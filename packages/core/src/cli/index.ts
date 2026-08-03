@@ -860,6 +860,21 @@ switch (command) {
     break;
   }
 
+  case "vault": {
+    // `args` has every bare `--` stripped, and `vault exec`'s whole contract is
+    // that `--` separates our flags from the child's argv.
+    import("./vault.js")
+      .then(async (m) => {
+        const code = await m.runVault(process.argv.slice(3));
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
   case "agents": {
     import("./agents.js")
       .then(async (m) => {
@@ -1221,6 +1236,10 @@ Usage:
   agent-native agents list      List connected/discoverable agents
   agent-native invoke <app> "prompt"
                                 Call another agent-native app over A2A
+  agent-native vault exec --key KEY -- <cmd>
+                                Run <cmd> with workspace vault secrets in its
+                                environment, without pasting them into a prompt.
+                                Hygiene, not containment — see 'vault --help'.
   agent-native script <name>    Run an action (deprecated alias for 'action')
   agent-native typecheck        Run TypeScript type checking
   agent-native create [name]    Scaffold a new agent-native workspace with a
