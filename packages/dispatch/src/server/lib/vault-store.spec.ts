@@ -51,6 +51,7 @@ import { readAppSecret } from "@agent-native/core/secrets";
 import {
   cleanupSyncedCredentialKeysIfUnused,
   credentialStoreScopeForVaultCtx,
+  getSecretsByKeys,
   isTrustedEnvVarSyncAgentUrl,
   resyncAllVaultSecretsToCredentialStore,
   syncGrantsToApp,
@@ -476,5 +477,63 @@ describe("syncGrantsToApp", () => {
     await syncGrantsToApp("coach");
 
     expect(store.get("org:org_caller:LEGACY_KEY")).toBe("sk-test-legacy");
+  });
+});
+
+describe("getSecretsByKeys", () => {
+  const ctx = { ownerEmail: "admin@example.test", orgId: "org_123" };
+
+  function mockKeyLookup(rows: Array<Record<string, unknown>>) {
+    const captured: { where: unknown } = { where: undefined };
+    const query = {
+      select: vi.fn(() => query),
+      from: vi.fn(() => query),
+      where: vi.fn(async (condition: unknown) => {
+        captured.where = condition;
+        return rows;
+      }),
+    };
+    mocks.getDb.mockReturnValue(query);
+    return { query, captured };
+  }
+
+  it("reads every requested key in one scoped query", async () => {
+    const { query, captured } = mockKeyLookup([
+      { id: "secret_1", credentialKey: "ALPHA_API_KEY", value: "alpha" },
+      { id: "secret_2", credentialKey: "BETA_API_KEY", value: "beta" },
+    ]);
+
+    const rows = await getSecretsByKeys(["ALPHA_API_KEY", "BETA_API_KEY"], ctx);
+
+    expect(rows).toHaveLength(2);
+    expect(query.where).toHaveBeenCalledTimes(1);
+    expect(captured.where).toBeDefined();
+  });
+
+  it("returns duplicate rows for one key instead of resolving the collision", async () => {
+    mockKeyLookup([
+      { id: "secret_1", credentialKey: "SHARED_API_KEY", value: "first" },
+      { id: "secret_2", credentialKey: "SHARED_API_KEY", value: "second" },
+    ]);
+
+    const rows = await getSecretsByKeys(["SHARED_API_KEY"], ctx);
+
+    expect(rows.map((row) => row.id)).toEqual(["secret_1", "secret_2"]);
+  });
+
+  it("trims and de-duplicates requested keys before querying", async () => {
+    const { query } = mockKeyLookup([]);
+
+    await getSecretsByKeys(["  ALPHA_API_KEY ", "ALPHA_API_KEY"], ctx);
+
+    expect(query.where).toHaveBeenCalledTimes(1);
+  });
+
+  it("never issues a query when no usable key was requested", async () => {
+    const { query } = mockKeyLookup([]);
+
+    await expect(getSecretsByKeys([], ctx)).resolves.toEqual([]);
+    await expect(getSecretsByKeys(["   "], ctx)).resolves.toEqual([]);
+    expect(query.select).not.toHaveBeenCalled();
   });
 });
