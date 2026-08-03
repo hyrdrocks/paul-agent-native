@@ -53,6 +53,10 @@ import {
   signupAttributionFromCookieHeader,
 } from "./attribution.js";
 import { resolveAuthCookieNamespace } from "./cookie-namespace.js";
+import {
+  isCrossRequestPromiseUnsafe,
+  pollForValue,
+} from "./cross-request-init.js";
 import { getWorkspaceA2ADerivedSecret } from "./derived-secret.js";
 import {
   renderResetPasswordEmail,
@@ -729,11 +733,45 @@ export async function getBetterAuth(
   config?: BetterAuthConfig,
 ): Promise<BetterAuthInstance> {
   if (_auth) return _auth;
-  if (_initPromise) return _initPromise;
 
-  _initPromise = createBetterAuthInstance(config);
-  _auth = await _initPromise;
-  return _auth;
+  if (_initPromise) {
+    if (!isCrossRequestPromiseUnsafe()) return _initPromise;
+    // Workers: `_initPromise` belongs to the request that created it, and
+    // workerd cancels our continuation on it the moment that request answers —
+    // this call would then never settle. Watch the resolved instance instead,
+    // and start our own attempt if the in-flight one goes quiet. Instance
+    // creation is idempotent (CREATE TABLE IF NOT EXISTS), so a duplicate
+    // attempt costs a round trip, not correctness.
+    const shared = _initPromise;
+    const settled = await pollForValue(() => _auth, {
+      timeoutMs: crossRequestInitWaitMs(),
+    });
+    if (settled) return settled;
+    if (_initPromise === shared) _initPromise = undefined;
+  }
+
+  const attempt = createBetterAuthInstance(config);
+  _initPromise = attempt;
+  try {
+    _auth = await attempt;
+    return _auth;
+  } catch (err) {
+    // Leaving the rejected promise memoized poisoned the whole isolate: every
+    // later request re-awaited the same failure, so a transient cold-start DB
+    // error became permanent for that instance.
+    if (_initPromise === attempt) _initPromise = undefined;
+    throw err;
+  }
+}
+
+/**
+ * How long a request watches another request's in-flight Better Auth init
+ * before starting its own. Cold D1/Postgres init runs into several seconds, so
+ * this must stay well above a warm init and below the readiness deadline.
+ */
+function crossRequestInitWaitMs(): number {
+  const raw = Number(process.env.AGENT_NATIVE_AUTH_INIT_WAIT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 12_000;
 }
 
 /**

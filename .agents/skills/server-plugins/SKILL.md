@@ -61,6 +61,31 @@ All framework-level routes live under `/_agent-native/` to avoid collisions with
 | `/_agent-native/collab/*`                                     | Real-time collaboration (see `real-time-collab`) |
 | `/_agent-native/a2a`                                          | A2A JSON-RPC endpoint (see `a2a-protocol`) |
 
+## Async plugin init must be a thunk
+
+A plugin that does async setup registers it with `trackPluginInit`, and it must
+pass a FUNCTION, not an already-running promise:
+
+```ts
+// Right — the framework decides when and where the init starts.
+const mount = async () => {
+  await awaitBootstrap(nitroApp);
+  /* … register routes … */
+};
+trackPluginInit(nitroApp, mount, { paths: ["/_agent-native/thing"] });
+
+// Wrong — starts at isolate scope, which Cloudflare Workers forbids.
+trackPluginInit(nitroApp, mount(), { paths: ["/_agent-native/thing"] });
+```
+
+Nitro calls plugins at isolate/module scope. On Workers, workerd answers any I/O
+there with "Disallowed operation called within global scope", and work it does
+attribute to the request that warmed the isolate is canceled the moment that
+request answers — taking every other concurrent request's continuation with it.
+A thunk lets the readiness gate start the init inside a live request context and
+keep it alive with that request's `waitUntil`, and lets the gate re-run it once
+after a failure instead of answering the same 503 for the isolate's whole life.
+
 ## Actions-First Approach
 
 For standard CRUD and data operations, use `defineAction` in `actions/` — the framework auto-mounts them as HTTP endpoints at `/_agent-native/actions/:name`. Only create custom `/api/*` routes for things actions can't do:

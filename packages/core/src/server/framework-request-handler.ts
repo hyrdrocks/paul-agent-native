@@ -18,6 +18,13 @@ import { getMissingDefaultPlugins } from "../deploy/route-discovery.js";
 import { MCP_PUBLIC_ROUTE_PREFIX } from "../mcp/route-paths.js";
 import { getConfiguredAppBasePath } from "./app-base-path.js";
 import { captureError } from "./capture-error.js";
+import type { InitState } from "./cross-request-init.js";
+import {
+  INIT_POLL_INTERVAL_MS,
+  isCrossRequestPromiseUnsafe,
+  keepAliveAcrossRequests,
+  sleep,
+} from "./cross-request-init.js";
 import { createCsrfMiddleware } from "./csrf.js";
 import {
   installHttpResponseTelemetryHooks,
@@ -35,6 +42,9 @@ const FRAMEWORK_PREFIX = "/_agent-native";
 const WELL_KNOWN_PREFIX = "/.well-known";
 const APP_SHIM_KEY = "_agentNativeH3Shim";
 const BOOTSTRAP_PROMISE_KEY = "_agentNativeBootstrapPromise";
+const BOOTSTRAP_STATE_KEY = "_agentNativeBootstrapState";
+const BOOTSTRAP_ATTEMPTS_KEY = "_agentNativeBootstrapAttempts";
+const BOOTSTRAP_RETRIED_KEY = "_agentNativeBootstrapRetried";
 const PLUGIN_READY_KEY = "_agentNativePluginReadyPromise";
 const PLUGIN_READY_PLACEHOLDERS_KEY = "_agentNativePluginReadyPlaceholders";
 const PLUGIN_FAILED_KEY = "_agentNativePluginInitFailures";
@@ -44,9 +54,28 @@ const MIDDLEWARE_DISPATCHER_PATCHED_KEY =
 const REQUEST_CONTEXT_BOUNDARY_KEY = "_agentNativeRequestContextBoundary";
 
 interface PluginReadyEntry {
-  promise: Promise<void>;
+  /** Undefined until the init has actually been started (see `start`). */
+  promise?: Promise<void>;
+  /**
+   * Completion flag for `promise`, readable from any request context. On
+   * Workers, waiters poll this instead of awaiting `promise` — see
+   * `cross-request-init.ts`.
+   */
+  state: InitState;
   paths?: string[];
+  /**
+   * Starts the init. Present when the caller passed a thunk rather than a
+   * running promise, which is what lets Workers defer the start into a request
+   * context; also used as the default retry.
+   */
+  start?: () => Promise<void>;
+  /** Re-run this plugin's init after a failure. */
+  retry?: () => Promise<void>;
+  retried?: boolean;
 }
+
+/** Most bootstrap failures are a cold dependency; a poisoned isolate is not. */
+const MAX_BOOTSTRAP_ATTEMPTS = 3;
 
 function getAppBasePath(): string {
   return getConfiguredAppBasePath();
@@ -145,18 +174,12 @@ export function getH3App(nitroApp: any): H3AppShim {
 
   if (!BOOTSTRAPPED.has(nitroApp)) {
     BOOTSTRAPPED.add(nitroApp);
-    nitroApp[BOOTSTRAP_PROMISE_KEY] = bootstrapDefaultPlugins(nitroApp).catch(
-      (err) => {
-        console.warn(
-          "[agent-native] Failed to auto-mount default plugins:",
-          (err as Error).message,
-        );
-        captureError(err, {
-          route: "default-plugin-bootstrap",
-          tags: { phase: "default-plugin-bootstrap" },
-        });
-      },
-    );
+    // On Workers this runs at isolate/module scope, and everything it starts
+    // belongs to whichever request happened to warm the isolate: once that
+    // request answers, workerd cancels the continuations every other concurrent
+    // request is parked on. Bootstrap is started from the first request instead,
+    // under that request's own `waitUntil` (see ensureBootstrapStarted).
+    if (!isCrossRequestPromiseUnsafe()) startBootstrap(nitroApp);
 
     // Readiness gate: Nitro v3 doesn't await async plugins, so routes
     // registered inside an async plugin may not exist when the first
@@ -167,6 +190,7 @@ export function getH3App(nitroApp: any): H3AppShim {
       await awaitFrameworkRoutesReadyForRequest(
         nitroApp,
         eventAny.context?._mountedPathname ?? event.url?.pathname ?? "",
+        event,
       );
       // Fall through — the actual route handler runs next.
       return undefined;
@@ -214,6 +238,11 @@ export function getH3App(nitroApp: any): H3AppShim {
     // fallback for runtimes where `onRequest` isn't wired.
     nitroApp.hooks?.hook?.("request", async (event: H3Event) => {
       const reqPath = event.url?.pathname ?? "";
+      // Start bootstrap on the FIRST request of any kind, not just gated ones:
+      // default plugins mount the auth guard and template routes that plain
+      // page/api requests depend on too.
+      ensureBootstrapStarted(nitroApp, event);
+      startDeferredPluginInits(nitroApp, event);
       if (
         resolveMountMatch(reqPath, FRAMEWORK_PREFIX) ||
         resolveMountMatch(reqPath, WELL_KNOWN_PREFIX) ||
@@ -221,7 +250,7 @@ export function getH3App(nitroApp: any): H3AppShim {
       ) {
         const startedAt = Date.now();
         try {
-          await awaitFrameworkRoutesReadyForRequest(nitroApp, reqPath);
+          await awaitFrameworkRoutesReadyForRequest(nitroApp, reqPath, event);
         } finally {
           recordFrameworkReadyWait(event, Date.now() - startedAt);
         }
@@ -255,7 +284,12 @@ function registerRequestContextBoundary(nitroApp: any): void {
   if (!h3 || !Array.isArray(h3["~middleware"])) return;
   if (h3[REQUEST_CONTEXT_BOUNDARY_KEY]) return;
 
-  const middleware = (_event: H3Event, next: () => unknown) => {
+  const middleware = (event: H3Event, next: () => unknown) => {
+    // Index 0 on every request, so it is also the earliest point at which a
+    // runtime that never wires Nitro's `request` hook can still start bootstrap
+    // inside a real request context (see ensureBootstrapStarted).
+    ensureBootstrapStarted(nitroApp, event);
+    startDeferredPluginInits(nitroApp, event);
     if (hasRequestContext()) return next();
     return runWithRequestContext({}, () => next());
   };
@@ -306,6 +340,77 @@ function ensureGlobalMiddlewareDispatch(nitroApp: any): void {
 }
 
 /**
+ * Start default-plugin bootstrap and publish both its promise (Node waiters)
+ * and its completion flag (Workers waiters, which cannot await the promise).
+ *
+ * `event`, when given, is the request that owns the work: handing the promise to
+ * its `waitUntil` keeps that request context alive past its own response so the
+ * bootstrap's continuations stay legal on Workers.
+ */
+function startBootstrap(nitroApp: any, event?: H3Event): void {
+  if (nitroApp[BOOTSTRAP_STATE_KEY]) return;
+  const state: InitState = { settled: false };
+  nitroApp[BOOTSTRAP_STATE_KEY] = state;
+  nitroApp[BOOTSTRAP_ATTEMPTS_KEY] =
+    (nitroApp[BOOTSTRAP_ATTEMPTS_KEY] ?? 0) + 1;
+
+  const promise = (async () => {
+    try {
+      await bootstrapDefaultPlugins(nitroApp);
+      state.settled = true;
+    } catch (err) {
+      // Flag the failure before reporting it: a waiter polling this state must
+      // learn "ran and failed", not keep waiting for a run that already ended.
+      state.settled = true;
+      state.error = err;
+      console.warn(
+        "[agent-native] Failed to auto-mount default plugins:",
+        (err as Error).message,
+      );
+      captureError(err, {
+        route: "default-plugin-bootstrap",
+        tags: { phase: "default-plugin-bootstrap" },
+      });
+    }
+  })();
+
+  nitroApp[BOOTSTRAP_PROMISE_KEY] = promise;
+  keepAliveAcrossRequests(event, promise);
+}
+
+/** Start bootstrap under `event`'s context if it has never run here. */
+function ensureBootstrapStarted(nitroApp: any, event?: H3Event): void {
+  if (!nitroApp || IN_BOOTSTRAP.has(nitroApp)) return;
+  if (nitroApp[BOOTSTRAP_STATE_KEY]) return;
+  startBootstrap(nitroApp, event);
+}
+
+/**
+ * Restart a bootstrap that already ran and failed — at most once per request and
+ * `MAX_BOOTSTRAP_ATTEMPTS` per isolate.
+ *
+ * A bootstrap that rejected once (DB not yet reachable on a cold instance) used
+ * to leave its settled-with-error memo behind for the isolate's whole lifetime,
+ * so every later request there was served by an app whose default plugins never
+ * mounted — a permanent 404 surface produced by one transient error.
+ */
+function retryBootstrapIfFailed(nitroApp: any, event?: H3Event): void {
+  if (!nitroApp || IN_BOOTSTRAP.has(nitroApp)) return;
+  const state = nitroApp[BOOTSTRAP_STATE_KEY] as InitState | undefined;
+  if (!state?.error) return;
+  if ((nitroApp[BOOTSTRAP_ATTEMPTS_KEY] ?? 0) >= MAX_BOOTSTRAP_ATTEMPTS) return;
+  // Both readiness gates run for the same request; one retry between them.
+  const context = (event as any)?.context;
+  if (context) {
+    if (context[BOOTSTRAP_RETRIED_KEY]) return;
+    context[BOOTSTRAP_RETRIED_KEY] = true;
+  }
+  nitroApp[BOOTSTRAP_STATE_KEY] = undefined;
+  nitroApp[BOOTSTRAP_PROMISE_KEY] = undefined;
+  startBootstrap(nitroApp, event);
+}
+
+/**
  * Wait for the framework's default-plugin bootstrap to complete.
  *
  * Called by user-facing plugin factories (`createAgentChatPlugin`, etc.) at
@@ -321,8 +426,31 @@ export async function awaitBootstrap(nitroApp: any): Promise<void> {
   // Trigger bootstrap if it hasn't been already (idempotent — getH3App
   // creates the shim and kicks off bootstrap on first call).
   getH3App(nitroApp);
+  if (isCrossRequestPromiseUnsafe()) {
+    const state = nitroApp[BOOTSTRAP_STATE_KEY] as InitState | undefined;
+    // No bootstrap yet means we are at isolate scope, where Workers forbids
+    // both starting the work and sleeping on a timer. The first request starts
+    // it and the readiness gate holds requests until it finishes, so returning
+    // here delays default plugins rather than dropping them.
+    if (!state) return;
+    await pollUntilBootstrapSettled(nitroApp, frameworkReadyDeadlineMs());
+    return;
+  }
   const promise = nitroApp[BOOTSTRAP_PROMISE_KEY];
   if (promise) await promise;
+}
+
+async function pollUntilBootstrapSettled(
+  nitroApp: any,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const state = nitroApp[BOOTSTRAP_STATE_KEY] as InitState | undefined;
+    if (!state || state.settled) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(INIT_POLL_INTERVAL_MS);
+  }
 }
 
 /**
@@ -335,8 +463,15 @@ export async function awaitBootstrap(nitroApp: any): Promise<void> {
 async function awaitFrameworkRoutesReadyForRequest(
   nitroApp: any,
   reqPath: string,
+  event?: H3Event,
 ): Promise<boolean> {
   if (!nitroApp) return true;
+  ensureBootstrapStarted(nitroApp, event);
+  retryBootstrapIfFailed(nitroApp, event);
+  startDeferredPluginInits(nitroApp, event);
+  if (isCrossRequestPromiseUnsafe()) {
+    return pollFrameworkRoutesReady(nitroApp, reqPath, event);
+  }
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
@@ -352,6 +487,41 @@ async function awaitFrameworkRoutesReadyForRequest(
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Workers-safe readiness wait: observe completion FLAGS on a timer this request
+ * created, never a promise another request created.
+ *
+ * Init work that has not started yet is started here, so it belongs to a live
+ * request context rather than to isolate scope.
+ */
+async function pollFrameworkRoutesReady(
+  nitroApp: any,
+  reqPath: string,
+  event?: H3Event,
+): Promise<boolean> {
+  const deadline = Date.now() + frameworkReadyDeadlineMs();
+  for (;;) {
+    const bootstrapState = nitroApp[BOOTSTRAP_STATE_KEY] as
+      | InitState
+      | undefined;
+    const bootstrapSettled = !bootstrapState || bootstrapState.settled;
+
+    startDeferredPluginInits(nitroApp, event);
+    const pending = bootstrapSettled
+      ? relevantPluginEntries(nitroApp, reqPath).filter(
+          (entry) => !entry.state.settled,
+        )
+      : [];
+
+    if (bootstrapSettled && pending.length === 0) {
+      prunePluginEntries(nitroApp, reqPath);
+      return true;
+    }
+    if (Date.now() >= deadline) return false;
+    await sleep(INIT_POLL_INTERVAL_MS);
   }
 }
 
@@ -378,43 +548,30 @@ function frameworkReadyDeadlineMs(): number {
  * Call this from the TOP of any async plugin so that the readiness gate
  * (installed by getH3App) can hold /_agent-native requests until the plugin
  * finishes mounting its routes.
+ *
+ * Pass a THUNK, not a running promise, unless the init has to start eagerly:
+ * only a thunk can be started inside a request context, which is what Cloudflare
+ * Workers requires (a Nitro plugin runs at isolate scope, where workerd refuses
+ * I/O outright) and what makes a failed init retryable.
  */
 export function trackPluginInit(
   nitroApp: any,
-  promise: Promise<void>,
-  options: { paths?: string[] } = {},
+  init: Promise<void> | (() => Promise<void>),
+  options: { paths?: string[]; retry?: () => Promise<void> } = {},
 ): void {
   if (!nitroApp) return;
   // Ensure the readiness gate exists even when the tracked plugin is the first
   // framework code to run in a serverless isolate. Otherwise an immediate
   // first request can fall through before the plugin registers its routes.
   getH3App(nitroApp);
-  // Attach a no-op catch so the promise doesn't surface as an unhandled
-  // rejection when Nitro v3 drops the async return value. The actual error
-  // is still observable when awaitPluginsReady() re-awaits the promise.
-  const safe = promise.catch((err) => {
-    console.error(
-      "[agent-native] Plugin init failed:",
-      (err as Error).message || err,
-    );
-    // Record the failure so the readiness gate can return a retryable 503 for
-    // this plugin's routes instead of letting them fall through to a bare
-    // "Cannot find any route matching" 404. That bare 404 is what kept biting
-    // external MCP clients (pi/codex/claude) and the connect flow on cold /
-    // propagating instances whose async init rejected (e.g. DB not yet
-    // reachable): the route never registered, so the placeholder released into
-    // a 404 the client couldn't recover from. A 503 is at least retryable.
-    const failures = (nitroApp[PLUGIN_FAILED_KEY] ??= new Map<
-      string,
-      string
-    >());
-    const msg = (err as Error)?.message || String(err);
-    for (const p of options.paths?.filter(Boolean) ?? []) failures.set(p, msg);
-  });
+  const start = typeof init === "function" ? init : undefined;
   const entry: PluginReadyEntry = {
-    promise: safe,
+    state: { settled: false },
     paths: options.paths?.filter(Boolean),
+    start,
+    retry: options.retry ?? start,
   };
+
   const existing = nitroApp[PLUGIN_READY_KEY] as PluginReadyEntry[] | undefined;
   if (existing) {
     existing.push(entry);
@@ -422,6 +579,77 @@ export function trackPluginInit(
     nitroApp[PLUGIN_READY_KEY] = [entry];
   }
   installPluginReadyPlaceholders(nitroApp, entry.paths);
+
+  // Workers: a plugin runs at isolate scope, where starting the init is not
+  // merely fragile but forbidden — workerd answers `setTimeout`, `fetch` and
+  // every other I/O call outside a request with "Disallowed operation called
+  // within global scope". Callers that pass a thunk get their init started by
+  // the first request instead (startDeferredPluginInits), inside that request's
+  // context and under its `waitUntil`. Verified on workerd: a promise whose
+  // creating context is gone can be rescued by nobody — a second request
+  // handing it to its OWN waitUntil does not keep it alive.
+  if (start && isCrossRequestPromiseUnsafe()) return;
+
+  attachTrackedInit(nitroApp, entry, start ? start() : (init as Promise<void>));
+}
+
+/**
+ * Bind a running init to its entry: flip the entry's flag when it settles, and
+ * record a rejection so the readiness gate can answer the plugin's routes with a
+ * retryable 503.
+ */
+function attachTrackedInit(
+  nitroApp: any,
+  entry: PluginReadyEntry,
+  promise: Promise<void>,
+): void {
+  const state = entry.state;
+  // Attach a no-op catch so the promise doesn't surface as an unhandled
+  // rejection when Nitro v3 drops the async return value. The actual error
+  // is still observable when awaitPluginsReady() re-awaits the promise.
+  entry.promise = promise.then(
+    () => {
+      state.settled = true;
+    },
+    (err) => {
+      state.settled = true;
+      state.error = err;
+      console.error(
+        "[agent-native] Plugin init failed:",
+        (err as Error).message || err,
+      );
+      // Record the failure so the readiness gate can return a retryable 503 for
+      // this plugin's routes instead of letting them fall through to a bare
+      // "Cannot find any route matching" 404. That bare 404 is what kept biting
+      // external MCP clients (pi/codex/claude) and the connect flow on cold /
+      // propagating instances whose async init rejected (e.g. DB not yet
+      // reachable): the route never registered, so the placeholder released into
+      // a 404 the client couldn't recover from. A 503 is at least retryable.
+      const failures = (nitroApp[PLUGIN_FAILED_KEY] ??= new Map<
+        string,
+        string
+      >());
+      const msg = (err as Error)?.message || String(err);
+      for (const p of entry.paths ?? []) failures.set(p, msg);
+    },
+  );
+}
+
+/**
+ * Start any init whose caller deferred it to a request context, in THIS
+ * request's context and under its `waitUntil` — the only context that can keep
+ * the work's own continuations alive on Workers.
+ */
+function startDeferredPluginInits(nitroApp: any, event?: H3Event): void {
+  const entries = nitroApp?.[PLUGIN_READY_KEY] as
+    | PluginReadyEntry[]
+    | undefined;
+  if (!entries?.length) return;
+  for (const entry of entries) {
+    if (entry.promise || !entry.start) continue;
+    attachTrackedInit(nitroApp, entry, entry.start());
+    keepAliveAcrossRequests(event, entry.promise);
+  }
 }
 
 function installPluginReadyPlaceholders(
@@ -448,6 +676,7 @@ function installPluginReadyPlaceholders(
         const ready = await awaitFrameworkRoutesReadyForRequest(
           nitroApp,
           reqPath,
+          event,
         );
         if (!ready) {
           // Boot is still running and we are out of budget. Answer now, while
@@ -466,6 +695,11 @@ function installPluginReadyPlaceholders(
         if (failures?.size) {
           for (const [failedPath, msg] of failures) {
             if (resolveMountMatch(reqPath, failedPath)) {
+              // A 503 the caller can retry into the same 503 forever is not
+              // actually retryable. Queue one fresh init attempt for this
+              // plugin and answer 503 now, so the caller's next try can find
+              // real routes.
+              retryFailedPluginInit(nitroApp, failedPath);
               setResponseStatus(event, 503);
               setResponseHeader(event, "retry-after", "5");
               return {
@@ -481,6 +715,33 @@ function installPluginReadyPlaceholders(
       },
     );
   }
+}
+
+/**
+ * Re-run the init of a plugin whose first attempt failed, at most once per
+ * tracked entry, so the 503 this request is about to answer is one the caller
+ * can actually retry into something better.
+ */
+function retryFailedPluginInit(nitroApp: any, failedPath: string): void {
+  const entry = (
+    (nitroApp[PLUGIN_READY_KEY] as PluginReadyEntry[] | undefined) ?? []
+  ).find(
+    (candidate) =>
+      candidate.retry &&
+      !candidate.retried &&
+      candidate.state.error &&
+      candidate.paths?.includes(failedPath),
+  );
+  if (!entry?.retry) return;
+  entry.retried = true;
+  const failures = nitroApp[PLUGIN_FAILED_KEY] as
+    | Map<string, string>
+    | undefined;
+  for (const path of entry.paths ?? []) failures?.delete(path);
+  // Tracked as a thunk, so on Workers the attempt starts in the NEXT request's
+  // context — this one is about to answer 503, and a context that is closing
+  // cannot carry the work.
+  trackPluginInit(nitroApp, entry.retry, { paths: entry.paths });
 }
 
 function logFrameworkRouteError(args: {
@@ -533,26 +794,62 @@ export async function awaitPluginsReady(
   nitroApp: any,
   reqPath?: string,
 ): Promise<void> {
-  const entries = nitroApp[PLUGIN_READY_KEY] as PluginReadyEntry[] | undefined;
-  if (!entries?.length) return;
+  const relevant = relevantPluginEntries(nitroApp, reqPath);
+  if (!relevant.length) return;
 
-  const relevant = reqPath
-    ? entries.filter((entry) =>
-        entry.paths?.length
-          ? entry.paths.some((path) => resolveMountMatch(reqPath, path))
-          : true,
-      )
-    : entries;
-
-  if (relevant.length) {
-    await Promise.all(relevant.map((entry) => entry.promise));
-    const completed = new Set(relevant);
-    const latest =
-      (nitroApp[PLUGIN_READY_KEY] as PluginReadyEntry[] | undefined) ?? [];
-    nitroApp[PLUGIN_READY_KEY] = latest.filter(
-      (entry) => !completed.has(entry),
+  if (isCrossRequestPromiseUnsafe()) {
+    // Poll the flags; the promises belong to whichever request tracked them.
+    const deadline = Date.now() + frameworkReadyDeadlineMs();
+    while (!relevant.every((entry) => entry.state.settled)) {
+      if (Date.now() >= deadline) return;
+      await sleep(INIT_POLL_INTERVAL_MS);
+    }
+  } else {
+    await Promise.all(
+      relevant.map((entry) => entry.promise ?? entry.start?.()),
     );
   }
+  const completed = new Set(relevant.filter(isPrunableEntry));
+  const latest =
+    (nitroApp[PLUGIN_READY_KEY] as PluginReadyEntry[] | undefined) ?? [];
+  nitroApp[PLUGIN_READY_KEY] = latest.filter((entry) => !completed.has(entry));
+}
+
+/**
+ * A failed entry stays tracked until its retry has been used: it is the only
+ * place the retry thunk lives, and the readiness gate needs it when a later
+ * request hits the recorded failure.
+ */
+function isPrunableEntry(entry: PluginReadyEntry): boolean {
+  if (!entry.state.settled) return false;
+  if (!entry.state.error) return true;
+  return !entry.retry || entry.retried === true;
+}
+
+function relevantPluginEntries(
+  nitroApp: any,
+  reqPath?: string,
+): PluginReadyEntry[] {
+  const entries = nitroApp?.[PLUGIN_READY_KEY] as
+    | PluginReadyEntry[]
+    | undefined;
+  if (!entries?.length) return [];
+  if (!reqPath) return entries;
+  return entries.filter((entry) =>
+    entry.paths?.length
+      ? entry.paths.some((path) => resolveMountMatch(reqPath, path))
+      : true,
+  );
+}
+
+function prunePluginEntries(nitroApp: any, reqPath?: string): void {
+  const settled = new Set(
+    relevantPluginEntries(nitroApp, reqPath).filter(isPrunableEntry),
+  );
+  if (!settled.size) return;
+  const latest =
+    (nitroApp[PLUGIN_READY_KEY] as PluginReadyEntry[] | undefined) ?? [];
+  nitroApp[PLUGIN_READY_KEY] = latest.filter((entry) => !settled.has(entry));
 }
 
 /**

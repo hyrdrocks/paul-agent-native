@@ -656,6 +656,35 @@ describe("framework request handler", () => {
     },
   );
 
+  it("re-runs a failed plugin init so its 503 is actually retryable", async () => {
+    // A recorded init failure used to be permanent for the instance: every later
+    // request answered the same 503 for that plugin's routes even after the
+    // transient cause (an unreachable DB on a cold instance) cleared.
+    const nitroApp = createNitroApp();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let attempts = 0;
+    const mount = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("db unreachable");
+      getH3App(nitroApp).use("/_agent-native/mcp", () => ({ ok: true }));
+    };
+    trackPluginInit(nitroApp, mount(), {
+      paths: ["/_agent-native/mcp"],
+      retry: mount,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const first = await dispatch(nitroApp, "/_agent-native/mcp");
+    expect(JSON.stringify(first)).toContain("initializing or unavailable");
+
+    await expect(dispatch(nitroApp, "/_agent-native/mcp")).resolves.toEqual({
+      ok: true,
+    });
+    expect(attempts).toBe(2);
+    errorSpy.mockRestore();
+  });
+
   it("does not treat similar non-prefixed paths as framework routes", async () => {
     process.env.APP_BASE_PATH = "/docs";
     const nitroApp = createNitroApp();

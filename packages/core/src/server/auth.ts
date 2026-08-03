@@ -1351,6 +1351,50 @@ let _authGuardFn:
 let _mountedApp: H3App | null = null;
 
 /**
+ * Set when the last mount on an app installed the guard and the fallback routes
+ * but NOT Better Auth's own catch-all. That app is locked, not working, so the
+ * already-mounted short-circuit must not treat it as mounted: a later attempt
+ * has to be allowed to finish the job.
+ */
+let _authMountFailure: { app: H3App; cause: unknown } | null = null;
+
+/**
+ * Why the last mount on `app` is incomplete, or undefined when it is not.
+ *
+ * `autoMountAuth` still returns true for a degraded mount — the fallback routes
+ * and the guard really are installed, and the app really is locked — but Better
+ * Auth's own catch-all at `/_agent-native/auth/ba/*` is not, so every sign-in,
+ * sign-up and session call the client makes would hit the router's no-match 404.
+ * A caller that gates routes on init (`createAuthPlugin`, via `trackPluginInit`)
+ * has to be able to tell that apart from a working mount so it can answer those
+ * routes with a retryable 503 instead.
+ */
+export function getAuthMountFailure(
+  app: H3App,
+): { cause: unknown } | undefined {
+  return _authMountFailure?.app === app
+    ? { cause: _authMountFailure.cause }
+    : undefined;
+}
+
+/**
+ * Better Auth failed to initialize, so the auth routes the client actually calls
+ * were never mounted. Thrown by `createAuthPlugin` so the framework readiness
+ * gate answers `/_agent-native/auth` with a retryable 503.
+ */
+export class AuthMountIncompleteError extends Error {
+  constructor(cause: unknown) {
+    super(
+      `agent-native auth mounted in degraded mode: Better Auth init failed (${
+        (cause as Error)?.message || String(cause)
+      })`,
+    );
+    this.name = "AuthMountIncompleteError";
+    this.cause = cause;
+  }
+}
+
+/**
  * Run the auth guard on an event. Returns a Response/object to block the
  * request (login page or 401), or undefined to allow it through.
  *
@@ -3687,7 +3731,11 @@ export async function autoMountAuth(
   // Vite HMR — without this check, an HMR-restarted Nitro instance (fresh
   // H3 app, empty middleware) would short-circuit here and end up with no
   // auth routes mounted at all.
-  if (_authGuardFn && _mountedApp === app) {
+  //
+  // A degraded mount is excluded on purpose: after a failed Better Auth init
+  // the guard exists but its routes do not, and short-circuiting here would
+  // make every retry a no-op that reports success.
+  if (_authGuardFn && _mountedApp === app && !getAuthMountFailure(app)) {
     if (options.mountGoogleOAuthRoutes === false) {
       setGenericGoogleOAuthRoutesEnabled(app, false);
     }
@@ -3816,6 +3864,7 @@ export async function autoMountAuth(
   // Default: Better Auth (account-first)
   try {
     await mountBetterAuthRoutes(app, options);
+    _authMountFailure = null;
     if (process.env.DEBUG)
       console.log(
         "[agent-native] Auth enabled — Better Auth (accounts + organizations).",
@@ -3837,6 +3886,7 @@ export async function autoMountAuth(
     const guardFn = createAuthGuardFn();
     _authGuardFn = guardFn;
     app.use(defineEventHandler(guardFn));
+    _authMountFailure = { app, cause: err };
     console.log(
       "[agent-native] Auth guard registered despite init failure — app is locked.",
     );
