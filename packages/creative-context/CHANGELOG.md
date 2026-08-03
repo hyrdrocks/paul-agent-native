@@ -1,5 +1,14 @@
 # @agent-native/creative-context
 
+## 1.0.0-paul.0
+
+### Patch Changes
+
+- Updated dependencies [f3a868b]
+- Updated dependencies [0c17835]
+- Updated dependencies [17b5fe8]
+  - @agent-native/core@0.134.0-paul.0
+
 ## 0.5.8
 
 ### Patch Changes

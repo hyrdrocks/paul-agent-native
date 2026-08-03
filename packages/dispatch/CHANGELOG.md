@@ -1,5 +1,48 @@
 # @agent-native/dispatch
 
+## 1.0.0-paul.0
+
+### Minor Changes
+
+- a3f7797: Add `lease-vault-secrets`, an all-or-nothing bulk read of named workspace vault
+  credentials for callers that already hold a connect bearer. It takes an explicit
+  list of credential keys plus a caller-minted `leaseId` and returns
+  `{ leaseId, env }`, refusing the whole lease — naming every missing, ambiguous,
+  or valueless key in one message — rather than returning a partial result. The
+  action is mounted `POST`-only and kept off the agent and tool-iframe surfaces;
+  its audit row records the requested key names and never any value.
+- eefec2b: Record vault sync and vault request events in the dispatch audit log instead of
+  the vault log alone, and stamp every vault audit event with an explicit
+  visibility and org so the trail is readable by the same people who can read the
+  vault row it describes.
+- f3a868b: Read the Vault Audit tab from the framework action audit log, so reads,
+  mutations, and refused attempts arrive in one timeline with their status and
+  error code. The tab now filters by action, outcome, actor, and time, and pages
+  through results; the list surface still omits each event's recorded input.
+  `vault_audit_log` keeps its existing writers and rows — nothing reads it for
+  the tab. Audit queries gain a `targetTypes` filter for features whose events
+  span more than one target type.
+- 17b5fe8: Split the vault read surface: `list-vault-secrets` no longer returns secret
+  values at all, carrying a server-computed masked `last4` preview instead, and a
+  new `reveal-vault-secret` returns one value for one id. Reveal is mounted
+  `POST`-only, kept off the agent and tool-iframe surfaces, and audited on every
+  call — the audit row records the id and never the value. The vault UI's eye
+  toggle now fetches on demand and the edit dialog no longer prefills the stored
+  value, so a reveal in the timeline means a real reveal.
+
+  Core: vault action names join the auto-authenticated-read exclusion patterns, so
+  a value-returning vault action is never auto-advertised to external agents;
+  `filterAgentTools` is exported from `@agent-native/core/server` so apps can
+  assert an `agentTool: false` action really is absent from the agent tool list.
+
+### Patch Changes
+
+- 0c17835: `lease-vault-secrets` now marks its all-or-nothing refusal as a client error, so the message naming every missing, ambiguous, or valueless key reaches the caller instead of being replaced with a generic internal-error response.
+- Updated dependencies [f3a868b]
+- Updated dependencies [0c17835]
+- Updated dependencies [17b5fe8]
+  - @agent-native/core@0.134.0-paul.0
+
 ## 0.16.6
 
 ### Patch Changes
