@@ -5,7 +5,7 @@ Every `gh issue` call must carry `--repo sonhyrd/paul-dispatch-app`. A bare `gh 
 inside this clone resolves against `BuilderIO/agent-native` upstream and returns an unrelated issue.
 
 The tickets are deliberately not mirrored here: `paul-dispatch-app` is private, this fork is public,
-and the vault tickets describe unpatched weaknesses in BuilderIO's shipped product. **Do not
+and the vault tickets contain security analysis that is not for publication. **Do not
 recreate them here.**
 
 ## Conventions
