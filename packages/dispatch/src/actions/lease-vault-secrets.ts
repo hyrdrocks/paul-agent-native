@@ -91,8 +91,16 @@ export default defineAction({
           `ambiguous credential key(s) ${ambiguous.join(", ")} — more than one visible vault secret uses each; rename or delete the duplicates rather than relying on which one wins`,
         empty.length && `no stored value for ${empty.join(", ")}`,
       ].filter(Boolean);
-      throw new Error(
-        `Vault lease ${leaseId} refused (all-or-nothing): ${reasons.join("; ")}`,
+      // The whole point of naming every offending key at once is that the
+      // caller reads the names. Without an explicit client statusCode the
+      // action route classifies this as an uncategorized 500 and replaces the
+      // message with "Internal server error", so the list only ever reaches
+      // the server console — see `isUserFacing` in `action-routes.ts`.
+      throw Object.assign(
+        new Error(
+          `Vault lease ${leaseId} refused (all-or-nothing): ${reasons.join("; ")}`,
+        ),
+        { statusCode: 400 },
       );
     }
 

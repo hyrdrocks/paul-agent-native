@@ -627,6 +627,168 @@ export function codexHasBlock(file: string, name: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Reading connections back out
+// ---------------------------------------------------------------------------
+
+/** An MCP server entry read back out of a client config, decoded. */
+export interface McpConnection {
+  serverName: string;
+  url?: string;
+  headers: Record<string, string>;
+}
+
+function stringHeaders(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+}
+
+/**
+ * Read a config file, distinguishing "this client has no config" (absent) from
+ * "this file exists but cannot be read". Collapsing the second into the first
+ * would report a machine with a corrupt `~/.claude.json` as one with nothing
+ * connected — a wrong cause the caller could not tell from the truth.
+ */
+function readConfigFileOrAbsent(file: string): string | undefined {
+  try {
+    return fs.readFileSync(file, "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(
+      `Cannot read MCP config file: ${file} (${(err as Error).message})`,
+    );
+  }
+}
+
+function readJsonMcpConnections(
+  client: ClientId,
+  file: string,
+): McpConnection[] {
+  const raw = readConfigFileOrAbsent(file);
+  if (raw === undefined || !raw.trim()) return [];
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `Cannot parse JSON config file: ${file}\n` +
+        `Fix or move the file and re-run.`,
+    );
+  }
+  const servers = parsed?.[jsonMcpConfigKeyForClient(client)];
+  if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+    return [];
+  }
+  return Object.entries(servers).flatMap(([serverName, server]) => {
+    if (!server || typeof server !== "object" || Array.isArray(server)) {
+      return [];
+    }
+    const entry = server as Record<string, unknown>;
+    const requestInit =
+      entry.requestInit &&
+      typeof entry.requestInit === "object" &&
+      !Array.isArray(entry.requestInit)
+        ? (entry.requestInit as Record<string, unknown>)
+        : undefined;
+    return [
+      {
+        serverName,
+        url: typeof entry.url === "string" ? entry.url : undefined,
+        headers: stringHeaders(entry.headers ?? requestInit?.headers),
+      },
+    ];
+  });
+}
+
+function parseInlineTomlTable(line: string): Record<string, string> {
+  const match = line.match(/\{(.*)\}/);
+  if (!match) return {};
+  const out: Record<string, string> = {};
+  const pairRe = /"((?:\\.|[^"])*)"\s*=\s*"((?:\\.|[^"])*)"/g;
+  let pair: RegExpExecArray | null;
+  while ((pair = pairRe.exec(match[1]))) {
+    out[unescapeTomlString(pair[1])] = unescapeTomlString(pair[2]);
+  }
+  return out;
+}
+
+function unescapeTomlString(value: string): string {
+  return value.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+}
+
+/**
+ * Codex writes `http_headers` inline on the server table, but a hand-edited or
+ * older config may carry it as a `[mcp_servers.<name>.http_headers]` sub-table
+ * instead. Both forms have to be read, or a real connection reads back as one
+ * with no bearer — which is indistinguishable from an unauthenticated entry.
+ */
+function readCodexMcpConnections(file: string): McpConnection[] {
+  const content = readConfigFileOrAbsent(file);
+  if (content === undefined) return [];
+
+  const lines = content.split(/\r?\n/);
+  const byName = new Map<string, McpConnection>();
+  let i = 0;
+  while (i < lines.length) {
+    const keys = parseTomlTableHeader(lines[i]);
+    if (!keys || keys.length < 2 || keys[0] !== "mcp_servers") {
+      i++;
+      continue;
+    }
+    const serverName = keys[1];
+    const isServerTable = keys.length === 2;
+    const isHeaderTable = keys.length === 3 && keys[2] === "http_headers";
+    const body: string[] = [];
+    i++;
+    while (i < lines.length && parseTomlTableHeader(lines[i]) === null) {
+      body.push(lines[i]);
+      i++;
+    }
+
+    const connection = byName.get(serverName) ?? { serverName, headers: {} };
+    if (isServerTable) {
+      const urlLine = body.find((line) => /^\s*url\s*=/.test(line));
+      const urlMatch = urlLine?.match(/"((?:\\.|[^"])*)"/);
+      if (urlMatch) connection.url = unescapeTomlString(urlMatch[1]);
+      const headerLine = body.find((line) => /^\s*http_headers\s*=/.test(line));
+      if (headerLine) {
+        Object.assign(connection.headers, parseInlineTomlTable(headerLine));
+      }
+    } else if (isHeaderTable) {
+      for (const line of body) {
+        const pair = line.match(
+          /^\s*(?:"((?:\\.|[^"])*)"|([A-Za-z0-9_-]+))\s*=\s*"((?:\\.|[^"])*)"/,
+        );
+        if (!pair) continue;
+        const name =
+          pair[1] !== undefined ? unescapeTomlString(pair[1]) : pair[2];
+        connection.headers[name] = unescapeTomlString(pair[3]);
+      }
+    }
+    byName.set(serverName, connection);
+  }
+
+  return [...byName.values()];
+}
+
+/**
+ * Read the MCP server entries a client has on disk. An absent config yields no
+ * entries; a config that exists but cannot be read or parsed throws, so a
+ * broken file is never reported as an unconnected machine.
+ */
+export function readMcpConnectionsForClient(
+  client: ClientId,
+  file: string,
+): McpConnection[] {
+  return client === "codex"
+    ? readCodexMcpConnections(file)
+    : readJsonMcpConnections(client, file);
+}
+
+// ---------------------------------------------------------------------------
 // Unified write helper
 // ---------------------------------------------------------------------------
 

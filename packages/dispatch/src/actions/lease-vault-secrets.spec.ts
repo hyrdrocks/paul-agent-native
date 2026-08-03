@@ -118,6 +118,10 @@ describe("lease-vault-secrets refusal", () => {
       })
       .catch((err: unknown) => err as Error);
 
+    // Without an explicit client statusCode the action route classifies the
+    // refusal as an uncategorized 500 and replaces this message with
+    // "Internal server error", so the named keys never reach the caller.
+    expect((error as { statusCode?: number }).statusCode).toBe(400);
     expect(error.message).toContain("ONE_API_KEY");
     expect(error.message).toContain("TWO_API_KEY");
     expect(error.message).toContain("THREE_API_KEY");
