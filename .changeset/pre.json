@@ -24,6 +24,7 @@
     "clips-desktop": "0.1.1"
   },
   "changesets": [
+    "connect-codex-header-subtable",
     "lease-vault-secrets-action",
     "lease-vault-secrets-refusal-status",
     "vault-audit-parity",

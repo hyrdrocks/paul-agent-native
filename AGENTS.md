@@ -281,3 +281,15 @@ Two are entry points rather than area guides:
 - `adding-a-feature` — the four-area checklist every feature must satisfy.
 - `writing-agent-instructions` — read before editing any `AGENTS.md`,
   `SKILL.md`, or tool/action description, including this file.
+
+## Agent skills
+
+### Issue tracker
+
+See `docs/agents/issue-tracker.md` — tickets for this work do **not** live where `git remote -v`
+would suggest; read that file before any `gh issue` call.
+
+### Delegation profile
+
+Branch prefix, post-merge check, commit policy, and worker constraints for `/delegate-tickets`.
+See `docs/agents/delegate-profile.md`.
