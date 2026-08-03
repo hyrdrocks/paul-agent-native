@@ -192,6 +192,26 @@ describe("audit store filters + ordering", () => {
     ).toHaveLength(1);
   });
 
+  it("filters to a set of target types in one query", async () => {
+    await insertAuditEvent(makeEvent({ id: "a", targetType: "vault-secret" }));
+    await insertAuditEvent(makeEvent({ id: "b", targetType: "vault-grant" }));
+    await insertAuditEvent(makeEvent({ id: "c", targetType: "recording" }));
+
+    const rows = await queryAuditEvents(
+      { userEmail: "alice@x.com" },
+      { targetTypes: ["vault-secret", "vault-grant"] },
+    );
+    expect(rows.map((r) => r.id).sort()).toEqual(["a", "b"]);
+  });
+
+  it("matches nothing when the target-type set is empty", async () => {
+    await insertAuditEvent(makeEvent({ targetType: "vault-secret" }));
+
+    expect(
+      await queryAuditEvents({ userEmail: "alice@x.com" }, { targetTypes: [] }),
+    ).toEqual([]);
+  });
+
   it("returns newest first and respects the limit", async () => {
     await insertAuditEvent(makeEvent({ createdAt: 100 }));
     await insertAuditEvent(makeEvent({ createdAt: 300 }));
@@ -205,6 +225,28 @@ describe("audit store filters + ordering", () => {
       { limit: 2 },
     );
     expect(limited).toHaveLength(2);
+  });
+
+  it("pages same-millisecond rows without repeating or dropping one", async () => {
+    for (const id of ["e1", "e2", "e3", "e4"]) {
+      await insertAuditEvent(makeEvent({ id, createdAt: 500 }));
+    }
+
+    const first = await queryAuditEvents(
+      { userEmail: "alice@x.com" },
+      { limit: 2 },
+    );
+    const second = await queryAuditEvents(
+      { userEmail: "alice@x.com" },
+      { limit: 2, offset: 2 },
+    );
+
+    expect([...first, ...second].map((r) => r.id).sort()).toEqual([
+      "e1",
+      "e2",
+      "e3",
+      "e4",
+    ]);
   });
 
   it("filters by sinceMs", async () => {
