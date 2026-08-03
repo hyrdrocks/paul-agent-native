@@ -13,6 +13,9 @@ import {
   codexHasBlock,
   hasJsonMcpEntry,
   hasJsonMcpEntryForClient,
+  parseCodexBlockHeaders,
+  parseCodexBlockUrl,
+  readCodexServerBlock,
   removeCodexSameUrlDuplicates,
   removeJsonSameUrlDuplicates,
   writeCodexBlock,
@@ -831,5 +834,146 @@ describe("codexHasBlock", () => {
     );
     expect(codexHasBlock(file, "plan")).toBe(true);
     expect(codexHasBlock(file, "other")).toBe(false);
+  });
+});
+
+describe("readCodexServerBlock", () => {
+  it("keeps the whole footprint when headers live in a sub-table", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(
+      file,
+      [
+        '[mcp_servers."plan"]',
+        'url = "https://plan.example.com/mcp"',
+        "",
+        '[mcp_servers."plan".http_headers]',
+        'Authorization = "Bearer FAKE-PLACEHOLDER"',
+        "",
+        "[other]",
+        "keep = true",
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const block = readCodexServerBlock(file, "plan");
+    expect(block).toContain('[mcp_servers."plan".http_headers]');
+    expect(block).toContain('Authorization = "Bearer FAKE-PLACEHOLDER"');
+    expect(block).not.toContain("[other]");
+  });
+
+  it("returns undefined for an absent server and an absent file", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(file, '[mcp_servers."plan"]\nurl = "x"\n', "utf-8");
+    expect(readCodexServerBlock(file, "other")).toBeUndefined();
+    expect(readCodexServerBlock(path.join(dir, "gone.toml"), "plan")).toBe(
+      undefined,
+    );
+  });
+
+  it("round-trips a sub-table footprint through writeCodexBlock", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(
+      file,
+      [
+        '[mcp_servers."plan"]',
+        'url = "https://plan.example.com/mcp"',
+        "",
+        '[mcp_servers."plan".http_headers]',
+        'Authorization = "Bearer FAKE-PLACEHOLDER"',
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+    const block = readCodexServerBlock(file, "plan") as string;
+
+    writeCodexBlock(
+      file,
+      "plan",
+      buildCodexHttpBlock("plan", "http://dev/mcp"),
+    );
+    writeCodexBlock(file, "plan", block);
+
+    expect(
+      parseCodexBlockHeaders(readCodexServerBlock(file, "plan") as string),
+    ).toEqual({ Authorization: "Bearer FAKE-PLACEHOLDER" });
+  });
+
+  it("keeps one server's sub-tables out of another server's block", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(
+      file,
+      [
+        '[mcp_servers."plan"]',
+        'url = "https://plan.example.com/mcp"',
+        "",
+        '[mcp_servers."mail"]',
+        'url = "https://mail.example.com/mcp"',
+        "",
+        '[mcp_servers."mail".http_headers]',
+        'Authorization = "Bearer FAKE-MAIL"',
+        "",
+        '[mcp_servers."plan".http_headers]',
+        'Authorization = "Bearer FAKE-PLAN"',
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const plan = readCodexServerBlock(file, "plan") as string;
+    expect(parseCodexBlockHeaders(plan)).toEqual({
+      Authorization: "Bearer FAKE-PLAN",
+    });
+    expect(parseCodexBlockUrl(plan)).toBe("https://plan.example.com/mcp");
+  });
+});
+
+describe("parseCodexBlockHeaders", () => {
+  it("reads the inline http_headers form", () => {
+    const block = [
+      '[mcp_servers."plan"]',
+      'url = "https://plan.example.com/mcp"',
+      'http_headers = { "Authorization" = "Bearer FAKE-PLACEHOLDER" }',
+      "",
+    ].join("\n");
+    expect(parseCodexBlockHeaders(block)).toEqual({
+      Authorization: "Bearer FAKE-PLACEHOLDER",
+    });
+    expect(parseCodexBlockUrl(block)).toBe("https://plan.example.com/mcp");
+  });
+
+  it("reads the http_headers sub-table form", () => {
+    const block = [
+      '[mcp_servers."plan"]',
+      'url = "https://plan.example.com/mcp"',
+      "",
+      '[mcp_servers."plan".http_headers]',
+      'Authorization = "Bearer FAKE-PLACEHOLDER"',
+      '"X-Agent-Native-Owner-Email" = "u@example.com"',
+      "",
+    ].join("\n");
+    expect(parseCodexBlockHeaders(block)).toEqual({
+      Authorization: "Bearer FAKE-PLACEHOLDER",
+      "X-Agent-Native-Owner-Email": "u@example.com",
+    });
+    expect(parseCodexBlockUrl(block)).toBe("https://plan.example.com/mcp");
+  });
+
+  it("ignores url and http_headers keys that sit under another sub-table", () => {
+    const block = [
+      '[mcp_servers."plan"]',
+      'url = "https://plan.example.com/mcp"',
+      "",
+      '[mcp_servers."plan".env]',
+      'url = "https://decoy.example.com/mcp"',
+      'http_headers = { "Authorization" = "Bearer FAKE-DECOY" }',
+      "",
+    ].join("\n");
+    expect(parseCodexBlockUrl(block)).toBe("https://plan.example.com/mcp");
+    expect(parseCodexBlockHeaders(block)).toEqual({});
   });
 });

@@ -44,7 +44,13 @@ import {
   CLIENTS,
   ClientId,
   configPathFor,
-  jsonMcpConfigKeyForClient,
+  parseCodexBlockHeaders,
+  parseCodexBlockUrl,
+  parseJsonEntryHeaders,
+  readCodexServerBlock,
+  readCodexServerBlocks,
+  readJsonServerEntries,
+  readJsonServerEntry,
   removeSameUrlDuplicatesForClient,
   writeCodexBlock,
   writeHttpEntryForClient,
@@ -1174,55 +1180,6 @@ function setSavedProfileEntry(
   profiles.prodEntries[serverName][client][file] = entry;
 }
 
-function readJsonMcpServerEntry(
-  client: ClientId,
-  file: string,
-  serverName: string,
-): Record<string, unknown> | undefined {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf-8"));
-    const entry = parsed?.[jsonMcpConfigKeyForClient(client)]?.[serverName];
-    return entry && typeof entry === "object" ? entry : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function tomlQuoteForRead(s: string): string {
-  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-}
-
-function codexHeadersForRead(name: string): string[] {
-  const headers = [`[mcp_servers.${tomlQuoteForRead(name)}]`];
-  if (/^[A-Za-z0-9_-]+$/.test(name)) headers.push(`[mcp_servers.${name}]`);
-  return headers;
-}
-
-function readCodexMcpBlock(
-  file: string,
-  serverName: string,
-): string | undefined {
-  let content = "";
-  try {
-    content = fs.readFileSync(file, "utf-8");
-  } catch {
-    return undefined;
-  }
-  const headers = new Set(codexHeadersForRead(serverName));
-  const lines = content.split(/\r?\n/);
-  for (let i = 0; i < lines.length; i++) {
-    if (!headers.has(lines[i].trim())) continue;
-    const block: string[] = [lines[i]];
-    i++;
-    while (i < lines.length && !/^\s*\[/.test(lines[i])) {
-      block.push(lines[i]);
-      i++;
-    }
-    return block.join("\n").replace(/\n*$/, "") + "\n";
-  }
-  return undefined;
-}
-
 function readCurrentMcpEntry(
   client: ClientId,
   serverName: string,
@@ -1231,7 +1188,7 @@ function readCurrentMcpEntry(
 ): CurrentMcpEntry {
   const file = configPathFor(client, baseDir, scope);
   if (client === "codex") {
-    const block = readCodexMcpBlock(file, serverName);
+    const block = readCodexServerBlock(file, serverName);
     return {
       file,
       saved: block
@@ -1239,7 +1196,7 @@ function readCurrentMcpEntry(
         : undefined,
     };
   }
-  const entry = readJsonMcpServerEntry(client, file, serverName);
+  const entry = readJsonServerEntry(client, file, serverName);
   return {
     file,
     saved: entry
@@ -1263,33 +1220,12 @@ function writeSavedMcpEntry(
   writeJsonMcpEntryForClient(client, file, serverName, saved.entry);
 }
 
-function unescapeTomlString(value: string): string {
-  return value.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
-}
-
-function parseCodexHeaders(block: string): Record<string, string> {
-  const line = block
-    .split(/\r?\n/)
-    .find((candidate) => /^\s*http_headers\s*=/.test(candidate));
-  if (!line) return {};
-  const match = line.match(/\{(.*)\}/);
-  if (!match) return {};
-  const headers: Record<string, string> = {};
-  const pairRe = /"((?:\\.|[^"])*)"\s*=\s*"((?:\\.|[^"])*)"/g;
-  let pair: RegExpExecArray | null;
-  while ((pair = pairRe.exec(match[1]))) {
-    headers[unescapeTomlString(pair[1])] = unescapeTomlString(pair[2]);
-  }
-  return headers;
-}
-
 function savedEntryUrl(saved: SavedMcpEntry | undefined): string | undefined {
   if (!saved) return undefined;
   if (saved.kind === "json") {
     return typeof saved.entry.url === "string" ? saved.entry.url : undefined;
   }
-  const match = saved.block.match(/^\s*url\s*=\s*"((?:\\.|[^"])*)"/m);
-  return match ? unescapeTomlString(match[1]) : undefined;
+  return parseCodexBlockUrl(saved.block);
 }
 
 interface ExistingMcpEntry {
@@ -1300,75 +1236,21 @@ interface ExistingMcpEntry {
   url: string;
 }
 
-function readJsonMcpServerEntries(
+function savedEntriesForClient(
   client: ClientId,
   file: string,
 ): { serverName: string; saved: SavedMcpEntry }[] {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf-8"));
-    const servers = parsed?.[jsonMcpConfigKeyForClient(client)];
-    if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
-      return [];
-    }
-    return Object.entries(servers).flatMap(([serverName, entry]) => {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-        return [];
-      }
-      return [
-        {
-          serverName,
-          saved: {
-            kind: "json" as const,
-            entry: entry as Record<string, unknown>,
-            savedAt: new Date().toISOString(),
-          },
-        },
-      ];
-    });
-  } catch {
-    return [];
-  }
-}
-
-function parseCodexMcpServerName(line: string): string | undefined {
-  const trimmed = line.trim();
-  const quoted = trimmed.match(/^\[mcp_servers\."((?:\\.|[^"])*)"\]$/);
-  if (quoted) return unescapeTomlString(quoted[1]);
-  const bare = trimmed.match(/^\[mcp_servers\.([A-Za-z0-9_-]+)\]$/);
-  return bare?.[1];
-}
-
-function readCodexMcpServerEntries(
-  file: string,
-): { serverName: string; saved: SavedMcpEntry }[] {
-  let content = "";
-  try {
-    content = fs.readFileSync(file, "utf-8");
-  } catch {
-    return [];
-  }
-  const lines = content.split(/\r?\n/);
-  const entries: { serverName: string; saved: SavedMcpEntry }[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const serverName = parseCodexMcpServerName(lines[i]);
-    if (!serverName) continue;
-    const block: string[] = [lines[i]];
-    i++;
-    while (i < lines.length && !/^\s*\[/.test(lines[i])) {
-      block.push(lines[i]);
-      i++;
-    }
-    i--;
-    entries.push({
+  const savedAt = new Date().toISOString();
+  if (client === "codex") {
+    return readCodexServerBlocks(file).map(({ serverName, block }) => ({
       serverName,
-      saved: {
-        kind: "codex",
-        block: block.join("\n").replace(/\n*$/, "") + "\n",
-        savedAt: new Date().toISOString(),
-      },
-    });
+      saved: { kind: "codex", block, savedAt },
+    }));
   }
-  return entries;
+  return readJsonServerEntries(client, file).map(({ serverName, entry }) => ({
+    serverName,
+    saved: { kind: "json", entry, savedAt },
+  }));
 }
 
 function readExistingMcpEntries(
@@ -1379,11 +1261,7 @@ function readExistingMcpEntries(
   const entries: ExistingMcpEntry[] = [];
   for (const client of clients) {
     const file = configPathFor(client, baseDir, scope);
-    const rawEntries =
-      client === "codex"
-        ? readCodexMcpServerEntries(file)
-        : readJsonMcpServerEntries(client, file);
-    for (const { serverName, saved } of rawEntries) {
+    for (const { serverName, saved } of savedEntriesForClient(client, file)) {
       const url = savedEntryUrl(saved);
       if (!url) continue;
       entries.push({ client, serverName, file, saved, url });
@@ -1426,25 +1304,9 @@ function savedEntryHeaders(
   saved: SavedMcpEntry | undefined,
 ): Record<string, string> {
   if (!saved) return {};
-  if (saved.kind === "json") {
-    const headers =
-      saved.entry.headers ??
-      (saved.entry.requestInit &&
-      typeof saved.entry.requestInit === "object" &&
-      !Array.isArray(saved.entry.requestInit)
-        ? (saved.entry.requestInit as Record<string, unknown>).headers
-        : undefined);
-    return headers && typeof headers === "object"
-      ? Object.fromEntries(
-          Object.entries(headers as Record<string, unknown>)
-            .filter((entry): entry is [string, string] => {
-              return typeof entry[1] === "string";
-            })
-            .map(([key, value]) => [key, value]),
-        )
-      : {};
-  }
-  return parseCodexHeaders(saved.block);
+  return saved.kind === "json"
+    ? parseJsonEntryHeaders(saved.entry)
+    : parseCodexBlockHeaders(saved.block);
 }
 
 function isLoopbackMcpUrl(value: string | undefined): boolean {

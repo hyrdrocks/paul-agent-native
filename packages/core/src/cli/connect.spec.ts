@@ -1169,6 +1169,33 @@ describe("runConnect", () => {
     }
   });
 
+  it("reconnect surfaces a corrupt JSON config instead of reporting nothing connected", async () => {
+    const root = tmpDir();
+    process.chdir(root);
+    fs.writeFileSync(path.join(root, ".mcp.json"), '{"mcpServers": [BROKEN');
+
+    const err = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+
+    await runConnect(
+      [
+        "reconnect",
+        "https://plan.agent-native.com",
+        "--client",
+        "claude-code",
+        "--scope",
+        "project",
+      ],
+      { fetchImpl: vi.fn(), sleep: noopSleep, openBrowser: vi.fn() },
+    );
+
+    expect(process.exitCode).toBe(1);
+    expect(err.mock.calls.flat().join("")).toContain(
+      "Cannot parse JSON config file",
+    );
+  });
+
   it("reconnect without a URL fails clearly when no existing entry is present", async () => {
     const root = tmpDir();
     const home = tmpDir();
@@ -1937,6 +1964,64 @@ describe("runConnect", () => {
         Authorization: `Bearer ${fakeJwt("u@example.com")}`,
       },
     });
+  });
+
+  it("reads a Codex http_headers sub-table when switching to dev and back", async () => {
+    const root = tmpDir();
+    const home = tmpDir();
+    const oldHome = process.env.HOME;
+    const profilesFile = path.join(root, "profiles.json");
+    const codexFile = path.join(home, ".codex", "config.toml");
+    const bearer = fakeJwt("u@example.com");
+    fs.mkdirSync(path.dirname(codexFile), { recursive: true });
+    fs.writeFileSync(
+      codexFile,
+      [
+        '[mcp_servers."agent-native-mail"]',
+        'url = "https://mail.agent-native.com/mcp"',
+        "",
+        '[mcp_servers."agent-native-mail".http_headers]',
+        `Authorization = "Bearer ${bearer}"`,
+        "",
+      ].join("\n"),
+    );
+    process.env.HOME = home;
+    process.chdir(root);
+
+    try {
+      await runConnect(
+        [
+          "dev",
+          "--apps",
+          "mail",
+          "--client",
+          "codex",
+          "--gateway",
+          "http://127.0.0.1:8080",
+        ],
+        {
+          profilesFile,
+          fetchImpl: vi.fn(async () => {
+            throw new Error("gateway not running");
+          }) as unknown as typeof fetch,
+        },
+      );
+
+      // The owner email can only come from the bearer in the sub-table.
+      let toml = fs.readFileSync(codexFile, "utf-8");
+      expect(toml).toContain('url = "http://127.0.0.1:8080/mail/mcp"');
+      expect(toml).toContain('"X-Agent-Native-Owner-Email" = "u@example.com"');
+
+      await runConnect(["prod", "--apps", "mail", "--client", "codex"], {
+        profilesFile,
+      });
+
+      toml = fs.readFileSync(codexFile, "utf-8");
+      expect(toml).toContain('url = "https://mail.agent-native.com/mcp"');
+      expect(toml).toContain(`Authorization = "Bearer ${bearer}"`);
+    } finally {
+      process.env.HOME = oldHome;
+    }
   });
 
   it("switches a Codex entry to dev and restores the raw production block", async () => {
