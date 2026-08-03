@@ -86,6 +86,15 @@ A thunk lets the readiness gate start the init inside a live request context and
 keep it alive with that request's `waitUntil`, and lets the gate re-run it once
 after a failure instead of answering the same 503 for the isolate's whole life.
 
+`paths` tells the gate where to install placeholders and which prefixes to
+report as unavailable if this init fails. It is NOT a dependency declaration, and
+nothing else may read it as one: `/mcp` is mounted by the agent-chat init while
+`/mcp/oauth` is mounted by core-routes, so no request path identifies the plugin
+whose init must finish first. On Cloudflare Workers a gated request therefore
+waits for every tracked init, not the prefix-matching ones. Declare the prefixes
+you register and do not narrow them to make a cold start feel faster — a request
+released early gets a 404 the client cannot retry.
+
 ## Actions-First Approach
 
 For standard CRUD and data operations, use `defineAction` in `actions/` — the framework auto-mounts them as HTTP endpoints at `/_agent-native/actions/:name`. Only create custom `/api/*` routes for things actions can't do:

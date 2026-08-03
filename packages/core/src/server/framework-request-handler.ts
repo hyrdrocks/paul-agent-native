@@ -52,6 +52,13 @@ const PROVIDED_PLUGIN_STEMS_KEY = "_agentNativeProvidedPluginStems";
 const MIDDLEWARE_DISPATCHER_PATCHED_KEY =
   "_agentNativeMiddlewareDispatcherPatched";
 const REQUEST_CONTEXT_BOUNDARY_KEY = "_agentNativeRequestContextBoundary";
+const INIT_GUARD_KEY = "_agentNativeFrameworkInitGuard";
+
+/**
+ * h3's "no route matched" sentinel, which it later turns into a 404. Registered
+ * symbol, so reading it here cannot drift from the h3 instance in use.
+ */
+const H3_NOT_FOUND = Symbol.for("h3.notFound");
 
 interface PluginReadyEntry {
   /** Undefined until the init has actually been started (see `start`). */
@@ -299,6 +306,109 @@ function registerRequestContextBoundary(nitroApp: any): void {
   markRequestBoundaryInstalled();
 }
 
+function isGatedPath(reqPath: string): boolean {
+  return Boolean(
+    resolveMountMatch(reqPath, FRAMEWORK_PREFIX) ||
+    resolveMountMatch(reqPath, WELL_KNOWN_PREFIX) ||
+    resolveMountMatch(reqPath, MCP_PUBLIC_ROUTE_PREFIX),
+  );
+}
+
+interface ReadinessSnapshot {
+  bootstrap: "unstarted" | "pending" | "failed" | "ready";
+  pending: string[];
+  failed: string[];
+}
+
+/**
+ * What this isolate can currently prove about its own framework init.
+ *
+ * Entries are pruned once they settle cleanly, so a healthy warm isolate reports
+ * `ready` with nothing pending — which is what makes "incomplete" a usable
+ * signal rather than a permanent state.
+ */
+function describeFrameworkReadiness(nitroApp: any): ReadinessSnapshot {
+  const state = nitroApp?.[BOOTSTRAP_STATE_KEY] as InitState | undefined;
+  const entries =
+    (nitroApp?.[PLUGIN_READY_KEY] as PluginReadyEntry[] | undefined) ?? [];
+  const label = (entry: PluginReadyEntry) =>
+    entry.paths?.join(",") || "(unscoped)";
+  return {
+    bootstrap: !state
+      ? "unstarted"
+      : state.error
+        ? "failed"
+        : state.settled
+          ? "ready"
+          : "pending",
+    pending: entries.filter((entry) => !entry.state.settled).map(label),
+    failed: entries.filter((entry) => entry.state.error).map(label),
+  };
+}
+
+function isFrameworkInitIncomplete(snapshot: ReadinessSnapshot): boolean {
+  return (
+    snapshot.bootstrap !== "ready" ||
+    snapshot.pending.length > 0 ||
+    snapshot.failed.length > 0
+  );
+}
+
+/**
+ * Last-resort middleware for the gated prefixes: it runs after every route, so
+ * reaching it means nothing matched this request.
+ *
+ * A gated prefix answering a bare 404 is the one failure external clients cannot
+ * survive. An MCP client makes a handful of discovery/handshake calls and does
+ * not retry, so a single 404 on `/mcp` or
+ * `/.well-known/oauth-authorization-server` kills the connection outright, while
+ * a 503 is a "try again" it can act on. Whenever this isolate cannot prove its
+ * own init finished, "no route" means "not mounted yet", not "does not exist" —
+ * those are different answers and must not share a status code.
+ *
+ * The warn line is unconditional on purpose. A gated 404 on a fully-initialized
+ * isolate is a genuine missing route and worth seeing; a gated 404 with anything
+ * pending names the init that had not finished, which is the only way to tell
+ * the two apart from outside the isolate.
+ */
+function getFrameworkInitGuard(
+  nitroApp: any,
+): (event: H3Event, next: () => any) => any {
+  const cached = nitroApp[INIT_GUARD_KEY];
+  if (cached) return cached;
+
+  const guard = async (event: H3Event, next: () => any) => {
+    const reqPath = event.url?.pathname ?? "";
+    if (!isGatedPath(reqPath)) return next();
+
+    const result = await next();
+    if (result !== undefined && result !== H3_NOT_FOUND) return result;
+
+    const readiness = describeFrameworkReadiness(nitroApp);
+    const incomplete = isFrameworkInitIncomplete(readiness);
+    console.warn(
+      `[agent-native] no framework route matched ${reqPath} — ` +
+        `bootstrap=${readiness.bootstrap} ` +
+        `pending=[${readiness.pending.join(" ")}] ` +
+        `failed=[${readiness.failed.join(" ")}] ` +
+        `answering ${incomplete ? "503" : "404"}`,
+    );
+    if (!incomplete) return result;
+
+    setResponseStatus(event, 503);
+    setResponseHeader(event, "retry-after", "5");
+    return {
+      error: "agent-native routes are still initializing",
+      bootstrap: readiness.bootstrap,
+      pending: readiness.pending,
+      failed: readiness.failed,
+    };
+  };
+
+  nitroApp[INIT_GUARD_KEY] = guard;
+  return guard;
+}
+
 /**
  * Nitro 3 production builds generate a route dispatcher by overriding h3's
  * internal `~getMiddleware()` hook. Some generated dispatchers return only
@@ -324,15 +434,14 @@ function ensureGlobalMiddlewareDispatch(nitroApp: any): void {
     const globalMiddleware = Array.isArray(h3["~middleware"])
       ? h3["~middleware"]
       : [];
-    if (globalMiddleware.length === 0) return originalList;
-
     const alreadyIncluded = new Set(originalList);
     const missingGlobal = globalMiddleware.filter(
       (middleware) => !alreadyIncluded.has(middleware),
     );
-    return missingGlobal.length
-      ? [...missingGlobal, ...originalList]
-      : originalList;
+    // Appended here rather than registered, because "last" is the guard's whole
+    // contract and registration order cannot provide it: real routes are pushed
+    // onto `~middleware` during plugin init, long after this module runs.
+    return [...missingGlobal, ...originalList, getFrameworkInitGuard(nitroApp)];
   };
 
   h3["~getMiddleware"] = wrappedGetMiddleware;
@@ -470,7 +579,7 @@ async function awaitFrameworkRoutesReadyForRequest(
   retryBootstrapIfFailed(nitroApp, event);
   startDeferredPluginInits(nitroApp, event);
   if (isCrossRequestPromiseUnsafe()) {
-    return pollFrameworkRoutesReady(nitroApp, reqPath, event);
+    return pollFrameworkRoutesReady(nitroApp, event);
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -496,10 +605,20 @@ async function awaitFrameworkRoutesReadyForRequest(
  *
  * Init work that has not started yet is started here, so it belongs to a live
  * request context rather than to isolate scope.
+ *
+ * Waits for EVERY tracked init, not just the ones whose declared paths match
+ * this request. `paths` says where a plugin registers its own routes, which is
+ * not the same question as which plugin owns the route being requested: `/mcp`
+ * is mounted by the agent-chat init while `/mcp/oauth` is mounted by
+ * core-routes, so scoping by prefix released `/mcp` as soon as core-routes
+ * finished and answered a 404 for a handler that was still being mounted. On a
+ * cold isolate every init is running concurrently anyway, so the wall-clock cost
+ * is the slowest init either way. The deadline still bounds it, and a single
+ * stalled init now holds every gated prefix rather than one — a retryable 503
+ * instead of an unrecoverable 404, which is the trade we want.
  */
 async function pollFrameworkRoutesReady(
   nitroApp: any,
-  reqPath: string,
   event?: H3Event,
 ): Promise<boolean> {
   const deadline = Date.now() + frameworkReadyDeadlineMs();
@@ -511,13 +630,11 @@ async function pollFrameworkRoutesReady(
 
     startDeferredPluginInits(nitroApp, event);
     const pending = bootstrapSettled
-      ? relevantPluginEntries(nitroApp, reqPath).filter(
-          (entry) => !entry.state.settled,
-        )
+      ? relevantPluginEntries(nitroApp).filter((entry) => !entry.state.settled)
       : [];
 
     if (bootstrapSettled && pending.length === 0) {
-      prunePluginEntries(nitroApp, reqPath);
+      prunePluginEntries(nitroApp);
       return true;
     }
     if (Date.now() >= deadline) return false;

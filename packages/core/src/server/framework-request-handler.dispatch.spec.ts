@@ -1,0 +1,161 @@
+/**
+ * Cold-isolate route dispatch, against REAL h3 wired the way Nitro 3 generates
+ * it — `config.onRequest` bridged to the `request` hook, `~findRoute` for
+ * file-based routes, and a `~getMiddleware` dispatcher that (as Nitro emits it
+ * for an app with no `server/middleware/*`) does not include the global
+ * `~middleware` array at all.
+ *
+ * The hand-rolled harness in `framework-request-handler.workers.spec.ts` asserts
+ * the framework's own bookkeeping. This file asserts what a client actually
+ * receives, because the failures that survived the first fix were all of the
+ * form "the gate said ready and the response was still a 404": on a genuinely
+ * cold Cloudflare isolate, six sequential samples of `/mcp`,
+ * `/.well-known/oauth-authorization-server` and
+ * `/.well-known/oauth-protected-resource` each returned exactly one 404, always
+ * the slow first request, at 2.4-3.9s — the full cost of init, paid and then
+ * thrown away.
+ */
+import { H3Core } from "h3";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { getH3App, trackPluginInit } from "./framework-request-handler.js";
+
+vi.mock("../deploy/route-discovery.js", () => ({
+  getMissingDefaultPlugins: vi.fn(async () => []),
+}));
+
+/**
+ * `hookable`'s serial `callHook`, inlined: it returns a promise as soon as a
+ * hook returns one, which is exactly what h3 awaits before resolving the route.
+ * Getting this wrong would hide the bug these tests exist to catch.
+ */
+function createHooks() {
+  const registered: Record<string, Array<(...args: any[]) => any>> = {};
+  return {
+    hook: (name: string, fn: (...args: any[]) => any) => {
+      (registered[name] ??= []).push(fn);
+    },
+    callHook: (name: string, ...args: any[]) => {
+      const list = registered[name] ?? [];
+      const step = (i: number): any => {
+        if (i >= list.length) return undefined;
+        const result = list[i](...args);
+        return result && typeof result.then === "function"
+          ? Promise.resolve(result).then(() => step(i + 1))
+          : step(i + 1);
+      };
+      return step(0);
+    },
+  };
+}
+
+function createNitroApp() {
+  const hooks = createHooks();
+  const h3App = new H3Core({});
+  (h3App as any).config.onRequest = (event: any) =>
+    hooks.callHook("request", event)?.catch?.(() => {});
+  // No file-based route matches a framework path.
+  (h3App as any)["~findRoute"] = () => undefined;
+  // Nitro emits this dispatcher whenever the app has route rules; with no
+  // `server/middleware/*` files it never reads `h3App["~middleware"]`, which is
+  // the array `getH3App().use()` writes to.
+  (h3App as any)["~getMiddleware"] = () => [];
+  return {
+    fetch: (req: Request) => (h3App as any).fetch(req),
+    h3: h3App,
+    hooks,
+  };
+}
+
+function get(nitroApp: any, path: string): Promise<Response> {
+  return nitroApp.fetch(new Request(`https://worker.test${path}`));
+}
+
+describe("cold-isolate dispatch on Cloudflare Workers", () => {
+  beforeEach(() => {
+    (globalThis as any).__cf_env = {};
+    process.env.AGENT_NATIVE_ROUTE_READY_TIMEOUT_MS = "2000";
+  });
+
+  afterEach(() => {
+    delete (globalThis as any).__cf_env;
+    delete process.env.AGENT_NATIVE_ROUTE_READY_TIMEOUT_MS;
+    vi.restoreAllMocks();
+  });
+
+  it("holds a request for an init that mounts its route under another plugin's prefix", async () => {
+    const nitroApp = createNitroApp();
+
+    // Production shape: core-routes declares "/mcp" (it owns /mcp/oauth and
+    // /mcp/connect) and finishes early, while the agent-chat init is what
+    // actually mounts the /mcp protocol endpoint under a prefix of its own.
+    trackPluginInit(nitroApp, async () => {}, {
+      paths: ["/_agent-native", "/mcp", "/.well-known"],
+    });
+    trackPluginInit(
+      nitroApp,
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        getH3App(nitroApp).use("/mcp", () => ({ mcp: "ok" }));
+      },
+      { paths: ["/_agent-native/agent-chat"] },
+    );
+
+    const response = await get(nitroApp, "/mcp");
+
+    // Scoping readiness by declared prefix released this request as soon as the
+    // first entry settled, and answered the 404 that kills MCP clients.
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ mcp: "ok" });
+  });
+
+  it("answers a gated path with a retryable 503 while any init is unfinished", async () => {
+    const nitroApp = createNitroApp();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // An init that never settles: the isolate cannot prove it is initialized, so
+    // "no route" is unknown, not absent.
+    trackPluginInit(nitroApp, () => new Promise<void>(() => {}), {
+      paths: ["/_agent-native/agent-chat"],
+    });
+
+    const response = await get(
+      nitroApp,
+      "/.well-known/oauth-authorization-server",
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("5");
+    const body = (await response.json()) as any;
+    expect(body.pending).toContain("/_agent-native/agent-chat");
+    warn.mockRestore();
+  });
+
+  it("still answers 404 for a gated path on a fully initialized isolate", async () => {
+    const nitroApp = createNitroApp();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    trackPluginInit(
+      nitroApp,
+      async () => {
+        getH3App(nitroApp).use("/mcp", () => ({ mcp: "ok" }));
+      },
+      { paths: ["/mcp"] },
+    );
+
+    expect((await get(nitroApp, "/mcp")).status).toBe(200);
+    // A route that genuinely does not exist must not be dressed up as a
+    // transient failure — that would make every client typo retry forever.
+    expect((await get(nitroApp, "/_agent-native/nope")).status).toBe(404);
+    warn.mockRestore();
+  });
+
+  it("leaves non-gated paths to the app", async () => {
+    const nitroApp = createNitroApp();
+    trackPluginInit(nitroApp, async () => {}, { paths: ["/_agent-native"] });
+
+    // The guard must not touch the SSR/app surface: reaching it on `/` would
+    // mean rewriting the app's own 404s.
+    expect((await get(nitroApp, "/vault")).status).toBe(404);
+  });
+});
