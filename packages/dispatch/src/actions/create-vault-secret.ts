@@ -1,6 +1,7 @@
 import { defineAction } from "@agent-native/core";
 import { z } from "zod";
 
+import { vaultAuditTarget, vaultResultId } from "../server/lib/vault-audit.js";
 import { createSecret } from "../server/lib/vault-store.js";
 
 export default defineAction({
@@ -23,6 +24,13 @@ export default defineAction({
   // secret storage; the audit log must record THAT a secret was created — never
   // the value. Opt out of input capture so the trail can't become a second
   // durable credential store.
-  audit: { recordInputs: false },
+  audit: {
+    recordInputs: false,
+    target: (_args, result, meta) =>
+      vaultAuditTarget(meta, {
+        type: "vault-secret",
+        id: vaultResultId(result),
+      }),
+  },
   run: async (args) => createSecret(args),
 });

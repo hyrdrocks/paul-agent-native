@@ -1,6 +1,11 @@
 import { defineAction } from "@agent-native/core";
 import { z } from "zod";
 
+import {
+  vaultAuditTarget,
+  vaultRequestAuditOrgId,
+  vaultResultId,
+} from "../server/lib/vault-audit.js";
 import { createRequest } from "../server/lib/vault-store.js";
 
 export default defineAction({
@@ -13,5 +18,13 @@ export default defineAction({
     appId: z.string().describe("App ID that needs the credential"),
     reason: z.string().optional().describe("Why this credential is needed"),
   }),
+  audit: {
+    target: (_args, result, meta) =>
+      vaultAuditTarget(meta, {
+        type: "vault-request",
+        id: vaultResultId(result),
+        orgId: vaultRequestAuditOrgId(result),
+      }),
+  },
   run: async (args) => createRequest(args),
 });

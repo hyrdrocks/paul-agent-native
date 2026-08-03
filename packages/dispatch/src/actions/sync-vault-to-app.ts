@@ -1,6 +1,7 @@
 import { defineAction } from "@agent-native/core";
 import { z } from "zod";
 
+import { vaultAuditTarget } from "../server/lib/vault-audit.js";
 import { syncGrantsToApp } from "../server/lib/vault-store.js";
 
 export default defineAction({
@@ -11,5 +12,9 @@ export default defineAction({
       .string()
       .describe("App ID to sync secrets to, e.g. mail, calendar, analytics"),
   }),
+  audit: {
+    target: (args, _result, meta) =>
+      vaultAuditTarget(meta, { type: "vault-app", id: args.appId }),
+  },
   run: async (args) => syncGrantsToApp(args.appId),
 });

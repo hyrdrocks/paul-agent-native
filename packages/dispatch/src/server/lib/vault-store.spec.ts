@@ -437,6 +437,30 @@ describe("syncGrantsToApp", () => {
     expect(result.synced).toBe(2);
   });
 
+  it("records the sync in the framework audit log, not only the vault log", async () => {
+    fakeCredentialStore();
+    mockWorkspace({ ownerEmail: "clicker@example.test", orgId: "org_caller" }, [
+      {
+        id: "secret_own",
+        ownerEmail: "clicker@example.test",
+        orgId: "org_caller",
+        name: "Shared API Key",
+        credentialKey: "SHARED_API_KEY",
+        value: "sk-test-shared",
+      },
+    ]);
+
+    await syncGrantsToApp("coach");
+
+    expect(mocks.recordAudit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "vault.secrets.synced",
+        targetType: "vault-app",
+        targetId: "coach",
+      }),
+    );
+  });
+
   it("still syncs the caller's own org secrets into that org", async () => {
     const store = fakeCredentialStore();
     mockWorkspace({ ownerEmail: "clicker@example.test", orgId: "org_caller" }, [

@@ -23,7 +23,7 @@ import {
   recordAudit,
 } from "./dispatch-store.js";
 
-const VAULT_ACCESS_SETTINGS_KEY = "dispatch-vault-access-settings";
+export const VAULT_ACCESS_SETTINGS_KEY = "dispatch-vault-access-settings";
 const VAULT_SYNC_DESCRIPTION_PREFIX = "Synced from Dispatch vault:";
 
 export type VaultAccessMode = "all-apps" | "manual";
@@ -1009,6 +1009,13 @@ export async function syncGrantsToApp(
     },
   });
 
+  await recordAudit({
+    action: "vault.secrets.synced",
+    targetType: "vault-app",
+    targetId: appId,
+    summary: `Synced ${syncedKeys.length} vault secret(s) to ${appId}: ${syncedKeys.join(", ")}`,
+  });
+
   return {
     appId,
     accessMode: access.mode,
@@ -1061,11 +1068,12 @@ export async function createRequest(input: {
   const timestamp = now();
   const requestId = id();
   const actor = currentOwnerEmail();
+  const orgId = currentOrgId();
 
   await db.insert(schema.vaultRequests).values({
     id: requestId,
     ownerEmail: actor,
-    orgId: currentOrgId(),
+    orgId,
     credentialKey: input.credentialKey,
     appId: input.appId,
     reason: input.reason || null,
@@ -1082,6 +1090,17 @@ export async function createRequest(input: {
     appId: input.appId,
     summary: `${actor} requested ${input.credentialKey} for ${input.appId}`,
     metadata: { requestId, reason: input.reason },
+  });
+
+  // orgId is stamped from the row rather than left to default, so every
+  // request event in the trail is scoped to the request's own org — the same
+  // org approve/deny must later stamp when the reviewer sits elsewhere.
+  await recordAudit({
+    action: "vault.request.created",
+    targetType: "vault-request",
+    targetId: requestId,
+    orgId,
+    summary: `Requested vault secret ${input.credentialKey} for ${input.appId}`,
   });
 
   await notifyAdminsOfRequest(requestId, input);
@@ -1210,6 +1229,19 @@ export async function approveRequest(
     metadata: { requestId, reviewer },
   });
 
+  // Owner and org both come from the request row, not the reviewer. A reviewer
+  // in another org would otherwise write a row scoped to neither party:
+  // `listAuditEvents` requires owner AND org to match the reader, so the
+  // requester would lose the record of their own request being approved.
+  await recordAudit({
+    action: "vault.request.approved",
+    targetType: "vault-request",
+    targetId: requestId,
+    ownerEmail: claimedRequest.ownerEmail,
+    orgId: claimedRequest.orgId,
+    summary: `Approved vault secret ${claimedRequest.credentialKey} for ${claimedRequest.appId} (requested by ${claimedRequest.requestedBy})`,
+  });
+
   return getRequest(requestId, ctx);
 }
 
@@ -1253,6 +1285,15 @@ export async function denyRequest(
     appId: claimedRequest.appId,
     summary: `Denied ${claimedRequest.credentialKey} for ${claimedRequest.appId} (requested by ${claimedRequest.requestedBy})`,
     metadata: { requestId, reviewer, reason },
+  });
+
+  await recordAudit({
+    action: "vault.request.denied",
+    targetType: "vault-request",
+    targetId: requestId,
+    ownerEmail: claimedRequest.ownerEmail,
+    orgId: claimedRequest.orgId,
+    summary: `Denied vault secret ${claimedRequest.credentialKey} for ${claimedRequest.appId} (requested by ${claimedRequest.requestedBy})`,
   });
 
   return getRequest(requestId, ctx);
