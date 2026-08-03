@@ -1,5 +1,30 @@
 # @agent-native/core
 
+## 0.134.0-paul.0
+
+### Minor Changes
+
+- f3a868b: Read the Vault Audit tab from the framework action audit log, so reads,
+  mutations, and refused attempts arrive in one timeline with their status and
+  error code. The tab now filters by action, outcome, actor, and time, and pages
+  through results; the list surface still omits each event's recorded input.
+  `vault_audit_log` keeps its existing writers and rows — nothing reads it for
+  the tab. Audit queries gain a `targetTypes` filter for features whose events
+  span more than one target type.
+- 0c17835: Add `agent-native vault exec --key KEY [--key KEY...] [--app NAME] -- <command>`, which leases the named workspace vault secrets into a child process environment so a local agent session never has to paste a credential into a prompt. Leased values win over the existing environment and collisions are reported by key name only; the lease id goes to stderr and reaches the child as `AGENT_NATIVE_VAULT_LEASE`. Wrapper failures use private exit codes 64–68 so `vault exec` never impersonates the command it wrapped, and the child's own exit code propagates unchanged. `--help` states plainly that this is hygiene rather than containment.
+- 17b5fe8: Split the vault read surface: `list-vault-secrets` no longer returns secret
+  values at all, carrying a server-computed masked `last4` preview instead, and a
+  new `reveal-vault-secret` returns one value for one id. Reveal is mounted
+  `POST`-only, kept off the agent and tool-iframe surfaces, and audited on every
+  call — the audit row records the id and never the value. The vault UI's eye
+  toggle now fetches on demand and the edit dialog no longer prefills the stored
+  value, so a reveal in the timeline means a real reveal.
+
+  Core: vault action names join the auto-authenticated-read exclusion patterns, so
+  a value-returning vault action is never auto-advertised to external agents;
+  `filterAgentTools` is exported from `@agent-native/core/server` so apps can
+  assert an `agentTool: false` action really is absent from the agent tool list.
+
 ## 0.133.3
 
 ### Patch Changes
