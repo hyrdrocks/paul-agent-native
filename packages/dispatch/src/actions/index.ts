@@ -76,6 +76,7 @@ import removePendingWorkspaceApp from "./remove-pending-workspace-app.js";
 import requestVaultSecret from "./request-vault-secret.js";
 import resolveIntegrationSourceContext from "./resolve-integration-source-context.js";
 import restoreStarterWorkspaceResources from "./restore-starter-workspace-resources.js";
+import revealVaultSecret from "./reveal-vault-secret.js";
 import revokeVaultGrant from "./revoke-vault-grant.js";
 import revokeWorkspaceResourceGrant from "./revoke-workspace-resource-grant.js";
 import scaffoldWorkspaceApp from "./scaffold-workspace-app.js";
@@ -179,6 +180,7 @@ export const dispatchActions: Record<string, ActionEntry> = {
   "resolve-integration-source-context": resolveIntegrationSourceContext,
   "remix-workspace-template": remixWorkspaceTemplate,
   "request-vault-secret": requestVaultSecret,
+  "reveal-vault-secret": revealVaultSecret,
   "revoke-vault-grant": revokeVaultGrant,
   "revoke-workspace-resource-grant": revokeWorkspaceResourceGrant,
   "restore-starter-workspace-resources": restoreStarterWorkspaceResources,

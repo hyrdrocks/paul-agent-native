@@ -214,7 +214,9 @@ function EditSecretDialog({ secret }: { secret: any }) {
     secret.credentialKey || "",
   );
   const [name, setName] = useState(secret.name || "");
-  const [value, setValue] = useState(secret.value || "");
+  // Never prefilled. The dialog has no value to prefill with, and giving it
+  // one would make every edit a reveal that nothing recorded.
+  const [value, setValue] = useState("");
   const [provider, setProvider] = useState(secret.provider || "");
   const [description, setDescription] = useState(secret.description || "");
   const [showValue, setShowValue] = useState(false);
@@ -231,7 +233,7 @@ function EditSecretDialog({ secret }: { secret: any }) {
   const resetDraft = () => {
     setCredentialKey(secret.credentialKey || "");
     setName(secret.name || "");
-    setValue(secret.value || "");
+    setValue("");
     setProvider(secret.provider || "");
     setDescription(secret.description || "");
     setShowValue(false);
@@ -267,7 +269,9 @@ function EditSecretDialog({ secret }: { secret: any }) {
               id: secret.id,
               credentialKey,
               name,
-              value,
+              // Omitted rather than sent empty: an untouched field must leave
+              // the stored value alone, not overwrite it with a blank.
+              ...(value ? { value } : {}),
               provider: provider || null,
               description: description || null,
             });
@@ -298,6 +302,7 @@ function EditSecretDialog({ secret }: { secret: any }) {
               <Input
                 id={`vault-secret-value-${secret.id}`}
                 type={showValue ? "text" : "password"}
+                placeholder="Leave blank to keep the current value"
                 value={value}
                 onChange={(e) => setValue(e.target.value)}
                 className="font-mono text-sm"
@@ -361,10 +366,7 @@ function EditSecretDialog({ secret }: { secret: any }) {
             <Button
               type="submit"
               disabled={
-                !credentialKey.trim() ||
-                !name.trim() ||
-                !value ||
-                update.isPending
+                !credentialKey.trim() || !name.trim() || update.isPending
               }
             >
               {update.isPending ? "Saving..." : "Save changes"}
@@ -491,7 +493,14 @@ function SecretRow({
   accessMode: VaultAccessMode;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const [showValue, setShowValue] = useState(false);
+  // The value is not in the list payload, so it is not in the page until
+  // someone clicks the eye — and clicking it writes an audit row.
+  const [revealedValue, setRevealedValue] = useState<string | null>(null);
+
+  const reveal = useActionMutation("reveal-vault-secret", {
+    onSuccess: (data: any) => setRevealedValue(data.value),
+    onError: (err) => toast.error(String(err)),
+  });
 
   const deleteSecret = useActionMutation("delete-vault-secret", {
     onSuccess: () => toast.success("Secret deleted"),
@@ -515,7 +524,10 @@ function SecretRow({
       <button
         type="button"
         className="flex w-full items-center gap-3 px-4 py-3 text-left cursor-pointer"
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => {
+          if (expanded) setRevealedValue(null);
+          setExpanded(!expanded);
+        }}
       >
         {expanded ? (
           <IconChevronDown size={16} className="text-muted-foreground" />
@@ -535,6 +547,9 @@ function SecretRow({
           </div>
           <div className="mt-0.5 font-mono text-xs text-muted-foreground">
             {secret.credentialKey}
+            {/* The preview lives here too: telling six OPENAI_API_KEY-ish
+                rows apart should not cost six expands. */}
+            {secret.last4 ? ` · ${secret.last4}` : ""}
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -557,14 +572,34 @@ function SecretRow({
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground">Value:</span>
             <code className="text-xs font-mono text-foreground">
-              {showValue ? secret.value : `••••${secret.value.slice(-4)}`}
+              {/* "" is a row with nothing stored; a missing field is a list
+                  payload that could not say either way. They are not the
+                  same answer, so they do not render as the same sentence. */}
+              {revealedValue ??
+                (typeof secret.last4 === "string"
+                  ? secret.last4 || "No value stored"
+                  : "Preview unavailable")}
             </code>
             <button
               type="button"
-              onClick={() => setShowValue(!showValue)}
+              disabled={reveal.isPending}
+              onClick={() =>
+                revealedValue !== null
+                  ? setRevealedValue(null)
+                  : reveal.mutate({ id: secret.id })
+              }
               className="text-muted-foreground hover:text-foreground cursor-pointer"
+              aria-label={
+                revealedValue !== null
+                  ? "Hide secret value"
+                  : "Reveal secret value"
+              }
             >
-              {showValue ? <IconEyeOff size={14} /> : <IconEye size={14} />}
+              {revealedValue !== null ? (
+                <IconEyeOff size={14} />
+              ) : (
+                <IconEye size={14} />
+              )}
             </button>
           </div>
 

@@ -1,11 +1,12 @@
 import { defineAction } from "@agent-native/core";
+import { last4 } from "@agent-native/core/secrets";
 import { z } from "zod";
 
 import { listSecrets } from "../server/lib/vault-store.js";
 
 export default defineAction({
   description:
-    "List all secrets stored in the workspace vault. Includes raw values so the UI mask/unmask toggle works — masking is a UI concern, not a data concern. Agent responses should still mask values when echoing them to users.",
+    "List the secrets stored in the workspace vault: names, credential keys, and a masked last-4 preview. Never returns secret values — one id at a time goes through `reveal-vault-secret`, which is audited.",
   schema: z.object({}),
   http: { method: "GET" },
   run: async () => {
@@ -14,9 +15,10 @@ export default defineAction({
       id: s.id,
       name: s.name,
       credentialKey: s.credentialKey,
-      // Included so the vault UI's eye-icon toggle can reveal the stored
-      // value. Without this the "unmask" click shows an empty string.
-      value: s.value,
+      // Enough to tell six OPENAI_API_KEY-ish rows apart without revealing
+      // any. `last4("")` is "" rather than a mask, so a row stored with no
+      // value stays distinguishable from one whose value is simply short.
+      last4: last4(s.value),
       provider: s.provider,
       description: s.description,
       createdBy: s.createdBy,

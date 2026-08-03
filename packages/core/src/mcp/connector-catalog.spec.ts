@@ -855,6 +855,23 @@ describe("connector-catalog tier — no connectorCatalog declared", () => {
         publicAgent: { expose: true, readOnly: true, requiresAuth: true },
         run: async () => ({ ok: true }),
       },
+      // The vault family is excluded by name, not by what it happens to
+      // return today: a future value-returning vault read must not become an
+      // auto-advertised read the day someone annotates it as one.
+      "list-vault-secrets": {
+        tool: { description: "List workspace vault secrets" },
+        http: { method: "GET" },
+        readOnly: true,
+        publicAgent: { expose: true, readOnly: true, requiresAuth: true },
+        run: async () => ({ ok: true }),
+      },
+      "lease-vault-secrets": {
+        tool: { description: "Lease workspace vault secrets" },
+        http: { method: "GET" },
+        readOnly: true,
+        publicAgent: { expose: true, readOnly: true, requiresAuth: true },
+        run: async () => ({ ok: true }),
+      },
     };
 
     it("never auto-advertises or auto-calls excluded actions even when fully annotated as authenticated reads", async () => {
@@ -877,11 +894,15 @@ describe("connector-catalog tier — no connectorCatalog declared", () => {
       expect(names).not.toContain("db-query");
       expect(names).not.toContain("seed-demo-data");
       expect(names).not.toContain("context-preview-get");
+      expect(names).not.toContain("list-vault-secrets");
+      expect(names).not.toContain("lease-vault-secrets");
 
       for (const name of [
         "db-query",
         "seed-demo-data",
         "context-preview-get",
+        "list-vault-secrets",
+        "lease-vault-secrets",
       ]) {
         const callOut = await call(
           {

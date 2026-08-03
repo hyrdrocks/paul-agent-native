@@ -490,11 +490,17 @@ const AUTO_READ_EXCLUDED_ACTION_NAMES = new Set([
  * prefixes around a shared noun (e.g. `list-extensions`, `create-extension`,
  * `hide-extension`; `list-browser-sessions`, `run-browser-session-action`) —
  * so a leading-prefix match alone would miss most of them.
+ *
+ * `vault` covers the whole family for the same reason, and deliberately covers
+ * more than the actions that return a value today: over-breadth here is
+ * recoverable with one `connectorCatalog` entry, under-breadth is a silent
+ * credential leak to an external caller.
  */
 const AUTO_READ_EXCLUDED_ACTION_PATTERNS: RegExp[] = [
   /^seed-/,
   /extension/,
   /browser-session/,
+  /vault/,
 ];
 
 export function isAutoReadExcludedActionName(name: string): boolean {

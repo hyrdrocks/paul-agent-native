@@ -22,6 +22,8 @@ ladder.
   vault, integrations, resource grants, messaging, routing, and approvals.
 - Do not expose secret values. Vault stores references and encrypted values; apps
   receive grants or credential refs, not copied tokens.
+- No vault read returns a secret value to you. Revealing one is a human action
+  in the vault UI — point the user there rather than hunting for another read.
 - Workspace integrations own provider identity, readiness, metadata, and grants.
   Domain apps still own provider-specific readers and interpretation.
 - Integration grants are not provider capability limits. For ad hoc provider
