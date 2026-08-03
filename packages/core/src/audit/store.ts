@@ -280,6 +280,18 @@ export async function queryAuditEvents(
     args.push(value);
   };
   if (filters.targetType) push("target_type = ?", filters.targetType);
+  if (filters.targetTypes) {
+    // An empty set matches nothing rather than everything: a caller that
+    // narrowed to zero types asked for zero rows, and widening back to the
+    // whole log would hand it other features' events as if they were its own.
+    if (filters.targetTypes.length === 0) where.push("1=0");
+    else {
+      where.push(
+        `target_type IN (${filters.targetTypes.map(() => "?").join(", ")})`,
+      );
+      args.push(...filters.targetTypes);
+    }
+  }
   if (filters.targetId) push("target_id = ?", filters.targetId);
   if (filters.actorKind) push("actor_kind = ?", filters.actorKind);
   if (filters.actorEmail) push("actor_email = ?", filters.actorEmail);
@@ -304,9 +316,12 @@ export async function queryAuditEvents(
   const offset = Math.max(0, Math.floor(filters.offset ?? 0));
 
   const result = await client.execute({
+    // `id` breaks ties: one action can write several events in the same
+    // millisecond, and an unstable order silently duplicates or skips those
+    // rows across an offset page boundary.
     sql: `SELECT ${LIST_COLUMNS} FROM agent_audit_log
           WHERE ${where.join(" AND ")}
-          ORDER BY created_at DESC
+          ORDER BY created_at DESC, id DESC
           LIMIT ? OFFSET ?`,
     args: [...args, limit, offset],
   });

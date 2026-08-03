@@ -123,6 +123,10 @@ export interface AuditEvent {
 /** Filters for `queryAuditEvents`. */
 export interface AuditQueryFilters {
   targetType?: string;
+  /** Filter to any of several resource types, for a feature whose events span
+   *  more than one target type (e.g. the vault's secrets, grants, and
+   *  requests). An empty array matches nothing. */
+  targetTypes?: string[];
   targetId?: string;
   actorKind?: AuditActorKind;
   actorEmail?: string;

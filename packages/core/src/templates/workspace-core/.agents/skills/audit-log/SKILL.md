@@ -84,6 +84,14 @@ SQL to the caller — they never leak another tenant's rows:
 Call them from the UI with `useActionQuery` to build an activity feed or a
 "who changed this" line — never hand-write a fetch to the audit table.
 
+A feature whose events span several target types reads them in one query with
+the `targetTypes` filter on `queryAuditEvents` (an empty array matches nothing,
+never everything). Dispatch's `list-vault-audit` does exactly that — it is the
+vault's timeline, narrowed to the `vault-*` target types, and the reason the
+Vault Audit tab shows refused access: a vault call that throws never reaches
+`recordVaultAudit`, but the action seam still records `denied` / `error` plus
+the `errorCode`.
+
 ## Never
 
 - Don't write a parallel "history" table for a resource — declare an `audit.target`

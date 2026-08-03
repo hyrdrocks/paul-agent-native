@@ -214,15 +214,11 @@ export async function recordVaultAudit(input: {
   });
 }
 
-export async function listVaultAudit(limit = 50) {
-  const db = getDb();
-  return db
-    .select()
-    .from(schema.vaultAuditLog)
-    .where(scopedFilter(schema.vaultAuditLog))
-    .orderBy(desc(schema.vaultAuditLog.createdAt))
-    .limit(limit);
-}
+// `vault_audit_log` is write-only now: the vault timeline reads the framework
+// action audit log via `listVaultAuditEvents`, which also sees the refused
+// calls that throw before `recordVaultAudit` can run. The table and its
+// writers stay — dropping it would be a non-additive migration, and its rows
+// remain the record of what happened before the re-point.
 
 // ─── Secrets ──────────────────────────────────────────────────────
 

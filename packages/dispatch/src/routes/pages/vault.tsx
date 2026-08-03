@@ -1,9 +1,11 @@
+import type { AuditEvent, AuditStatus } from "@agent-native/core/audit";
 import {
   useActionMutation,
   useActionQuery,
 } from "@agent-native/core/client/hooks";
 import {
   IconChevronDown,
+  IconChevronLeft,
   IconChevronRight,
   IconEdit,
   IconEye,
@@ -14,7 +16,7 @@ import {
   IconTrash,
   IconX,
 } from "@tabler/icons-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { ActionQueryError } from "../../components/action-query-error";
@@ -75,6 +77,23 @@ const PROVIDERS = [
 const PROVIDER_NONE_VALUE = "__none__";
 
 type VaultAccessMode = "all-apps" | "manual";
+
+const AUDIT_ANY_VALUE = "__any__";
+const AUDIT_PAGE_SIZE = 25;
+const AUDIT_TIME_RANGES: Array<{ value: string; label: string; ms: number }> = [
+  { value: "1h", label: "Last hour", ms: 60 * 60 * 1000 },
+  { value: "24h", label: "Last 24 hours", ms: 24 * 60 * 60 * 1000 },
+  { value: "7d", label: "Last 7 days", ms: 7 * 24 * 60 * 60 * 1000 },
+  { value: "30d", label: "Last 30 days", ms: 30 * 24 * 60 * 60 * 1000 },
+];
+
+/** One page of `list-vault-audit`, mirroring the action's return shape. */
+type VaultAuditPage = {
+  events: AuditEvent[];
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+};
 
 export function meta() {
   return [{ title: "Vault — Dispatch" }];
@@ -739,16 +758,219 @@ function RequestRow({ request }: { request: any }) {
   );
 }
 
+const AUDIT_STATUS_LABELS: Record<AuditStatus, string> = {
+  success: "Success",
+  denied: "Denied",
+  error: "Error",
+};
+
+function AuditStatusBadge({
+  status,
+  errorCode,
+}: {
+  status: AuditStatus;
+  errorCode?: string | null;
+}) {
+  if (status === "success") {
+    return <Badge variant="secondary">Success</Badge>;
+  }
+  // An unrecognized status shows itself rather than being relabelled "Error":
+  // a reader must be able to tell a refusal we know about from one we don't.
+  return (
+    <Badge variant="destructive">
+      {AUDIT_STATUS_LABELS[status] ?? status}
+      {errorCode ? ` · ${errorCode}` : ""}
+    </Badge>
+  );
+}
+
+/**
+ * Vault activity, read from the framework action audit log rather than
+ * `vault_audit_log`: a refused read throws inside the vault store before it
+ * could write a vault-log row, so only the action seam records the refusal.
+ * The list surface omits each event's recorded input, so browsing the timeline
+ * never streams key names or payloads in bulk.
+ */
+function VaultAuditTab() {
+  const [actionFilter, setActionFilter] = useState("");
+  const [actorFilter, setActorFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState(AUDIT_ANY_VALUE);
+  const [rangeFilter, setRangeFilter] = useState(AUDIT_ANY_VALUE);
+  const [offset, setOffset] = useState(0);
+
+  const rangeMs = AUDIT_TIME_RANGES.find((r) => r.value === rangeFilter)?.ms;
+  // Anchored to the moment the range changed. Recomputing `Date.now()` on every
+  // render would hand the query a new key each pass and refetch forever.
+  const sinceMs = useMemo(
+    () => (rangeMs === undefined ? undefined : Date.now() - rangeMs),
+    [rangeMs],
+  );
+
+  const auditQuery = useActionQuery("list-vault-audit", {
+    limit: AUDIT_PAGE_SIZE,
+    offset,
+    ...(actionFilter.trim() ? { action: actionFilter.trim() } : {}),
+    ...(actorFilter.trim() ? { actorEmail: actorFilter.trim() } : {}),
+    ...(statusFilter === AUDIT_ANY_VALUE ? {} : { status: statusFilter }),
+    ...(sinceMs === undefined ? {} : { sinceMs }),
+  });
+  const page = auditQuery.data as VaultAuditPage | undefined;
+  // A page that arrives without an `events` array is a broken response, not an
+  // empty timeline — say so instead of rendering "no vault activity yet" over
+  // a trail we failed to read.
+  const malformed = page !== undefined && !Array.isArray(page.events);
+  const events = malformed ? [] : (page?.events ?? []);
+
+  return (
+    <div className="space-y-3">
+      {auditQuery.isError ? (
+        <ActionQueryError
+          error={auditQuery.error}
+          onRetry={() => void auditQuery.refetch()}
+        />
+      ) : null}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          value={actionFilter}
+          onChange={(e) => {
+            setActionFilter(e.target.value);
+            setOffset(0);
+          }}
+          placeholder="Action, e.g. sync-vault-to-app"
+          className="h-8 w-56 text-sm"
+        />
+        <Input
+          value={actorFilter}
+          onChange={(e) => {
+            setActorFilter(e.target.value);
+            setOffset(0);
+          }}
+          placeholder="Actor email"
+          className="h-8 w-56 text-sm"
+        />
+        <Select
+          value={statusFilter}
+          onValueChange={(value) => {
+            setStatusFilter(value);
+            setOffset(0);
+          }}
+        >
+          <SelectTrigger className="h-8 w-36 text-sm">
+            <SelectValue placeholder="Any outcome" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={AUDIT_ANY_VALUE}>Any outcome</SelectItem>
+            <SelectItem value="success">Success</SelectItem>
+            <SelectItem value="denied">Denied</SelectItem>
+            <SelectItem value="error">Error</SelectItem>
+          </SelectContent>
+        </Select>
+        <Select
+          value={rangeFilter}
+          onValueChange={(value) => {
+            setRangeFilter(value);
+            setOffset(0);
+          }}
+        >
+          <SelectTrigger className="h-8 w-40 text-sm">
+            <SelectValue placeholder="Any time" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={AUDIT_ANY_VALUE}>Any time</SelectItem>
+            {AUDIT_TIME_RANGES.map((range) => (
+              <SelectItem key={range.value} value={range.value}>
+                {range.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {events.map((event) => (
+        <div key={event.id} className="rounded-xl border bg-muted/30 px-4 py-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="text-sm font-medium text-foreground">
+              {event.summary || event.action}
+            </div>
+            <AuditStatusBadge
+              status={event.status}
+              errorCode={event.errorCode}
+            />
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {event.actorEmail || "system"}
+            {event.actorKind === "agent" ? " (agent)" : ""} ·{" "}
+            {new Date(event.createdAt).toLocaleString()}
+            {event.targetType ? ` · ${event.targetType}` : ""}
+            {event.targetId ? ` ${event.targetId}` : ""}
+          </div>
+        </div>
+      ))}
+
+      {!auditQuery.isError && auditQuery.isLoading && (
+        <div className="rounded-xl border px-4 py-3 space-y-2">
+          <Skeleton className="h-4 w-1/3" />
+          <Skeleton className="h-3 w-2/3" />
+        </div>
+      )}
+
+      {malformed && (
+        <div className="rounded-2xl border border-dashed px-6 py-12 text-center text-sm text-muted-foreground">
+          Vault activity could not be read. Reload to try again.
+        </div>
+      )}
+
+      {!auditQuery.isError &&
+        !auditQuery.isLoading &&
+        !malformed &&
+        events.length === 0 && (
+          <div className="rounded-2xl border border-dashed px-6 py-12 text-center text-sm text-muted-foreground">
+            {offset > 0
+              ? "No vault activity on this page."
+              : "No vault activity yet."}
+          </div>
+        )}
+
+      {(offset > 0 || page?.hasMore) && (
+        <div className="flex items-center justify-between pt-1">
+          <span className="text-xs text-muted-foreground">
+            {`Events ${offset + 1}–${offset + events.length}`}
+          </span>
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={offset === 0}
+              onClick={() => setOffset(Math.max(0, offset - AUDIT_PAGE_SIZE))}
+            >
+              <IconChevronLeft size={16} />
+              Previous
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!page?.hasMore}
+              onClick={() => setOffset(offset + AUDIT_PAGE_SIZE)}
+            >
+              Next
+              <IconChevronRight size={16} />
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function VaultRoute() {
   const secretsQuery = useActionQuery("list-vault-secrets", {});
   const grantsQuery = useActionQuery("list-vault-grants", {});
   const requestsQuery = useActionQuery("list-vault-requests", {});
-  const auditQuery = useActionQuery("list-vault-audit", { limit: 20 });
   const accessQuery = useActionQuery("get-vault-access-settings", {});
   const { data: secrets, isLoading: secretsLoading } = secretsQuery;
   const { data: grants } = grantsQuery;
   const { data: requests } = requestsQuery;
-  const { data: audit } = auditQuery;
   const { data: accessSettings } = accessQuery;
   const accessMode: VaultAccessMode =
     (accessSettings as any)?.mode === "manual" ? "manual" : "all-apps";
@@ -878,31 +1100,8 @@ export default function VaultRoute() {
           )}
         </TabsContent>
 
-        <TabsContent value="audit" className="mt-4 space-y-2">
-          {auditQuery.isError ? (
-            <ActionQueryError
-              error={auditQuery.error}
-              onRetry={() => void auditQuery.refetch()}
-            />
-          ) : null}
-          {(audit || []).map((event: any) => (
-            <div
-              key={event.id}
-              className="rounded-xl border bg-muted/30 px-4 py-3"
-            >
-              <div className="text-sm font-medium text-foreground">
-                {event.summary}
-              </div>
-              <div className="mt-1 text-xs text-muted-foreground">
-                {event.actor} · {new Date(event.createdAt).toLocaleString()}
-              </div>
-            </div>
-          ))}
-          {!auditQuery.isError && (audit?.length || 0) === 0 && (
-            <div className="rounded-2xl border border-dashed px-6 py-12 text-center text-sm text-muted-foreground">
-              No vault activity yet.
-            </div>
-          )}
+        <TabsContent value="audit" className="mt-4">
+          <VaultAuditTab />
         </TabsContent>
       </Tabs>
     </DispatchShell>

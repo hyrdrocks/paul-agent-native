@@ -1,4 +1,12 @@
-import type { AuditCallMeta, AuditTarget } from "@agent-native/core/audit";
+import type {
+  AuditCallMeta,
+  AuditEvent,
+  AuditStatus,
+  AuditTarget,
+} from "@agent-native/core/audit";
+import { queryAuditEvents } from "@agent-native/core/audit";
+
+import { requireVaultCtx } from "./vault-store.js";
 
 /** The resource kinds a vault audit event can point at. */
 export type VaultAuditTargetType =
@@ -62,4 +70,81 @@ export function vaultRequestAuditOrgId(
   if (typeof orgId === "string") return orgId;
   if (orgId === null) return null;
   return undefined;
+}
+
+/**
+ * Every target type the vault stamps. Spelled as a full record so adding a
+ * `VaultAuditTargetType` without listing it here fails to compile — an
+ * unlisted type would silently drop those events out of the vault timeline.
+ */
+export const VAULT_AUDIT_TARGET_TYPES = Object.keys({
+  "vault-app": true,
+  "vault-grant": true,
+  "vault-request": true,
+  "vault-secret": true,
+  "vault-settings": true,
+} satisfies Record<VaultAuditTargetType, true>) as VaultAuditTargetType[];
+
+export interface VaultAuditQuery {
+  action?: string;
+  status?: AuditStatus;
+  actorEmail?: string;
+  sinceMs?: number;
+  limit?: number;
+  offset?: number;
+}
+
+export interface VaultAuditPage {
+  events: AuditEvent[];
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+}
+
+const DEFAULT_VAULT_AUDIT_LIMIT = 25;
+const MAX_VAULT_AUDIT_LIMIT = 100;
+
+/**
+ * The vault activity timeline: the framework action audit log narrowed to the
+ * vault's target types, so reads and mutations arrive from one query.
+ *
+ * It is not `vault_audit_log`. A refused vault call throws inside the store
+ * *before* `recordVaultAudit` could run, so that table can only ever hold the
+ * calls that succeeded; the action seam records `denied` and `error` too.
+ * `vault_audit_log` is still written by its existing callers — nothing reads it
+ * for this timeline.
+ *
+ * Vault *reads* appear here the moment a read action opts into
+ * `audit.onRead`; none does yet, so today this timeline is mutations and their
+ * refusals. Nothing about the query needs to change when reads arrive.
+ */
+export async function listVaultAuditEvents(
+  query: VaultAuditQuery = {},
+): Promise<VaultAuditPage> {
+  const ctx = requireVaultCtx();
+  const limit = Math.min(
+    Math.max(1, Math.floor(query.limit ?? DEFAULT_VAULT_AUDIT_LIMIT)),
+    MAX_VAULT_AUDIT_LIMIT,
+  );
+  const offset = Math.max(0, Math.floor(query.offset ?? 0));
+  const rows = await queryAuditEvents(
+    { userEmail: ctx.ownerEmail, orgId: ctx.orgId },
+    {
+      targetTypes: VAULT_AUDIT_TARGET_TYPES,
+      ...(query.action ? { action: query.action } : {}),
+      ...(query.status ? { status: query.status } : {}),
+      ...(query.actorEmail ? { actorEmail: query.actorEmail } : {}),
+      ...(typeof query.sinceMs === "number" ? { sinceMs: query.sinceMs } : {}),
+      // One row past the page answers "is there a next page" without a
+      // second COUNT over the same scan.
+      limit: limit + 1,
+      offset,
+    },
+  );
+  return {
+    events: rows.slice(0, limit),
+    limit,
+    offset,
+    hasMore: rows.length > limit,
+  };
 }
