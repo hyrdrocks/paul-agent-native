@@ -663,10 +663,22 @@ function readConfigFileOrAbsent(file: string): string | undefined {
   }
 }
 
-function readJsonMcpConnections(
+/** One MCP server entry as it literally appears in a JSON client config. */
+export interface JsonServerEntry {
+  serverName: string;
+  entry: Record<string, unknown>;
+}
+
+/**
+ * Read the raw, undecoded `mcpServers` entries out of a JSON client config, so
+ * a caller that has to replay an entry byte-for-byte (a saved profile, a
+ * rollback) keeps the fields this module does not model. An absent or empty
+ * file yields no entries; an unreadable or malformed one throws.
+ */
+export function readJsonServerEntries(
   client: ClientId,
   file: string,
-): McpConnection[] {
+): JsonServerEntry[] {
   const raw = readConfigFileOrAbsent(file);
   if (raw === undefined || !raw.trim()) return [];
   let parsed: any;
@@ -686,21 +698,46 @@ function readJsonMcpConnections(
     if (!server || typeof server !== "object" || Array.isArray(server)) {
       return [];
     }
-    const entry = server as Record<string, unknown>;
-    const requestInit =
-      entry.requestInit &&
-      typeof entry.requestInit === "object" &&
-      !Array.isArray(entry.requestInit)
-        ? (entry.requestInit as Record<string, unknown>)
-        : undefined;
-    return [
-      {
-        serverName,
-        url: typeof entry.url === "string" ? entry.url : undefined,
-        headers: stringHeaders(entry.headers ?? requestInit?.headers),
-      },
-    ];
+    return [{ serverName, entry: server as Record<string, unknown> }];
   });
+}
+
+/** The raw entry for one server, or `undefined` if the client has none. */
+export function readJsonServerEntry(
+  client: ClientId,
+  file: string,
+  serverName: string,
+): Record<string, unknown> | undefined {
+  return readJsonServerEntries(client, file).find(
+    (candidate) => candidate.serverName === serverName,
+  )?.entry;
+}
+
+/**
+ * The request headers a JSON entry carries, whether declared top-level or
+ * nested under `requestInit` (the shape OpenCode and Copilot use).
+ */
+export function parseJsonEntryHeaders(
+  entry: Record<string, unknown>,
+): Record<string, string> {
+  const requestInit =
+    entry.requestInit &&
+    typeof entry.requestInit === "object" &&
+    !Array.isArray(entry.requestInit)
+      ? (entry.requestInit as Record<string, unknown>)
+      : undefined;
+  return stringHeaders(entry.headers ?? requestInit?.headers);
+}
+
+function readJsonMcpConnections(
+  client: ClientId,
+  file: string,
+): McpConnection[] {
+  return readJsonServerEntries(client, file).map(({ serverName, entry }) => ({
+    serverName,
+    url: typeof entry.url === "string" ? entry.url : undefined,
+    headers: parseJsonEntryHeaders(entry),
+  }));
 }
 
 function parseInlineTomlTable(line: string): Record<string, string> {
@@ -719,59 +756,126 @@ function unescapeTomlString(value: string): string {
   return value.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
 }
 
+/** One MCP server's complete TOML footprint, as raw text. */
+export interface CodexServerBlock {
+  serverName: string;
+  /** The server table plus every sub-table of it, in first-seen order. */
+  block: string;
+}
+
 /**
- * Codex writes `http_headers` inline on the server table, but a hand-edited or
- * older config may carry it as a `[mcp_servers.<name>.http_headers]` sub-table
- * instead. Both forms have to be read, or a real connection reads back as one
- * with no bearer — which is indistinguishable from an unauthenticated entry.
+ * Split a Codex TOML config into one raw block per `[mcp_servers.*]` server.
+ * A server's footprint is its own table AND every sub-table of it
+ * (`.http_headers`, `.env`, …), wherever those sit in the file — stopping at
+ * the first sub-table header instead silently drops a bearer expressed that
+ * way, and hands `writeCodexBlock` a block that no longer restores the entry
+ * it came from. Absent file yields no blocks; an unreadable one throws.
  */
-function readCodexMcpConnections(file: string): McpConnection[] {
+export function readCodexServerBlocks(file: string): CodexServerBlock[] {
   const content = readConfigFileOrAbsent(file);
   if (content === undefined) return [];
 
   const lines = content.split(/\r?\n/);
-  const byName = new Map<string, McpConnection>();
+  const byName = new Map<string, string[]>();
   let i = 0;
   while (i < lines.length) {
-    const keys = parseTomlTableHeader(lines[i]);
-    if (!keys || keys.length < 2 || keys[0] !== "mcp_servers") {
+    const serverName = codexServerNameOfHeader(lines[i]);
+    if (serverName === undefined) {
       i++;
       continue;
     }
-    const serverName = keys[1];
-    const isServerTable = keys.length === 2;
-    const isHeaderTable = keys.length === 3 && keys[2] === "http_headers";
-    const body: string[] = [];
+    const table: string[] = [lines[i]];
     i++;
     while (i < lines.length && parseTomlTableHeader(lines[i]) === null) {
-      body.push(lines[i]);
+      table.push(lines[i]);
       i++;
     }
-
-    const connection = byName.get(serverName) ?? { serverName, headers: {} };
-    if (isServerTable) {
-      const urlLine = body.find((line) => /^\s*url\s*=/.test(line));
-      const urlMatch = urlLine?.match(/"((?:\\.|[^"])*)"/);
-      if (urlMatch) connection.url = unescapeTomlString(urlMatch[1]);
-      const headerLine = body.find((line) => /^\s*http_headers\s*=/.test(line));
-      if (headerLine) {
-        Object.assign(connection.headers, parseInlineTomlTable(headerLine));
-      }
-    } else if (isHeaderTable) {
-      for (const line of body) {
-        const pair = line.match(
-          /^\s*(?:"((?:\\.|[^"])*)"|([A-Za-z0-9_-]+))\s*=\s*"((?:\\.|[^"])*)"/,
-        );
-        if (!pair) continue;
-        const name =
-          pair[1] !== undefined ? unescapeTomlString(pair[1]) : pair[2];
-        connection.headers[name] = unescapeTomlString(pair[3]);
-      }
-    }
-    byName.set(serverName, connection);
+    const collected = byName.get(serverName);
+    if (collected) collected.push(...table);
+    else byName.set(serverName, table);
   }
 
-  return [...byName.values()];
+  return [...byName].map(([serverName, table]) => ({
+    serverName,
+    block: table.join("\n").replace(/\n*$/, "") + "\n",
+  }));
+}
+
+/** The complete TOML footprint of one server, or `undefined` if not present. */
+export function readCodexServerBlock(
+  file: string,
+  serverName: string,
+): string | undefined {
+  return readCodexServerBlocks(file).find(
+    (candidate) => candidate.serverName === serverName,
+  )?.block;
+}
+
+/**
+ * Decode ONE server's block — the text `readCodexServerBlocks` produced, never
+ * a whole file. Because a block concatenates a server's sub-tables, the walk
+ * has to track which table each line sits under: `url` and an inline
+ * `http_headers` count only on the server's own table, and bare key/value pairs
+ * count only under `.http_headers`. Reading either key from wherever it appears
+ * would let a `url` under `[mcp_servers.<name>.env]` masquerade as the server
+ * URL. Codex itself writes `http_headers` inline, but a hand-edited or older
+ * config may carry it as a `[mcp_servers.<name>.http_headers]` sub-table
+ * instead — both forms have to be read, or a real connection reads back as one
+ * with no bearer, which is indistinguishable from an unauthenticated entry.
+ */
+function parseCodexBlock(block: string): {
+  url?: string;
+  headers: Record<string, string>;
+} {
+  const headers: Record<string, string> = {};
+  let url: string | undefined;
+  // A block starts on the server's own table header, so anything before the
+  // first sub-table header belongs to the server.
+  let table: "server" | "http_headers" | "other" = "server";
+  for (const line of block.split(/\r?\n/)) {
+    const keys = parseTomlTableHeader(line);
+    if (keys) {
+      const isServer = keys.length === 2 && keys[0] === "mcp_servers";
+      const isHeaders = keys.length === 3 && keys[2] === "http_headers";
+      table = isServer ? "server" : isHeaders ? "http_headers" : "other";
+      continue;
+    }
+    if (table === "http_headers") {
+      const pair = line.match(
+        /^\s*(?:"((?:\\.|[^"])*)"|([A-Za-z0-9_-]+))\s*=\s*"((?:\\.|[^"])*)"/,
+      );
+      if (!pair) continue;
+      const name =
+        pair[1] !== undefined ? unescapeTomlString(pair[1]) : pair[2];
+      headers[name] = unescapeTomlString(pair[3]);
+      continue;
+    }
+    if (table !== "server") continue;
+    if (/^\s*http_headers\s*=/.test(line)) {
+      Object.assign(headers, parseInlineTomlTable(line));
+      continue;
+    }
+    const urlMatch = line.match(/^\s*url\s*=\s*"((?:\\.|[^"])*)"/);
+    if (urlMatch) url = unescapeTomlString(urlMatch[1]);
+  }
+  return { url, headers };
+}
+
+/** The `url = "…"` declared on one server block's own table. */
+export function parseCodexBlockUrl(block: string): string | undefined {
+  return parseCodexBlock(block).url;
+}
+
+/** The HTTP headers one server block declares, inline or as a sub-table. */
+export function parseCodexBlockHeaders(block: string): Record<string, string> {
+  return parseCodexBlock(block).headers;
+}
+
+function readCodexMcpConnections(file: string): McpConnection[] {
+  return readCodexServerBlocks(file).map(({ serverName, block }) => ({
+    serverName,
+    ...parseCodexBlock(block),
+  }));
 }
 
 /**
