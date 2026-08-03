@@ -1,0 +1,29 @@
+# Delegation profile
+
+Read by `/delegate-tickets` (step 1). Amended by the coordinator when a merge-back reveals a new
+baseline, known-noise test, or environment trap.
+
+**Where tickets live is not recorded here** — see `docs/agents/issue-tracker.md`.
+
+- **Remote**: `hyrdrocks/paul-agent-native` — a clean fork of `BuilderIO/agent-native` at core `0.133.3`, created 2026-08-03 for the vault-lease work. **Distinct from `sonhyrd/agent-native`** (28 commits of Cloudflare work, ADRs `0002`–`0005`); this fork deliberately does not build on that one, so its `docs/adr/` is empty and the next free ADR number is `0001`.
+- **Branch prefix**: `sss/`
+- **Post-merge check**: `pnpm typecheck && pnpm test:fast && pnpm guards`. Do not import the `agent-native` profile's known-failing list, which was measured on a different fork at a different commit.
+  - **Setup**: `pnpm install --ignore-scripts`, **not** a bare `pnpm install`. This machine has no C toolchain — `make` and `g++` are both absent (verified 2026-08-03) — so `node-pty`'s gyp build fails, aborts the whole install, leaves root bins unlinked, and every later `prepack` dies with `tsx: not found`. Nothing in a core or dispatch build needs the native binary, so `--ignore-scripts` is sufficient.
+  - **Build order matters and `--ignore-scripts` breaks it.** `packages/core` imports `@agent-native/toolkit` subpaths that resolve to toolkit's `dist`, which no longer gets built for you. Build toolkit before core or you get a wall of `TS2307: Cannot find module '@agent-native/toolkit/…'` — a stale-artifact failure wearing the shape of missing code.
+  - **Baseline measured at `dcc028cb` (2026-08-03, ticket #14):** `typecheck` clean, `guards` ALL PASS, `test:fast` red for two unrelated reasons — `templates/design` was already **117 tests red**, and *everything else* red only because `--ignore-scripts` leaves `better-sqlite3` with **no native binding**. Fix that with `npx prebuild-install` in `node_modules/better-sqlite3` (not `pnpm rebuild`, which needs the absent C toolchain); after it, `packages/dispatch` is 64 files / 364 tests green. **A wall of red `test:fast` output on a fresh worktree is almost certainly this, not your change** — check the binding before you debug anything else.
+  - **Run tests as `env -u CODEX_HOME pnpm test:fast`.** Orca injects `CODEX_HOME` into worker terminals, which makes every Codex config test read the wrong file. Found independently by the #18 and #20 workers: with it unset, `packages/core` goes from 14 red `connect.spec.ts` failures to 745 files all green.
+  - **The `templates/design` 117-red figure is not machine-independent.** #20 did not reproduce it — those tests need Playwright browsers that may or may not be installed. Measure the baseline on your machine rather than inheriting this number.
+  - **Four `test:fast` failures are load-flaky 5000 ms timeouts** (`packages/docs` ×2, `templates/factory`, `templates/crm`) that pass when re-run in isolation, and one (`templates/clips` audio-only-transcription) is deterministic and pre-existing. Re-run a suspected failure alone before calling it a regression.
+  - **Rebuild core in the merge worktree before believing a merge-back typecheck failure.** Any change to `packages/core/src/**` typechecks fine on the worker's branch (it rebuilt core) and then fails at merge-back against a stale `packages/core/dist`. Observed on #15: `error TS2561: 'targetTypes' does not exist in type 'AuditQueryFilters'` — a field that was plainly present in core's source. The message reads like the field was never added. Run `node scripts/prebuild-workspace-packages.ts postinstall` in the integration checkout, then re-run. This fires for every cross-package core change, so check it before diagnosing anything else.
+- **Commit policy**: conventional commit, **no issue-closing trailers**. Origin is a fork of BuilderIO and the tickets live in a third repo, so `closes #N` would point at an unrelated upstream issue. The coordinator closes tickets explicitly. Never add `Co-Authored-By` or agent attribution.
+- **Worker constraints**:
+  - **Pre-mode is already entered** (`.changeset/pre.json`, tag `paul`; core is `0.134.0-paul.0`). Add a changeset for your work, but do **not** run `changeset:version` and do **not** run `changeset pre exit` — versioning happens once per vendor cycle, in `paul-dispatch-app`'s #17 flow.
+- **`.changeset/pre.json` is repo-global — never create it on a ticket branch.** `changeset pre enter paul` pins `initialVersions` for all 21 packages, so every branch that runs it produces an identical file and every merge-back after the first conflicts. Ticket #18 owns entering pre mode, once, after the rest have merged. Individual tickets ship a plain changeset only.
+  - **Changeset required** for any source change under `packages/core` or `packages/dispatch` (`pnpm changeset:add`). Never hand-bump a package version. The changeset does **not** publish — the `@agent-native` npm scope is owned by `steve8708` and this fork cannot publish to it. It exists to version the fork and write its CHANGELOG.
+  - The version minted must be one **upstream will never issue** — `0.134.0-paul.N`, not a reused `0.133.3` — so a fork build identifies itself in `pnpm list` and in stack traces. See `paul-dispatch-app`'s `docs/adr/0001`.
+  - Read `CLAUDE.md` first, and the matching skill in `.agents/skills/` before changing that area; `secrets` is load-bearing for the vault work.
+  - Migrations are additive only; never drop, rename, or truncate.
+  - Never hardcode API keys, tokens, webhook URLs, or signing secrets — in source, tests, fixtures, or issue comments.
+  - **Never `git stash`** — the stash is shared across worktrees and would steal another worker's WIP.
+  - **Measure any baseline against `git merge-base main HEAD`**, never `HEAD` and never `main..HEAD`.
+  - **Stay on your own branch.** The coordinator owns merge-back.
