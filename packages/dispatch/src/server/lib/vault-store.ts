@@ -1,6 +1,14 @@
 import crypto from "node:crypto";
 
-import { and, desc, eq, isNull, or, sql } from "@agent-native/core/db/schema";
+import {
+  and,
+  desc,
+  eq,
+  inArray,
+  isNull,
+  or,
+  sql,
+} from "@agent-native/core/db/schema";
 import { ssrfSafeFetch } from "@agent-native/core/extensions/url-safety";
 import {
   deleteAppSecret,
@@ -140,7 +148,11 @@ function scopedFilter<T extends { ownerEmail: any; orgId: any }>(table: T) {
   return ctxScope(table, requireVaultCtx());
 }
 
-function normalizeCredentialKey(value: string) {
+/** Exported so a caller that matches rows back to the names it asked for
+ * normalizes them the same way the lookup did. Two copies of this rule drift
+ * into a refusal that names the wrong cause: the row is there, but the
+ * requested key no longer equals the stored one. */
+export function normalizeCredentialKey(value: string) {
   return value.trim();
 }
 
@@ -248,6 +260,31 @@ export async function getSecret(secretId: string, ctx: VaultCtx) {
     )
     .limit(1);
   return row ?? null;
+}
+
+/**
+ * Read the vault rows for an explicit list of credential keys, scoped to the
+ * caller's ctx.
+ *
+ * Deliberately narrow: it takes the names the caller asked for and returns
+ * nothing else, so a bulk lease never widens into the everything-with-values
+ * read that `listSecrets()` performs. Duplicate rows for one key are returned
+ * as-is — `credentialKey` is not unique, and resolving that collision is the
+ * caller's refusal to make, not this function's to guess.
+ */
+export async function getSecretsByKeys(keys: string[], ctx: VaultCtx) {
+  const db = getDb();
+  const wanted = [...new Set(keys.map(normalizeCredentialKey).filter(Boolean))];
+  if (wanted.length === 0) return [];
+  return db
+    .select()
+    .from(schema.vaultSecrets)
+    .where(
+      and(
+        inArray(schema.vaultSecrets.credentialKey, wanted),
+        ctxScope(schema.vaultSecrets, ctx),
+      ),
+    );
 }
 
 export async function createSecret(

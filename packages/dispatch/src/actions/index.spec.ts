@@ -18,6 +18,7 @@ describe("dispatch action registry", () => {
     );
     expect(dispatchActions).toHaveProperty("grant-workspace-resources-to-app");
     expect(dispatchActions).toHaveProperty("sync-vault-to-app");
+    expect(dispatchActions).toHaveProperty("lease-vault-secrets");
 
     expect(dispatchActions).not.toHaveProperty(
       "sync-workspace-resources-to-app",

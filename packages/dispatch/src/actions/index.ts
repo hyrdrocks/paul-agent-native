@@ -31,6 +31,7 @@ import getWorkspaceInfo from "./get-workspace-info.js";
 import getWorkspaceResourceEffectiveContext from "./get-workspace-resource-effective-context.js";
 import grantVaultSecretsToApp from "./grant-vault-secrets-to-app.js";
 import grantWorkspaceResourcesToApp from "./grant-workspace-resources-to-app.js";
+import leaseVaultSecrets from "./lease-vault-secrets.js";
 import listAgentRunFailures from "./list-agent-run-failures.js";
 import listAgentThreadSources from "./list-agent-thread-sources.js";
 import listAvailableWorkspaceTemplates from "./list-available-workspace-templates.js";
@@ -133,6 +134,7 @@ export const dispatchActions: Record<string, ActionEntry> = {
   "get-workspace-info": getWorkspaceInfo,
   "grant-workspace-resources-to-app": grantWorkspaceResourcesToApp,
   "grant-vault-secrets-to-app": grantVaultSecretsToApp,
+  "lease-vault-secrets": leaseVaultSecrets,
   "list-agent-thread-sources": listAgentThreadSources,
   "list-agent-run-failures": listAgentRunFailures,
   "list-available-workspace-templates": listAvailableWorkspaceTemplates,
