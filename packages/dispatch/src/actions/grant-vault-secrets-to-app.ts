@@ -1,6 +1,7 @@
 import { defineAction } from "@agent-native/core";
 import { z } from "zod";
 
+import { vaultAuditTarget } from "../server/lib/vault-audit.js";
 import { grantSecretsToApp } from "../server/lib/vault-store.js";
 
 export default defineAction({
@@ -17,5 +18,9 @@ export default defineAction({
       .max(100)
       .describe("Vault secret IDs to grant to the app"),
   }),
+  audit: {
+    target: (args, _result, meta) =>
+      vaultAuditTarget(meta, { type: "vault-app", id: args.appId }),
+  },
   run: async (args) => grantSecretsToApp(args.secretIds, args.appId),
 });

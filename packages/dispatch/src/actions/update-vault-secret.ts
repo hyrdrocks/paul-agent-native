@@ -1,6 +1,7 @@
 import { defineAction } from "@agent-native/core";
 import { z } from "zod";
 
+import { vaultAuditTarget } from "../server/lib/vault-audit.js";
 import { updateSecret } from "../server/lib/vault-store.js";
 
 export default defineAction({
@@ -44,6 +45,10 @@ export default defineAction({
     ),
   // Carries a secret `value`. Record THAT the secret changed, never the value —
   // keep the audit trail from becoming a second credential store.
-  audit: { recordInputs: false },
+  audit: {
+    recordInputs: false,
+    target: (args, _result, meta) =>
+      vaultAuditTarget(meta, { type: "vault-secret", id: args.id }),
+  },
   run: async (args) => updateSecret(args.id, args),
 });

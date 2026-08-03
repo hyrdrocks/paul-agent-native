@@ -1,6 +1,7 @@
 import { defineAction } from "@agent-native/core";
 import { z } from "zod";
 
+import { vaultAuditTarget } from "../server/lib/vault-audit.js";
 import { deleteSecret } from "../server/lib/vault-store.js";
 
 export default defineAction({
@@ -9,5 +10,9 @@ export default defineAction({
   schema: z.object({
     id: z.string().describe("Secret ID to delete"),
   }),
+  audit: {
+    target: (args, _result, meta) =>
+      vaultAuditTarget(meta, { type: "vault-secret", id: args.id }),
+  },
   run: async (args) => deleteSecret(args.id),
 });
