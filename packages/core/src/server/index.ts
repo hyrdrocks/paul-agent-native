@@ -200,6 +200,10 @@ export {
   refreshGlobalMcpManager,
   type AgentChatPluginOptions,
 } from "./agent-chat-plugin.js";
+// The same filter the chat plugin applies to build every agent tool surface,
+// exported so an app can assert an `agentTool: false` action really is absent
+// from it rather than re-implementing the predicate in a test.
+export { filterAgentTools } from "./agent-chat/action-filters-a2a.js";
 export {
   configureAgentNativeEmbeddedEnvironment,
   createAgentNativeEmbeddedAuthOptions,

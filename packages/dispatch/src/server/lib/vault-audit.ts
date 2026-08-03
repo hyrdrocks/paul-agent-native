@@ -114,9 +114,10 @@ const MAX_VAULT_AUDIT_LIMIT = 100;
  * `vault_audit_log` is still written by its existing callers — nothing reads it
  * for this timeline.
  *
- * Vault *reads* appear here the moment a read action opts into
- * `audit.onRead`; none does yet, so today this timeline is mutations and their
- * refusals. Nothing about the query needs to change when reads arrive.
+ * Vault *reads* arrive here through `reveal-vault-secret`, which stamps the
+ * same `vault-secret` target type a mutation does — a revealed value is one
+ * row in the same timeline as the edit that created it, and the query needed
+ * no change to pick it up.
  */
 export async function listVaultAuditEvents(
   query: VaultAuditQuery = {},
