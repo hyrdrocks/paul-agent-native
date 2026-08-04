@@ -22,13 +22,23 @@ export const EXIT = {
   AMBIGUOUS_APP: 66, // several connected apps, none selected
   LEASE_REFUSED: 67, // server said no (missing key, ambiguous key, auth)
   SPAWN_FAILED: 68, // command not found / not executable
+  REQUEST_REFUSED: 69, // a non-lease vault call was refused or unreachable
 } as const;
 
 /** Matches `lease-vault-secrets`, which refuses more than 50 keys server-side. */
 const MAX_LEASED_KEYS = 50;
 
 const LEASE_ACTION = "lease-vault-secrets";
+const LIST_ACTION = "list-vault-secrets";
 const LEASE_ENV_VAR = "AGENT_NATIVE_VAULT_LEASE";
+
+/**
+ * Load-bearing. The edge proxy in front of at least one deployment rejects a
+ * default runtime agent string outright, and the rejection reads exactly like
+ * the action route being disabled — so it sends whoever hits it after the
+ * wrong problem.
+ */
+const USER_AGENT = "agent-native-cli";
 
 /**
  * One connected app as found in a coding agent's own MCP config. The URL and
@@ -50,6 +60,16 @@ export interface VaultLease {
 }
 
 /**
+ * What `vault list` is allowed to know about a secret. The value is absent from
+ * the type, not merely unprinted: a deployment that starts returning one cannot
+ * turn listing into a credential printer by accident.
+ */
+export interface VaultSecretSummary {
+  credentialKey: string;
+  name?: string;
+}
+
+/**
  * The one seam the wrapper is tested through. The behaviours that matter most
  * — never spawning after a refusal, leased-wins merging, exit-code fidelity —
  * sit *between* parsing, resolving, and merging, so pinning those separately
@@ -62,6 +82,7 @@ export interface VaultExecDeps {
     leaseId: string,
     app: ConnectedApp,
   ) => Promise<VaultLease>;
+  listSecrets: (app: ConnectedApp) => Promise<VaultSecretSummary[]>;
   spawnChild: (
     cmd: string,
     args: string[],
@@ -82,28 +103,27 @@ interface ParsedExecArgs {
   errors: string[];
 }
 
-const VALUE_FLAGS = new Set(["key", "app"]);
+interface ParsedFlags {
+  help: boolean;
+  /** Every occurrence, in order, so a repeatable flag and a once-only flag
+   *  are told apart by the subcommand rather than by the parser. */
+  values: Map<string, string[]>;
+  errors: string[];
+}
 
 /**
- * `--` is mandatory and terminates option parsing, so there is no shell string
- * to quote and nothing to inject: everything after it goes to the child
- * verbatim, including further `--key`-looking tokens.
+ * Shared by every vault subcommand, so `list` and `exec` reject the same typo
+ * the same way instead of each growing its own dialect.
  */
-function parseExecArgv(argv: string[]): ParsedExecArgs {
-  const parsed: ParsedExecArgs = {
+function parseFlags(tokens: string[], valueFlags: Set<string>): ParsedFlags {
+  const parsed: ParsedFlags = {
     help: false,
-    keys: [],
-    commandArgs: [],
+    values: new Map(),
     errors: [],
   };
 
-  const separator = argv.indexOf("--");
-  const flags = separator === -1 ? argv : argv.slice(0, separator);
-  const rest = separator === -1 ? [] : argv.slice(separator + 1);
-
-  const seenKeys = new Set<string>();
-  for (let i = 0; i < flags.length; i += 1) {
-    const arg = flags[i];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const arg = tokens[i];
     if (!arg.startsWith("-")) {
       parsed.errors.push(`Unexpected argument: ${arg}`);
       continue;
@@ -119,40 +139,90 @@ function parseExecArgv(argv: string[]): ParsedExecArgs {
       parsed.help = true;
       continue;
     }
-    if (!VALUE_FLAGS.has(name)) {
+    if (!valueFlags.has(name)) {
       parsed.errors.push(`Unknown option: --${name}`);
       continue;
     }
 
-    const next = flags[i + 1];
+    const next = tokens[i + 1];
     const value =
       inlineValue ??
-      (next !== undefined && !next.startsWith("-") ? flags[++i] : undefined);
+      (next !== undefined && !next.startsWith("-") ? tokens[++i] : undefined);
     if (value === undefined || value === "") {
       parsed.errors.push(`Missing value for --${name}`);
       continue;
     }
 
-    if (name === "app") {
-      if (parsed.app !== undefined) {
-        parsed.errors.push("--app may only be given once");
-        continue;
-      }
-      parsed.app = value;
-      continue;
-    }
-
-    // Never comma-split: `credentialKey` is free text, so a comma-bearing key
-    // is a real key and splitting it would silently lease the wrong thing.
-    if (seenKeys.has(value)) {
-      parsed.errors.push(`Duplicate --key ${value}`);
-      continue;
-    }
-    seenKeys.add(value);
-    parsed.keys.push(value);
+    const seen = parsed.values.get(name);
+    if (seen) seen.push(value);
+    else parsed.values.set(name, [value]);
   }
 
+  return parsed;
+}
+
+const EXEC_VALUE_FLAGS = new Set(["key", "app"]);
+const LIST_VALUE_FLAGS = new Set(["app"]);
+
+/** `--app` is a credential source on every subcommand that takes it. */
+function takeApp(flags: ParsedFlags): string | undefined {
+  const given = flags.values.get("app") ?? [];
+  if (given.length > 1) {
+    flags.errors.push("--app may only be given once");
+    return undefined;
+  }
+  return given[0];
+}
+
+interface ParsedListArgs {
+  help: boolean;
+  app?: string;
+  errors: string[];
+}
+
+function parseListArgv(argv: string[]): ParsedListArgs {
+  const flags = parseFlags(argv, LIST_VALUE_FLAGS);
+  if (flags.help) return { help: true, errors: [] };
+  const app = takeApp(flags);
+  return { help: false, ...(app ? { app } : {}), errors: flags.errors };
+}
+
+/**
+ * `--` is mandatory and terminates option parsing, so there is no shell string
+ * to quote and nothing to inject: everything after it goes to the child
+ * verbatim, including further `--key`-looking tokens.
+ */
+function parseExecArgv(argv: string[]): ParsedExecArgs {
+  const parsed: ParsedExecArgs = {
+    help: false,
+    keys: [],
+    commandArgs: [],
+    errors: [],
+  };
+
+  const separator = argv.indexOf("--");
+  const flags = parseFlags(
+    separator === -1 ? argv : argv.slice(0, separator),
+    EXEC_VALUE_FLAGS,
+  );
+  const rest = separator === -1 ? [] : argv.slice(separator + 1);
+
+  parsed.help = flags.help;
   if (parsed.help) return parsed;
+
+  parsed.app = takeApp(flags);
+  const seenKeys = new Set<string>();
+  for (const key of flags.values.get("key") ?? []) {
+    // Never comma-split: `credentialKey` is free text, so a comma-bearing key
+    // is a real key and splitting it would silently lease the wrong thing.
+    if (seenKeys.has(key)) {
+      flags.errors.push(`Duplicate --key ${key}`);
+      continue;
+    }
+    seenKeys.add(key);
+    parsed.keys.push(key);
+  }
+  parsed.errors = flags.errors;
 
   if (separator === -1) {
     parsed.errors.push(
@@ -295,6 +365,29 @@ function errorMessage(err: unknown): string {
 }
 
 /**
+ * Discovery plus `--app` resolution, shared by every subcommand that spends a
+ * credential. A config file that exists but cannot be read is still "no bearer
+ * here", but the message has to name the real cause rather than let the
+ * developer conclude they never connected.
+ */
+function resolveCredentialSource(
+  deps: VaultExecDeps,
+  requested: string | undefined,
+): ResolvedApp {
+  let discovered: ConnectedApp[];
+  try {
+    discovered = deps.discoverConnectedApps();
+  } catch (err) {
+    return {
+      ok: false,
+      code: EXIT.NO_CREDENTIAL,
+      message: errorMessage(err),
+    };
+  }
+  return resolveApp(discovered, requested);
+}
+
+/**
  * `argv` is everything after `agent-native vault`, so the first token is the
  * subcommand — tests exercise the same array the CLI hands over.
  */
@@ -307,13 +400,14 @@ export async function runVaultExec(
 
   const [subcommand, ...rest] = argv;
   if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
-    stdout(formatVaultExecUsage());
+    stdout(formatVaultUsage());
     return 0;
   }
+  if (subcommand === "list") return runVaultList(rest, deps);
   if (subcommand !== "exec") {
     stderr(`Unknown vault subcommand: ${subcommand ?? "(none)"}`);
     stderr("");
-    stderr(formatVaultExecUsage());
+    stderr(formatVaultUsage());
     return EXIT.USAGE;
   }
 
@@ -329,18 +423,7 @@ export async function runVaultExec(
     return EXIT.USAGE;
   }
 
-  let discovered: ConnectedApp[];
-  try {
-    discovered = deps.discoverConnectedApps();
-  } catch (err) {
-    // A config file that exists but cannot be read is still "no bearer here",
-    // but the message has to name the real cause rather than let the developer
-    // conclude they never connected.
-    stderr(errorMessage(err));
-    return EXIT.NO_CREDENTIAL;
-  }
-
-  const resolved = resolveApp(discovered, parsed.app);
+  const resolved = resolveCredentialSource(deps, parsed.app);
   if (!resolved.ok) {
     stderr(resolved.message);
     return resolved.code;
@@ -371,6 +454,102 @@ export async function runVaultExec(
     stderr(`Could not run ${parsed.command}: ${errorMessage(err)}`);
     return EXIT.SPAWN_FAILED;
   }
+}
+
+/**
+ * Prints what is in the vault, never what is in a secret. The value is not
+ * merely omitted from the output: `VaultSecretSummary` has no field to hold
+ * one, so a deployment that starts returning values cannot leak them here.
+ */
+async function runVaultList(
+  argv: string[],
+  deps: VaultExecDeps,
+): Promise<number> {
+  const stdout = deps.stdout ?? console.log;
+  const { stderr } = deps;
+
+  const parsed = parseListArgv(argv);
+  if (parsed.help) {
+    stdout(formatVaultListUsage());
+    return 0;
+  }
+  if (parsed.errors.length > 0) {
+    for (const error of parsed.errors) stderr(error);
+    stderr("");
+    stderr(formatVaultListUsage());
+    return EXIT.USAGE;
+  }
+
+  const resolved = resolveCredentialSource(deps, parsed.app);
+  if (!resolved.ok) {
+    stderr(resolved.message);
+    return resolved.code;
+  }
+
+  let secrets: VaultSecretSummary[];
+  try {
+    secrets = await deps.listSecrets(resolved.app);
+  } catch (err) {
+    stderr(errorMessage(err));
+    return EXIT.REQUEST_REFUSED;
+  }
+
+  // An empty vault and a refused call must not read alike on a terminal, so
+  // the empty case says so on stderr and leaves stdout parseable.
+  if (secrets.length === 0) {
+    stderr(`No secrets in ${resolved.app.serverName}'s vault.`);
+    return 0;
+  }
+
+  const rows = [...secrets].sort((a, b) =>
+    a.credentialKey.localeCompare(b.credentialKey),
+  );
+  const width = Math.max(...rows.map((row) => row.credentialKey.length));
+  for (const row of rows) {
+    stdout(`${row.credentialKey.padEnd(width)}  ${row.name ?? ""}`.trimEnd());
+  }
+  return 0;
+}
+
+export function formatVaultUsage(): string {
+  return [
+    "Usage: agent-native vault <subcommand> [options]",
+    "",
+    "Subcommands:",
+    "  exec    Run a command with workspace vault secrets in its environment.",
+    "  list    Print the secret keys stored in a workspace vault. Never values.",
+    "",
+    "Every subcommand takes --app <NAME> to name the deployment supplying the",
+    "credential, so one installation serves every deployment you have connected.",
+    "",
+    "Run `agent-native vault <subcommand> --help` for that subcommand's options.",
+    "",
+    "This is hygiene, not containment — see `agent-native vault exec --help`.",
+  ].join("\n");
+}
+
+export function formatVaultListUsage(): string {
+  return [
+    "Usage: agent-native vault list [--app NAME]",
+    "",
+    "Prints the credential keys and display names of the secrets in a workspace",
+    "vault, so you can see what is available without opening the web UI. It never",
+    "prints a secret value, not even a masked preview: a routine command must not",
+    "be able to put a credential in your transcript.",
+    "",
+    "Options:",
+    "  --app <NAME>    Which connected app's vault to list. This selects a",
+    "                  credential source, not a principal and not a scope. With",
+    "                  several apps connected and none selected, the command",
+    "                  refuses and names them rather than guessing.",
+    "  --help          Show this message.",
+    "",
+    "Exit codes:",
+    `  ${EXIT.USAGE}  malformed invocation`,
+    `  ${EXIT.NO_CREDENTIAL}  no connect bearer found on this machine`,
+    `  ${EXIT.AMBIGUOUS_APP}  several connected apps, none selected`,
+    `  ${EXIT.REQUEST_REFUSED}  the deployment refused the request or was unreachable`,
+  ].join("\n");
 }
 
 export function formatVaultExecUsage(): string {
@@ -490,24 +669,43 @@ function appBaseUrl(mcpUrl: string): string {
   return url.toString().replace(/\/+$/, "");
 }
 
-export async function leaseSecrets(
-  keys: string[],
-  leaseId: string,
+/**
+ * The action route reports failures as `{ error }`; `message` is only there for
+ * hand-rolled route errors. Reading one and not the other turns "no vault
+ * secret for A, B" into a bare status code.
+ */
+function refusalDetail(json: any, status: number): string {
+  if (typeof json?.error === "string" && json.error.trim()) return json.error;
+  if (typeof json?.message === "string" && json.message.trim())
+    return json.message;
+  return `HTTP ${status}`;
+}
+
+/**
+ * One authenticated call to one action route, shared by every vault
+ * subcommand. Sharing it is what keeps `USER_AGENT` and the read timeout true
+ * of every request rather than of whichever one was written last.
+ */
+async function callVaultAction(
   app: ConnectedApp,
-): Promise<VaultLease> {
-  const url = `${appBaseUrl(app.url)}/_agent-native/actions/${LEASE_ACTION}`;
+  action: string,
+  init: { method: "GET" | "POST"; body?: string },
+): Promise<{ ok: boolean; status: number; json: any }> {
+  const url = `${appBaseUrl(app.url)}/_agent-native/actions/${action}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
 
   let response: Response;
   try {
     response = await fetch(url, {
-      method: "POST",
+      method: init.method,
       headers: {
-        "content-type": "application/json",
+        accept: "application/json",
         authorization: `Bearer ${app.bearer}`,
+        "user-agent": USER_AGENT,
+        ...(init.body ? { "content-type": "application/json" } : {}),
       },
-      body: JSON.stringify({ keys, leaseId }),
+      ...(init.body ? { body: init.body } : {}),
       signal: controller.signal,
     });
   } catch (err) {
@@ -523,18 +721,57 @@ export async function leaseSecrets(
     json = null;
   }
 
-  if (!response.ok) {
-    // The action route reports failures as `{ error }`; `message` is only
-    // there for hand-rolled route errors. Reading one and not the other turns
-    // "no vault secret for A, B" into a bare status code.
-    const detail =
-      typeof json?.error === "string" && json.error.trim()
-        ? json.error
-        : typeof json?.message === "string" && json.message.trim()
-          ? json.message
-          : `HTTP ${response.status}`;
+  return { ok: response.ok, status: response.status, json };
+}
+
+export async function listVaultSecrets(
+  app: ConnectedApp,
+): Promise<VaultSecretSummary[]> {
+  const { ok, status, json } = await callVaultAction(app, LIST_ACTION, {
+    method: "GET",
+  });
+
+  if (!ok) {
     throw new Error(
-      `Vault lease ${leaseId} refused by ${app.serverName}: ${detail}`,
+      `Vault list refused by ${app.serverName}: ${refusalDetail(json, status)}`,
+    );
+  }
+
+  // A 200 that is not a list is a deployment that does not serve this action;
+  // reading it as an empty vault would report "no secrets" about a vault this
+  // command never actually read.
+  if (!Array.isArray(json)) {
+    throw new Error(
+      `Vault list from ${app.serverName} returned no secret list. Is it running a core that exposes ${LIST_ACTION}?`,
+    );
+  }
+
+  return json.map((row: any, index: number) => {
+    if (typeof row?.credentialKey !== "string" || !row.credentialKey) {
+      throw new Error(
+        `Vault list from ${app.serverName} returned a secret with no credentialKey (row ${index + 1}).`,
+      );
+    }
+    return {
+      credentialKey: row.credentialKey,
+      ...(typeof row.name === "string" && row.name ? { name: row.name } : {}),
+    };
+  });
+}
+
+export async function leaseSecrets(
+  keys: string[],
+  leaseId: string,
+  app: ConnectedApp,
+): Promise<VaultLease> {
+  const { ok, status, json } = await callVaultAction(app, LEASE_ACTION, {
+    method: "POST",
+    body: JSON.stringify({ keys, leaseId }),
+  });
+
+  if (!ok) {
+    throw new Error(
+      `Vault lease ${leaseId} refused by ${app.serverName}: ${refusalDetail(json, status)}`,
     );
   }
 
@@ -591,6 +828,7 @@ export async function runVault(argv: string[]): Promise<number> {
     discoverConnectedApps: () =>
       discoverConnectedApps(process.cwd(), (message) => console.error(message)),
     leaseSecrets,
+    listSecrets: listVaultSecrets,
     spawnChild,
     env: process.env,
     stderr: (line) => console.error(line),

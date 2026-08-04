@@ -8,7 +8,9 @@ import {
   EXIT,
   discoverConnectedApps,
   leaseSecrets,
+  listVaultSecrets,
   formatVaultExecUsage,
+  formatVaultUsage,
   runVaultExec,
   type ConnectedApp,
   type VaultExecDeps,
@@ -33,6 +35,7 @@ interface Harness {
   stderrText: () => string;
   spawnChild: ReturnType<typeof vi.fn>;
   leaseSecrets: ReturnType<typeof vi.fn>;
+  listSecrets: ReturnType<typeof vi.fn>;
   discoverConnectedApps: ReturnType<typeof vi.fn>;
   stdoutText: () => string;
 }
@@ -45,11 +48,22 @@ function harness(overrides: Partial<VaultExecDeps> = {}): Harness {
     leaseId,
     env: Object.fromEntries(keys.map((key) => [key, FAKE_VALUE])),
   }));
+  // Carries a `value` the CLI must never surface: a deployment that starts
+  // returning one must not turn `vault list` into a credential printer.
+  const listSecrets = vi.fn(async () => [
+    {
+      credentialKey: "ANTHROPIC_API_KEY",
+      name: "Anthropic (prod)",
+      value: FAKE_VALUE,
+    },
+    { credentialKey: "STRIPE_KEY", name: "Stripe", value: FAKE_VALUE },
+  ]);
   const spawnChild = vi.fn(async () => 0);
 
   const deps: VaultExecDeps = {
     discoverConnectedApps,
     leaseSecrets,
+    listSecrets,
     spawnChild,
     env: {},
     stderr: (line) => lines.push(line),
@@ -64,6 +78,7 @@ function harness(overrides: Partial<VaultExecDeps> = {}): Harness {
     stdoutText: () => out.join("\n"),
     spawnChild: (overrides.spawnChild ?? spawnChild) as any,
     leaseSecrets: (overrides.leaseSecrets ?? leaseSecrets) as any,
+    listSecrets: (overrides.listSecrets ?? listSecrets) as any,
     discoverConnectedApps: (overrides.discoverConnectedApps ??
       discoverConnectedApps) as any,
   };
@@ -474,6 +489,176 @@ describe("runVaultExec — child exit propagation", () => {
   });
 });
 
+describe("runVault — subcommand dispatch", () => {
+  it("rejects an unknown subcommand with the usage exit code and names it", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["lst", "--app", "dispatch"], h.deps);
+
+    expect(code).toBe(EXIT.USAGE);
+    expect(h.stderrText()).toContain("lst");
+    expect(h.listSecrets).not.toHaveBeenCalled();
+    expect(h.spawnChild).not.toHaveBeenCalled();
+  });
+
+  it("rejects no subcommand at all rather than defaulting to one", async () => {
+    const h = harness();
+
+    expect(await runVaultExec([], h.deps)).toBe(EXIT.USAGE);
+    expect(h.listSecrets).not.toHaveBeenCalled();
+  });
+
+  it("lists every subcommand in the top-level usage", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["--help"], h.deps);
+
+    expect(code).toBe(0);
+    expect(h.stdoutText()).toContain("exec");
+    expect(h.stdoutText()).toContain("list");
+    expect(formatVaultUsage()).toContain("list");
+  });
+});
+
+describe("runVaultExec — list", () => {
+  it("prints the credential keys and their display names", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["list"], h.deps);
+
+    expect(code).toBe(0);
+    expect(h.listSecrets).toHaveBeenCalledWith(
+      expect.objectContaining({ serverName: "dispatch" }),
+    );
+    const out = h.stdoutText();
+    expect(out).toContain("ANTHROPIC_API_KEY");
+    expect(out).toContain("Anthropic (prod)");
+    expect(out).toContain("STRIPE_KEY");
+    expect(out).toContain("Stripe");
+  });
+
+  it("never prints a value, even when the deployment returns one", async () => {
+    const h = harness();
+
+    await runVaultExec(["list"], h.deps);
+
+    expect(h.stdoutText()).not.toContain(FAKE_VALUE);
+    expect(h.stderrText()).not.toContain(FAKE_VALUE);
+    expect(h.stdoutText()).not.toContain("fake-bearer");
+  });
+
+  it("takes the deployment as an argument on the subcommand", async () => {
+    const h = harness({
+      discoverConnectedApps: vi.fn(() => [app("dispatch"), app("plan")]),
+    });
+
+    const code = await runVaultExec(["list", "--app", "plan"], h.deps);
+
+    expect(code).toBe(0);
+    expect(h.listSecrets).toHaveBeenCalledWith(
+      expect.objectContaining({
+        serverName: "plan",
+        bearer: "fake-bearer-plan",
+      }),
+    );
+  });
+
+  it("refuses with 66 when several apps are connected and none selected", async () => {
+    const h = harness({
+      discoverConnectedApps: vi.fn(() => [app("dispatch"), app("plan")]),
+    });
+
+    const code = await runVaultExec(["list"], h.deps);
+
+    expect(code).toBe(EXIT.AMBIGUOUS_APP);
+    expect(h.stderrText()).toContain("plan");
+    expect(h.listSecrets).not.toHaveBeenCalled();
+  });
+
+  it("returns 65 when no app is connected on this machine", async () => {
+    const h = harness({ discoverConnectedApps: vi.fn(() => []) });
+
+    expect(await runVaultExec(["list"], h.deps)).toBe(EXIT.NO_CREDENTIAL);
+    expect(h.listSecrets).not.toHaveBeenCalled();
+  });
+
+  it("reports a broken client config as 65 naming the file", async () => {
+    const h = harness({
+      discoverConnectedApps: vi.fn(() => {
+        throw new Error(
+          "Cannot parse JSON config file: /home/dev/.claude.json",
+        );
+      }),
+    });
+
+    const code = await runVaultExec(["list"], h.deps);
+
+    expect(code).toBe(EXIT.NO_CREDENTIAL);
+    expect(h.stderrText()).toContain("/home/dev/.claude.json");
+  });
+
+  it("returns 64 on an unknown option and never calls the deployment", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["list", "--all"], h.deps);
+
+    expect(code).toBe(EXIT.USAGE);
+    expect(h.stderrText()).toContain("Unknown option: --all");
+    expect(h.listSecrets).not.toHaveBeenCalled();
+  });
+
+  it("returns 64 on a stray positional", async () => {
+    const h = harness();
+
+    expect(await runVaultExec(["list", "dispatch"], h.deps)).toBe(EXIT.USAGE);
+    expect(h.listSecrets).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a refusal from the deployment with its own exit code", async () => {
+    const h = harness({
+      listSecrets: vi.fn(async () => {
+        throw new Error("Vault list refused by dispatch: HTTP 401");
+      }),
+    });
+
+    const code = await runVaultExec(["list"], h.deps);
+
+    expect(code).toBe(EXIT.REQUEST_REFUSED);
+    expect(h.stderrText()).toContain("HTTP 401");
+  });
+
+  it("says the vault is empty rather than printing nothing at all", async () => {
+    const h = harness({ listSecrets: vi.fn(async () => []) });
+
+    const code = await runVaultExec(["list"], h.deps);
+
+    expect(code).toBe(0);
+    expect(h.stdoutText()).toBe("");
+    expect(h.stderrText().toLowerCase()).toContain("no secrets");
+  });
+
+  it("shows help without contacting the deployment", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["list", "--help"], h.deps);
+
+    expect(code).toBe(0);
+    expect(h.stdoutText()).toContain("--app");
+    expect(h.listSecrets).not.toHaveBeenCalled();
+  });
+
+  it("prints a key whose secret has no display name", async () => {
+    const h = harness({
+      listSecrets: vi.fn(async () => [{ credentialKey: "LONELY_KEY" }]),
+    });
+
+    const code = await runVaultExec(["list"], h.deps);
+
+    expect(code).toBe(0);
+    expect(h.stdoutText()).toContain("LONELY_KEY");
+  });
+});
+
 describe("runVaultExec — no secret value ever reaches stderr", () => {
   const cases: {
     name: string;
@@ -516,6 +701,17 @@ describe("runVaultExec — no secret value ever reaches stderr", () => {
       argv: ["exec", "--key", "K", "--", "false"],
       deps: { spawnChild: vi.fn(async () => 1) },
     },
+    { name: "list", argv: ["list"], deps: {} },
+    {
+      name: "list refused",
+      argv: ["list"],
+      deps: {
+        listSecrets: vi.fn(async () => {
+          throw new Error("Vault list refused by dispatch: HTTP 401");
+        }),
+      },
+    },
+    { name: "unknown subcommand", argv: ["lst"], deps: {} },
   ];
 
   for (const { name, argv, deps } of cases) {
@@ -752,6 +948,9 @@ describe("leaseSecrets", () => {
       "https://dispatch.test/_agent-native/actions/lease-vault-secrets",
     );
     expect(init.headers.authorization).toBe("Bearer fake-bearer-dispatch");
+    // Same explicit agent as every other vault call: the edge proxy in front of
+    // at least one deployment rejects a default runtime agent string outright.
+    expect(init.headers["user-agent"]).toBeTruthy();
     expect(JSON.parse(init.body)).toEqual({
       keys: ["K"],
       leaseId: "lease-0001",
@@ -783,6 +982,66 @@ describe("leaseSecrets", () => {
     await expect(
       leaseSecrets(["A", "B"], "lease-0001", app("dispatch")),
     ).rejects.toThrow(/did not return values for: B/);
+  });
+});
+
+describe("listVaultSecrets", () => {
+  function stubFetch(status: number, body: unknown) {
+    const fetchMock = vi.fn(async () => ({
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("gets the action route with the bearer and an explicit user agent", async () => {
+    const fetchMock = stubFetch(200, [
+      { credentialKey: "K", name: "Key", value: FAKE_VALUE },
+    ]);
+
+    const secrets = await listVaultSecrets(app("dispatch"));
+
+    expect(secrets).toEqual([{ credentialKey: "K", name: "Key" }]);
+    const [url, init] = fetchMock.mock.calls[0] as any;
+    expect(url).toBe(
+      "https://dispatch.test/_agent-native/actions/list-vault-secrets",
+    );
+    expect(init.method).toBe("GET");
+    expect(init.headers.authorization).toBe("Bearer fake-bearer-dispatch");
+    // A default runtime agent string is rejected outright by the edge proxy in
+    // front of at least one deployment, and the failure looks like a disabled
+    // route rather than a rejected client.
+    expect(init.headers["user-agent"]).toBeTruthy();
+  });
+
+  it("surfaces the refusal from the route's `error` field, not a bare status", async () => {
+    stubFetch(403, { error: "Vault access is not granted for this app" });
+
+    await expect(listVaultSecrets(app("dispatch"))).rejects.toThrow(
+      /not granted/,
+    );
+  });
+
+  it("refuses a 200 that is not a secret list rather than reporting an empty vault", async () => {
+    stubFetch(200, { ok: true });
+
+    await expect(listVaultSecrets(app("dispatch"))).rejects.toThrow(
+      /secret list/,
+    );
+  });
+
+  it("refuses a row with no credential key rather than printing a blank one", async () => {
+    stubFetch(200, [{ name: "Nameless" }]);
+
+    await expect(listVaultSecrets(app("dispatch"))).rejects.toThrow(
+      /credentialKey/,
+    );
   });
 });
 
