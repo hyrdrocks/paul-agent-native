@@ -158,7 +158,10 @@ function appLabel(origin: string, options: McpConnectRouteOptions): string {
 }
 
 function serverName(origin: string, options: McpConnectRouteOptions): string {
-  const explicit = options.serverName?.trim();
+  // `MCP_SERVER_NAME` lets a deployment pin the id its clients see without a
+  // code change — the hostname guess below is only a default.
+  const explicit =
+    options.serverName?.trim() || process.env.MCP_SERVER_NAME?.trim();
   if (explicit) return explicit;
   return `agent-native-${appLabel(origin, options)}`;
 }
@@ -1228,6 +1231,23 @@ export async function handleMcpConnect(
         userCode,
       }),
     );
+  }
+
+  // ---- GET /info  (session-required) -----------------------------------
+  // The server id is derived from options/env that the client bundle cannot
+  // see, so the in-app Access tab reads it here instead of re-deriving it
+  // from the hostname and disagreeing with this page.
+  if (sub === "/info") {
+    if (method !== "GET" && method !== "HEAD") {
+      return json({ error: "Method not allowed" }, 405);
+    }
+    const session = await getSession(event);
+    if (!session?.email) return json({ error: "Unauthorized" }, 401);
+    return json({
+      serverId: serverName(appUrl, options),
+      mcpUrl: mcpResourceUrl(appUrl),
+      appName: options.appName || appLabel(appUrl, options),
+    });
   }
 
   // ---- POST /token  (session-required) ---------------------------------

@@ -159,6 +159,43 @@ describe("handleMcpConnect", () => {
   afterEach(() => {
     delete process.env.A2A_SECRET;
     delete process.env.BETTER_AUTH_SECRET;
+    delete process.env.MCP_SERVER_NAME;
+  });
+
+  describe("server id", () => {
+    it("defaults to agent-native-<first hostname label>", async () => {
+      getSessionMock.mockResolvedValue({ email: "u@example.com" });
+      const res = await handleMcpConnect(ev({}), "/info");
+      expect(await res.json()).toMatchObject({ serverId: "agent-native-mail" });
+    });
+
+    it("honours MCP_SERVER_NAME over the hostname guess", async () => {
+      process.env.MCP_SERVER_NAME = "dispatch-paulsjob";
+      getSessionMock.mockResolvedValue({ email: "u@example.com" });
+      const page = await handleMcpConnect(ev({}), "/");
+      expect(await page.text()).toContain(
+        "claude mcp add --transport http dispatch-paulsjob",
+      );
+      const info = await handleMcpConnect(ev({}), "/info");
+      expect(await info.json()).toMatchObject({
+        serverId: "dispatch-paulsjob",
+      });
+    });
+
+    it("prefers an explicit route option over MCP_SERVER_NAME", async () => {
+      process.env.MCP_SERVER_NAME = "from-env";
+      getSessionMock.mockResolvedValue({ email: "u@example.com" });
+      const res = await handleMcpConnect(ev({}), "/info", {
+        serverName: "from-options",
+      });
+      expect(await res.json()).toMatchObject({ serverId: "from-options" });
+    });
+
+    it("GET /info requires a session", async () => {
+      getSessionMock.mockResolvedValue(null);
+      const res = await handleMcpConnect(ev({}), "/info");
+      expect(res.status).toBe(401);
+    });
   });
 
   describe("connect page", () => {
