@@ -157,9 +157,24 @@ function appLabel(origin: string, options: McpConnectRouteOptions): string {
   }
 }
 
+/**
+ * The MCP server id clients are told to register this deployment under.
+ *
+ * `MCP_SERVER_NAME` exists because the plugin option is not reachable for a
+ * deployment that consumes a pre-composed core-routes plugin: recomposing it
+ * would need that package's own private options, so there was no supported way
+ * to rename the server at all. Deployment-level naming is configured this way
+ * elsewhere too (`APP_NAME`, `APP_URL`).
+ *
+ * Precedence is explicit option, then env, then derived — an app that passes
+ * `mcpConnectServerName` in code has made a deliberate choice, and a
+ * deployment-wide variable should not silently override it.
+ */
 function serverName(origin: string, options: McpConnectRouteOptions): string {
   const explicit = options.serverName?.trim();
   if (explicit) return explicit;
+  const fromEnv = process.env.MCP_SERVER_NAME?.trim();
+  if (fromEnv) return fromEnv;
   return `agent-native-${appLabel(origin, options)}`;
 }
 

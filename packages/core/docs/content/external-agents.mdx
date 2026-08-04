@@ -281,6 +281,8 @@ For MCP hosts that cannot add a remote OAuth URL directly, open the app in your 
 
 Restart the agent client after connecting so it picks up the new MCP server.
 
+The server id in that block (`mail` above) defaults to `agent-native-<first label of your hostname>`. Set `MCP_SERVER_NAME` in the deployment's environment to choose it yourself — the connect page, the copyable config, and device-flow grants all use the same value. An app that passes `mcpConnectServerName` to `createCoreRoutesPlugin` keeps that name; the environment variable only fills in when the option is absent.
+
 Use this manual bearer block for MCP hosts that cannot complete the standard remote MCP OAuth flow, or for one-off debugging when you explicitly want to paste a token.
 
 ### Standard remote MCP OAuth {#standard-oauth}

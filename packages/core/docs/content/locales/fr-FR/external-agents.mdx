@@ -274,6 +274,8 @@ Pour les clients MCP qui ne peuvent pas ajouter directement un OAuth distant URL
 
 Redémarrez le client agent après la connexion afin qu'il récupère le nouveau serveur MCP.
 
+L'id de serveur dans ce bloc (`mail` ci-dessus) vaut par défaut `agent-native-<premier label de votre nom d'hôte>`. Définissez `MCP_SERVER_NAME` dans l'environnement du déploiement pour le choisir vous-même — la page de connexion, la configuration copiable et les autorisations du flux d'appareil utilisent la même valeur. Une application qui passe `mcpConnectServerName` à `createCoreRoutesPlugin` conserve ce nom ; la variable d'environnement n'intervient que si l'option est absente.
+
 Utilisez ce bloc support manuel pour les clients MCP qui ne peuvent pas terminer le flux distant standard MCP OAuth, ou pour un débogage ponctuel lorsque vous souhaitez explicitement coller un jeton.
 
 ### Télécommande standard MCP OAuth {#standard-oauth}
