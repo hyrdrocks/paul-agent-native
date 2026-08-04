@@ -10,6 +10,7 @@
  *                               [--scope user|project]
  *                               [--name <serverName>]
  *   agent-native reconnect [<url>] [--client ...] [--name <serverName>]
+ *   agent-native connect <url> --bearer          (bearer for every client)
  *   agent-native connect <url> --token <token>   (no-browser fallback)
  *   agent-native connect        [--client ...]   (pick first-party apps)
  *   agent-native connect --all  [--client ...]   (separate first-party app MCP resources)
@@ -150,6 +151,12 @@ export interface ParsedConnectArgs {
   /** No-browser fallback: skip device flow, use this token directly. */
   token?: string;
   /**
+   * Mint a bearer through the device flow and write it for EVERY selected
+   * client, including the OAuth-capable ones that plain connect hands a
+   * URL-only entry. For hosts with no browser to complete in-agent OAuth.
+   */
+  bearer?: boolean;
+  /**
    * Mint an ORG SERVICE token with this service name (e.g. "ci") instead of
    * writing local MCP configs. Authenticates the human via the device flow,
    * then calls the app's `create-org-service-token` action and prints the
@@ -205,6 +212,7 @@ export function parseConnectArgs(argv: string[]): ParsedConnectArgs {
     else if ((v = eat("--service-token")) !== undefined) out.serviceToken = v;
     else if ((v = eat("--ttl-days")) !== undefined) out.ttlDays = Number(v);
     else if ((v = eat("--token")) !== undefined) out.token = v;
+    else if (a === "--bearer") out.bearer = true;
     else if (a === "--full-catalog") out.fullCatalog = true;
     else if (!a.startsWith("-") && !out.url) {
       if (
@@ -730,6 +738,14 @@ function realSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Every connect request must send an explicit User-Agent. The edge proxy in
+ * front of at least one deployment rejects a default scripting-library agent
+ * string outright, and the rejection is indistinguishable from the connect
+ * route being disabled — any explicit agent passes.
+ */
+const CONNECT_USER_AGENT = "agent-native-connect";
+
 async function postJson(
   fetchImpl: typeof fetch,
   url: string,
@@ -740,7 +756,10 @@ async function postJson(
   try {
     const response = await fetchImpl(url, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "user-agent": CONNECT_USER_AGENT,
+      },
       body: JSON.stringify(body ?? {}),
       signal: controller.signal,
     });
@@ -808,7 +827,10 @@ async function validateOAuthMcpServer(
     try {
       const response = await fetchImpl(metadataUrl, {
         method: "GET",
-        headers: { accept: "application/json" },
+        headers: {
+          accept: "application/json",
+          "user-agent": CONNECT_USER_AGENT,
+        },
         signal: controller.signal,
       });
       if (!response.ok) {
@@ -892,6 +914,19 @@ export async function runDeviceFlow(
       if ((status === 404 || status >= 500) && attempt < START_ATTEMPTS - 1) {
         await sleep(1000 * (attempt + 1));
         continue;
+      }
+      if (status === 401 || status === 403) {
+        // The connect route itself is unauthenticated, so a refusal here comes
+        // from something in front of it. Say so — this failure otherwise reads
+        // exactly like the route being disabled and sends people to the wrong
+        // problem.
+        logErr(
+          `  ${baseUrl}${DEVICE_START_PATH} refused the request (HTTP ` +
+            `${status}). The connect route needs no auth, so this is an edge ` +
+            `proxy or access gateway in front of the deployment, not the ` +
+            `connect feature being off.`,
+        );
+        return null;
       }
       logErr(
         `  Could not start the connect flow on ${baseUrl} ` +
@@ -1989,10 +2024,13 @@ async function connectOne(
   const scope = parsed.scope === "user" ? "user" : "project";
   const baseDir = projectBaseDir();
   const allWritten: { client: ClientId; file: string }[] = [];
-  let oauthClients = parsed.token
+  // --bearer takes the same "every client gets the bearer" path as --token;
+  // it just mints the bearer through the device flow instead of taking one.
+  const bearerForEveryClient = Boolean(parsed.token) || parsed.bearer === true;
+  let oauthClients = bearerForEveryClient
     ? []
     : clients.filter((client) => supportsRemoteMcpOAuth(client));
-  let deviceFlowClients = parsed.token
+  let deviceFlowClients = bearerForEveryClient
     ? clients
     : clients.filter((client) => !supportsRemoteMcpOAuth(client));
   const oauthMigrations: ClientId[] = [];
@@ -2030,6 +2068,19 @@ async function connectOne(
       grant.serverName ??
       defaultServerName(baseUrl);
     headers = grant.headers;
+  }
+
+  if (parsed.bearer && !token) {
+    // A deployment running in open local-dev mode approves the request with an
+    // owner identity and no token. Writing that empty value produces an
+    // Authorization header with nothing after it, which surfaces much later as
+    // an unexplained auth failure — refuse instead of storing it.
+    logErr(
+      `  The approval returned no bearer token, so ${baseUrl} has nothing to ` +
+        `write. That deployment is likely running without authentication; ` +
+        `connect it without --bearer.`,
+    );
+    return { ok: false };
   }
 
   if (oauthClients.length > 0 && !parsed.token) {
@@ -2192,6 +2243,12 @@ async function connectOne(
   logOut(
     `  Auth/config is per client: this command updated ${clientLabelList(clients)} only.`,
   );
+  if (parsed.bearer) {
+    logErr(
+      `  --bearer wrote a long-lived bearer token to ${clientLabelList(clients)}; ` +
+        `on a host with a browser, prefer plain connect and its MCP OAuth.`,
+    );
+  }
   if (oauthClients.length > 0 && !parsed.token) {
     logOut("");
     if (oauthMigrations.length > 0) {
@@ -2453,6 +2510,13 @@ Usage:
 
       For cross-app access, prefer the unified Dispatch gateway:
       npx @agent-native/core@latest connect https://dispatch.agent-native.com
+
+  npx @agent-native/core@latest connect <url> --bearer [--client <c>]
+      Mint a bearer through the device flow and write it for EVERY selected
+      client, including the OAuth-capable ones that plain connect hands a
+      URL-only entry. Approve in a browser on any machine — the one being
+      configured never needs one. This writes a long-lived bearer token; on a
+      host that has a browser, prefer plain connect and its MCP OAuth.
 
   npx @agent-native/core@latest connect <url> --token <token>
       No-browser fallback. Skip the device flow and write the entry with

@@ -829,6 +829,112 @@ describe("runConnect", () => {
     });
   });
 
+  it("--bearer writes an explicit bearer for every selected client, including OAuth-capable ones", async () => {
+    const root = tmpDir();
+    const home = tmpDir();
+    const oldHome = process.env.HOME;
+    process.env.HOME = home;
+    process.chdir(root);
+    const errLines: string[] = [];
+
+    try {
+      await runConnect(
+        [
+          "https://mail.agent-native.com",
+          "--client",
+          "all",
+          "--scope",
+          "project",
+          "--bearer",
+        ],
+        {
+          fetchImpl: makeFetch([
+            {
+              status: "approved",
+              token: "tok-bearer",
+              mcpUrl: "https://mail.agent-native.com/mcp",
+              serverName: "agent-native-mail",
+            },
+          ]),
+          sleep: noopSleep,
+          openBrowser: vi.fn(),
+          logErr: (msg) => errLines.push(msg),
+        },
+      );
+
+      expect(process.exitCode).toBeFalsy();
+      // Claude Code is OAuth-capable: plain connect writes a URL-only entry
+      // here, --bearer writes the minted bearer instead.
+      const claudeCfg = JSON.parse(
+        fs.readFileSync(path.join(root, ".mcp.json"), "utf-8"),
+      );
+      expect(claudeCfg.mcpServers["agent-native-mail"]).toEqual({
+        type: "http",
+        url: "https://mail.agent-native.com/mcp",
+        headers: { Authorization: "Bearer tok-bearer" },
+      });
+      // Non-OAuth clients keep the bearer they already got.
+      const codexToml = fs.readFileSync(
+        path.join(home, ".codex", "config.toml"),
+        "utf-8",
+      );
+      expect(codexToml).toContain('"Authorization" = "Bearer tok-bearer"');
+
+      // One stderr notice, no confirmation prompt and no justification.
+      const notices = errLines.filter((line) =>
+        line.includes("long-lived bearer"),
+      );
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain("OAuth");
+      expect(notices[0]).not.toContain("tok-bearer");
+    } finally {
+      process.env.HOME = oldHome;
+    }
+  });
+
+  it("--bearer refuses an approval that returns no token instead of writing an empty credential", async () => {
+    const root = tmpDir();
+    const home = tmpDir();
+    const oldHome = process.env.HOME;
+    process.env.HOME = home;
+    process.chdir(root);
+    const errLines: string[] = [];
+
+    try {
+      await runConnect(
+        [
+          "https://mail.agent-native.com",
+          "--client",
+          "claude-code",
+          "--scope",
+          "project",
+          "--bearer",
+        ],
+        {
+          fetchImpl: makeFetch([
+            // A deployment in open local-dev mode approves with an owner
+            // identity and no token.
+            {
+              status: "approved",
+              ownerEmail: "owner@example.com",
+              mcpUrl: "https://mail.agent-native.com/mcp",
+              serverName: "agent-native-mail",
+            },
+          ]),
+          sleep: noopSleep,
+          openBrowser: vi.fn(),
+          logErr: (msg) => errLines.push(msg),
+        },
+      );
+
+      expect(process.exitCode).toBe(1);
+      expect(fs.existsSync(path.join(root, ".mcp.json"))).toBe(false);
+      expect(errLines.join("\n")).toContain("no bearer token");
+    } finally {
+      process.env.HOME = oldHome;
+    }
+  });
+
   it("uses the canonical 'plan' server name for first-party Plans device-flow connects", async () => {
     const root = tmpDir();
     const home = tmpDir();
