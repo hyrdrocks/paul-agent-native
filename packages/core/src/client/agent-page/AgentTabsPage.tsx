@@ -420,6 +420,8 @@ interface AccessUrls {
   mcpUrl: string;
   connectUrl: string;
   agentCardUrl: string;
+  /** Hostname-derived guess; replaced by the server's id once /info answers. */
+  serverId: string;
 }
 
 export const AGENT_ACCESS_DOCS_HREF = {
@@ -482,6 +484,7 @@ function AccessTab({
   appName: appNameProp,
 }: AgentPageTabProps & { appName?: string }) {
   const [urls, setUrls] = useState<AccessUrls | null>(null);
+  const [pinnedServerId, setPinnedServerId] = useState<string | null>(null);
   const [agentCardAvailable, setAgentCardAvailable] = useState(false);
   const [activeGuide, setActiveGuide] = useState(MCP_CONNECT_GUIDES[0]?.id);
 
@@ -517,8 +520,27 @@ function AccessTab({
         appPath("/.well-known/agent-card.json"),
         origin,
       ).toString(),
+      serverId: templateValues.serverId,
     });
   }, [appNameProp]);
+
+  // The connect route owns the server id (it can be pinned via route options
+  // or MCP_SERVER_NAME); the hostname guess above is only what we show until
+  // this answers, and what we keep if it never does.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(new URL(appPath("/mcp/connect/info"), window.location.origin))
+      .then((response) => (response.ok ? response.json() : null))
+      .then((info: { serverId?: unknown } | null) => {
+        const serverId =
+          typeof info?.serverId === "string" ? info.serverId.trim() : "";
+        if (!cancelled && serverId) setPinnedServerId(serverId);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!urls) return;
@@ -540,7 +562,7 @@ function AccessTab({
         appName: urls.appName,
         appUrl: urls.appUrl,
         mcpUrl: urls.mcpUrl,
-        serverId: `agent-native-${window.location.hostname || "app"}`,
+        serverId: pinnedServerId ?? urls.serverId,
       }
     : null;
   const guide =
