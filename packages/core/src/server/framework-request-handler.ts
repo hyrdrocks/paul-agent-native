@@ -55,6 +55,24 @@ const REQUEST_CONTEXT_BOUNDARY_KEY = "_agentNativeRequestContextBoundary";
 const INIT_GUARD_KEY = "_agentNativeFrameworkInitGuard";
 const INIT_PROVEN_KEY = "_agentNativeFrameworkInitProven";
 const MOUNT_PATHS_KEY = "_agentNativeFrameworkMountPaths";
+/** Mount path stamped on every middleware `registerMiddleware` creates. */
+const MOUNT_PATH_KEY = "_agentNativeMountPath";
+/** The middleware list THIS request was dispatched with (see the init guard). */
+const DISPATCH_SNAPSHOT_KEY = "_agentNativeDispatchSnapshot";
+/**
+ * How long a gated request with no matching route waits after the isolate stops
+ * registering mounts. Long enough to cover a gap between two plugin inits, short
+ * enough that a path which really does not exist still answers promptly.
+ */
+const MOUNT_PROGRESS_GRACE_MS = 750;
+/** Set by `registerMiddleware` when a framework mount answered the request. */
+const HANDLED_BY_KEY = "_agentNativeHandledBy";
+
+/**
+ * h3's "no route matched" sentinel, which it later turns into a 404. Registered
+ * symbol, so reading it here cannot drift from the h3 instance in use.
+ */
+const H3_NOT_FOUND = Symbol.for("h3.notFound");
 
 interface PluginReadyEntry {
   /** Undefined until the init has actually been started (see `start`). */
@@ -415,6 +433,38 @@ function getFrameworkInitGuard(
     // through is how the first version of this guard stayed silent in
     // production: the request was answered, just not by the framework.
     const result = await next();
+    // A gated path can also reach a catch-all — Nitro's asset/SSR fallback
+    // answers `/.well-known/agent-card.json` with a bare 404 body when the
+    // framework mount for it does not exist yet. That is the same "not mounted
+    // yet" failure as an unmatched route, so it takes the same recovery: an
+    // empty 404 from a catch-all is not an answer a gated client can trust.
+    const handledByMount = Boolean((event as any)?.context?.[HANDLED_BY_KEY]);
+    const recoverable =
+      result === undefined ||
+      result === H3_NOT_FOUND ||
+      (!handledByMount && isNotFound(result));
+    if (!recoverable) return result;
+
+    // Routes mounted while this request was in flight are not in the middleware
+    // list it was dispatched with, so "nothing matched" can mean "mounted too
+    // late for you" rather than "does not exist".
+    //
+    // The readiness gate cannot prevent this on its own: it releases the
+    // request on completion FLAGS, and mounting continues after the flags say
+    // ready — measured on Workers as a gated request whose snapshot was taken
+    // before 298 of the isolate's mounts existed. So wait here for the mount
+    // this request actually needs, then run it. Waiting on the mount is the
+    // question the response depends on; waiting on a readiness flag is a proxy
+    // for it that has now been observed to be wrong.
+    const missed = await awaitLateMountFor(nitroApp, event, reqPath);
+    if (missed.length) {
+      console.warn(
+        `[agent-native] ${reqPath} missed ${missed.length} mount(s) registered ` +
+          `after its dispatch snapshot — replaying [${mountLabels(missed).join(" ")}]`,
+      );
+      const replayed = await runMiddlewareChain(missed, event);
+      if (replayed !== undefined && replayed !== H3_NOT_FOUND) return replayed;
+    }
 
     const readiness = describeFrameworkReadiness(nitroApp);
     const incomplete = isFrameworkInitIncomplete(readiness);
@@ -424,7 +474,9 @@ function getFrameworkInitGuard(
         `bootstrap=${readiness.bootstrap} ` +
         `pending=[${readiness.pending.join(" ")}] ` +
         `failed=[${readiness.failed.join(" ")}] ` +
-        `proven=${readiness.proven} — answering 503`,
+        `proven=${readiness.proven} ` +
+        `mounted=[${mountLabels(allMounts(nitroApp)).join(" ")}] ` +
+        `— answering 503`,
     );
 
     setResponseStatus(event, 503);
@@ -439,6 +491,105 @@ function getFrameworkInitGuard(
 
   nitroApp[INIT_GUARD_KEY] = guard;
   return guard;
+}
+
+/** A 404 that some other handler produced, in either shape h3 can carry. */
+function isNotFound(result: unknown): boolean {
+  if (result instanceof Response) return result.status === 404;
+  const status = (result as any)?.statusCode ?? (result as any)?.status;
+  return status === 404;
+}
+
+function allMounts(nitroApp: any): any[] {
+  const middleware = nitroApp?.h3?.["~middleware"];
+  return Array.isArray(middleware) ? middleware : [];
+}
+
+/** Labels for a log line: mount paths where known, `?` for h3's own entries. */
+function mountLabels(middleware: any[]): string[] {
+  return middleware.map((entry) => entry?.[MOUNT_PATH_KEY] ?? "?");
+}
+
+/**
+ * Wait, within the readiness budget, for a mount that covers `reqPath` and was
+ * registered after this request's dispatch snapshot; resolve with every missed
+ * mount so the replay runs them in registration order.
+ *
+ * Returns as soon as a covering mount appears, and gives up at the deadline —
+ * at which point the caller's existing 503/404 answer is the right one. A path
+ * with no covering mount waits out the budget once per cold isolate rather than
+ * 404ing an MCP client that will not retry.
+ */
+async function awaitLateMountFor(
+  nitroApp: any,
+  event: H3Event,
+  reqPath: string,
+): Promise<any[]> {
+  const deadline = Date.now() + frameworkReadyDeadlineMs();
+  let mountCount = allMounts(nitroApp).length;
+  let lastProgressAt = Date.now();
+  for (;;) {
+    const missed = missedLateMounts(nitroApp, event, reqPath);
+    if (missed.some((entry) => mountCovers(entry, reqPath))) return missed;
+
+    // Bounded by PROGRESS, not just by the deadline: an isolate that is still
+    // mounting is worth waiting for, an isolate that has stopped mounting is
+    // not. Without this a genuinely absent gated path — every stray
+    // `/.well-known/*` probe — would burn the whole readiness budget before
+    // 404ing.
+    const current = allMounts(nitroApp).length;
+    if (current !== mountCount) {
+      mountCount = current;
+      lastProgressAt = Date.now();
+    }
+    const now = Date.now();
+    if (now >= deadline || now - lastProgressAt >= MOUNT_PROGRESS_GRACE_MS) {
+      return missed;
+    }
+    await sleep(INIT_POLL_INTERVAL_MS);
+  }
+}
+
+/** Does this middleware's mount point cover `reqPath`? */
+function mountCovers(middleware: any, reqPath: string): boolean {
+  const path = middleware?.[MOUNT_PATH_KEY];
+  if (typeof path !== "string" || path === "(global)") return false;
+  return Boolean(resolveMountMatch(reqPath, path));
+}
+
+/**
+ * Middleware mounted on this isolate that was NOT in the list this request was
+ * dispatched with — i.e. registered while the request was already in flight.
+ */
+function missedLateMounts(
+  nitroApp: any,
+  event: H3Event,
+  reqPath: string,
+): any[] {
+  if (!isGatedPath(reqPath)) return [];
+  const snapshot = (event as any)?.context?.[DISPATCH_SNAPSHOT_KEY];
+  if (!Array.isArray(snapshot)) return [];
+  const dispatched = new Set(snapshot);
+  return allMounts(nitroApp).filter((entry) => !dispatched.has(entry));
+}
+
+/**
+ * Run middleware in order with h3's `(event, next)` contract, returning the
+ * first real result. Mirrors h3's own composition closely enough for the
+ * `registerMiddleware` handlers this replays, which all either answer or
+ * delegate to `next()`.
+ */
+async function runMiddlewareChain(
+  middleware: any[],
+  event: H3Event,
+): Promise<unknown> {
+  const step = async (index: number): Promise<unknown> => {
+    if (index >= middleware.length) return H3_NOT_FOUND;
+    const entry = middleware[index];
+    if (typeof entry !== "function") return step(index + 1);
+    return await entry(event, () => step(index + 1));
+  };
+  return step(0);
 }
 
 /**
@@ -473,7 +624,21 @@ function ensureGlobalMiddlewareDispatch(nitroApp: any): void {
     // Appended here rather than registered, because "last" is the guard's whole
     // contract and registration order cannot provide it: real routes are pushed
     // onto `~middleware` during plugin init, long after this module runs.
-    return [...missingGlobal, ...originalList, getFrameworkInitGuard(nitroApp)];
+    const list = [
+      ...missingGlobal,
+      ...originalList,
+      getFrameworkInitGuard(nitroApp),
+    ];
+    // Stash what this request was dispatched with. Anything mounted after this
+    // point cannot run for this request, and the guard needs to be able to say
+    // so rather than reporting a bare "no route matched".
+    try {
+      const context = ((event as any).context ??= {});
+      context[DISPATCH_SNAPSHOT_KEY] = list;
+    } catch {
+      // Event without a writable context — diagnostics only, keep serving.
+    }
+    return list;
   };
 
   h3["~getMiddleware"] = wrappedGetMiddleware;
@@ -1117,6 +1282,14 @@ function registerMiddleware(
         restoreOriginalPath();
         return next();
       }
+      // Claim the response, so the init guard can tell a framework mount's own
+      // 404 (a real "this action found nothing", which must not be retried)
+      // from a catch-all's 404 on a path whose mount does not exist yet.
+      try {
+        ((event as any).context ??= {})[HANDLED_BY_KEY] = path || "(global)";
+      } catch {
+        // Diagnostics only — never fail a served response over it.
+      }
       return result;
     } catch (err) {
       // Log 500s to the server console so they're debuggable, and respond
@@ -1188,6 +1361,12 @@ function registerMiddleware(
     }
   };
 
+  // Stamped so the init guard can report which mounts this isolate holds, and
+  // which of them this request was dispatched with. Without it, a gated 404 is
+  // indistinguishable from outside: "never mounted" and "mounted after this
+  // request took its middleware snapshot" produce the identical response.
+  (middleware as any)[MOUNT_PATH_KEY] = path || "(global)";
+
   if (options.prepend) {
     h3["~middleware"].unshift(middleware);
   } else {
@@ -1198,6 +1377,11 @@ function registerMiddleware(
     }
     h3["~middleware"].push(middleware);
   }
+  // h3 memoizes its dispatcher and its composed middleware chain, and only
+  // invalidates them from its own `use()`. Pushing here without this leaves
+  // the isolate serving a chain frozen before this mount existed.
+  h3["~dispatch"] = undefined;
+  h3["~composed"] = undefined;
 }
 
 /**

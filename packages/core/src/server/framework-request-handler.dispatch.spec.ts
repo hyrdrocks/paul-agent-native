@@ -186,6 +186,80 @@ describe("cold-isolate dispatch on Cloudflare Workers", () => {
     expect(await response.json()).toEqual({ mcp: "ok" });
   });
 
+  it("serves a route mounted after the request took its middleware snapshot", async () => {
+    const nitroApp = createNitroApp();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Measured on Workers: the readiness gate released a `/mcp` request —
+    // 0ms wait, `bootstrap=ready pending=[] failed=[]` — and the isolate then
+    // registered 298 mounts, `/mcp` among them. The gate's flags cannot fix
+    // this; by the time they are consulted the middleware list is already
+    // snapshotted, so the recovery has to happen after dispatch.
+    trackPluginInit(nitroApp, async () => {}, { paths: ["/mcp"] });
+    void get(nitroApp, "/_agent-native/config");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    setTimeout(() => getH3App(nitroApp).use("/mcp", () => ({ mcp: "ok" })), 60);
+
+    const response = await get(nitroApp, "/mcp");
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ mcp: "ok" });
+    warn.mockRestore();
+  });
+
+  it("recovers a gated path a catch-all already answered with a bare 404", async () => {
+    const nitroApp = createNitroApp();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Nitro's asset/SSR fallback answers `/.well-known/agent-card.json` with an
+    // empty 404 when the framework mount for it does not exist yet — a 404 that
+    // never reaches the "no route matched" path, and so used to escape the
+    // guard entirely.
+    (nitroApp.h3 as any)["~findRoute"] = () => ({
+      data: { handler: () => new Response(null, { status: 404 }) },
+      params: {},
+    });
+    trackPluginInit(nitroApp, async () => {}, { paths: ["/.well-known"] });
+    setTimeout(
+      () =>
+        getH3App(nitroApp).use("/.well-known/agent-card.json", () => ({
+          name: "Dispatch",
+        })),
+      60,
+    );
+
+    const response = await get(nitroApp, "/.well-known/agent-card.json");
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ name: "Dispatch" });
+    warn.mockRestore();
+  });
+
+  it("does not replay a framework mount that answered its own 404", async () => {
+    const nitroApp = createNitroApp();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let calls = 0;
+
+    // An action answering "no such record" is a real answer. Re-running the
+    // mount to double-check it would execute the action twice.
+    trackPluginInit(
+      nitroApp,
+      async () => {
+        getH3App(nitroApp).use("/_agent-native/actions/get-thing", () => {
+          calls += 1;
+          return new Response(null, { status: 404 });
+        });
+      },
+      { paths: ["/_agent-native/actions"] },
+    );
+
+    const response = await get(nitroApp, "/_agent-native/actions/get-thing");
+
+    expect(response.status).toBe(404);
+    expect(calls).toBe(1);
+    warn.mockRestore();
+  });
+
   it("leaves non-gated paths to the app", async () => {
     const nitroApp = createNitroApp();
     trackPluginInit(nitroApp, async () => {}, { paths: ["/_agent-native"] });
