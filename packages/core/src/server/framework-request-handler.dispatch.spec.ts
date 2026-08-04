@@ -150,6 +150,42 @@ describe("cold-isolate dispatch on Cloudflare Workers", () => {
     warn.mockRestore();
   });
 
+  it("does not let the app's catch-all answer a gated path mid-init", async () => {
+    const nitroApp = createNitroApp();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // An SSR app matches every path, so h3 resolves a route for /mcp and the
+    // React Router 404 page is a perfectly good "result". The guard used to
+    // step aside for it, which is how a 404 kept reaching MCP clients even with
+    // the guard deployed.
+    (nitroApp.h3 as any)["~findRoute"] = () => ({
+      data: { handler: () => new Response("app 404", { status: 404 }) },
+      params: {},
+    });
+    trackPluginInit(nitroApp, () => new Promise<void>(() => {}), {
+      paths: ["/_agent-native/agent-chat"],
+    });
+
+    expect((await get(nitroApp, "/mcp")).status).toBe(503);
+    warn.mockRestore();
+  });
+
+  it("holds a request that arrives before any init has been tracked", async () => {
+    const nitroApp = createNitroApp();
+    // Nothing tracked yet: bootstrap settles with no entries, so the readiness
+    // bookkeeping reads exactly like a finished isolate. It is not one — no
+    // framework route is registered — and pruned entries produce the same
+    // reading on a real cold isolate.
+    getH3App(nitroApp);
+    setTimeout(() => {
+      getH3App(nitroApp).use("/mcp", () => ({ mcp: "ok" }));
+    }, 120);
+
+    const response = await get(nitroApp, "/mcp");
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ mcp: "ok" });
+  });
+
   it("leaves non-gated paths to the app", async () => {
     const nitroApp = createNitroApp();
     trackPluginInit(nitroApp, async () => {}, { paths: ["/_agent-native"] });

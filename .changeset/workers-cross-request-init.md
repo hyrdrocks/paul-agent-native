@@ -35,8 +35,17 @@ unchanged); Node keeps its existing scoped behaviour.
 
 And a gated prefix no longer answers a bare 404 while the isolate cannot prove
 its init finished: `/_agent-native/*`, `/mcp/*` and `/.well-known/*` fall through
-to a guard that reports a retryable 503 naming the unfinished inits, and logs the
-readiness snapshot either way. A route that genuinely does not exist still 404s.
+to a guard that reports a retryable 503 naming the unfinished inits. A route that
+genuinely does not exist still 404s.
+
+Two things make that guard reliable. It no longer steps aside when a route
+matched — on an SSR app h3 resolves the catch-all for `/mcp` and the app's own
+404 page answers, which is not a framework answer at all. And readiness is now a
+positive record rather than an inference: tracked entries are pruned once they
+settle, so "nothing pending" could equally mean "nothing was ever recorded", and
+a request arriving before the bookkeeping existed read the second as the first.
+An isolate that has never completed a readiness pass must also find the requested
+route actually registered before the gate releases it.
 This matters most for MCP clients, which make a handful of discovery and
 handshake calls without retrying, so one 404 on `/mcp` or
 `/.well-known/oauth-authorization-server` drops the connection outright.

@@ -53,12 +53,8 @@ const MIDDLEWARE_DISPATCHER_PATCHED_KEY =
   "_agentNativeMiddlewareDispatcherPatched";
 const REQUEST_CONTEXT_BOUNDARY_KEY = "_agentNativeRequestContextBoundary";
 const INIT_GUARD_KEY = "_agentNativeFrameworkInitGuard";
-
-/**
- * h3's "no route matched" sentinel, which it later turns into a 404. Registered
- * symbol, so reading it here cannot drift from the h3 instance in use.
- */
-const H3_NOT_FOUND = Symbol.for("h3.notFound");
+const INIT_PROVEN_KEY = "_agentNativeFrameworkInitProven";
+const MOUNT_PATHS_KEY = "_agentNativeFrameworkMountPaths";
 
 interface PluginReadyEntry {
   /** Undefined until the init has actually been started (see `start`). */
@@ -314,10 +310,40 @@ function isGatedPath(reqPath: string): boolean {
   );
 }
 
+/**
+ * True once some framework route matching `reqPath` has actually been
+ * registered.
+ *
+ * Init bookkeeping says whether the work that registers routes has finished;
+ * this says whether the route is there. Those came apart in production —
+ * `/mcp` and `/.well-known/oauth-protected-resource` answered 404 after paying
+ * the full 3-6s init cost on a cold isolate while every tracked init reported
+ * settled — so the gate asks the direct question too, not just the proxy for it.
+ *
+ * Only real routes count. The readiness gates and the per-plugin placeholders
+ * are registered with `prepend`, and they are precisely what a request must not
+ * mistake for the route it came for.
+ */
+function hasFrameworkRouteFor(nitroApp: any, reqPath: string): boolean {
+  const mounts = nitroApp?.[MOUNT_PATHS_KEY] as Set<string> | undefined;
+  if (!mounts?.size) return false;
+  for (const mount of mounts) {
+    if (resolveMountMatch(reqPath, mount)) return true;
+  }
+  return false;
+}
+
 interface ReadinessSnapshot {
   bootstrap: "unstarted" | "pending" | "failed" | "ready";
   pending: string[];
   failed: string[];
+  /**
+   * Whether this isolate has ever completed a readiness pass. Tracked entries
+   * are pruned once they settle, so `pending: []` alone cannot tell "everything
+   * finished" from "nothing was ever recorded" — and a request that arrives
+   * before the bookkeeping exists reads the second as the first.
+   */
+  proven: boolean;
 }
 
 /**
@@ -343,11 +369,13 @@ function describeFrameworkReadiness(nitroApp: any): ReadinessSnapshot {
           : "pending",
     pending: entries.filter((entry) => !entry.state.settled).map(label),
     failed: entries.filter((entry) => entry.state.error).map(label),
+    proven: nitroApp?.[INIT_PROVEN_KEY] === true,
   };
 }
 
 function isFrameworkInitIncomplete(snapshot: ReadinessSnapshot): boolean {
   return (
+    !snapshot.proven ||
     snapshot.bootstrap !== "ready" ||
     snapshot.pending.length > 0 ||
     snapshot.failed.length > 0
@@ -381,19 +409,23 @@ function getFrameworkInitGuard(
     const reqPath = event.url?.pathname ?? "";
     if (!isGatedPath(reqPath)) return next();
 
+    // Every framework route runs before this middleware, so whatever `next()`
+    // returns came from the app's file-based routing — usually the SSR
+    // catch-all, which happily renders its own 404 for `/mcp`. Passing that
+    // through is how the first version of this guard stayed silent in
+    // production: the request was answered, just not by the framework.
     const result = await next();
-    if (result !== undefined && result !== H3_NOT_FOUND) return result;
 
     const readiness = describeFrameworkReadiness(nitroApp);
     const incomplete = isFrameworkInitIncomplete(readiness);
+    if (!incomplete) return result;
     console.warn(
-      `[agent-native] no framework route matched ${reqPath} — ` +
+      `[agent-native] no framework route served ${reqPath} — ` +
         `bootstrap=${readiness.bootstrap} ` +
         `pending=[${readiness.pending.join(" ")}] ` +
         `failed=[${readiness.failed.join(" ")}] ` +
-        `answering ${incomplete ? "503" : "404"}`,
+        `proven=${readiness.proven} — answering 503`,
     );
-    if (!incomplete) return result;
 
     setResponseStatus(event, 503);
     setResponseHeader(event, "retry-after", "5");
@@ -579,7 +611,7 @@ async function awaitFrameworkRoutesReadyForRequest(
   retryBootstrapIfFailed(nitroApp, event);
   startDeferredPluginInits(nitroApp, event);
   if (isCrossRequestPromiseUnsafe()) {
-    return pollFrameworkRoutesReady(nitroApp, event);
+    return pollFrameworkRoutesReady(nitroApp, reqPath, event);
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -588,6 +620,7 @@ async function awaitFrameworkRoutesReadyForRequest(
         const bootstrapPromise = nitroApp[BOOTSTRAP_PROMISE_KEY];
         if (bootstrapPromise) await bootstrapPromise;
         await awaitPluginsReady(nitroApp, reqPath);
+        nitroApp[INIT_PROVEN_KEY] = true;
         return true;
       })(),
       new Promise<boolean>((resolve) => {
@@ -619,6 +652,7 @@ async function awaitFrameworkRoutesReadyForRequest(
  */
 async function pollFrameworkRoutesReady(
   nitroApp: any,
+  reqPath: string,
   event?: H3Event,
 ): Promise<boolean> {
   const deadline = Date.now() + frameworkReadyDeadlineMs();
@@ -633,7 +667,18 @@ async function pollFrameworkRoutesReady(
       ? relevantPluginEntries(nitroApp).filter((entry) => !entry.state.settled)
       : [];
 
-    if (bootstrapSettled && pending.length === 0) {
+    // Releasing needs BOTH: the bookkeeping says init is done, and either this
+    // isolate has completed a readiness pass before or the route being asked
+    // for is actually registered. On a cold isolate the bookkeeping alone has
+    // been wrong — pruned entries and a settled bootstrap read as "ready" to a
+    // request that arrived before any of it existed, and it left with a 404.
+    if (
+      bootstrapSettled &&
+      pending.length === 0 &&
+      (nitroApp[INIT_PROVEN_KEY] === true ||
+        hasFrameworkRouteFor(nitroApp, reqPath))
+    ) {
+      nitroApp[INIT_PROVEN_KEY] = true;
       prunePluginEntries(nitroApp);
       return true;
     }
@@ -1146,6 +1191,11 @@ function registerMiddleware(
   if (options.prepend) {
     h3["~middleware"].unshift(middleware);
   } else {
+    if (path) {
+      const mounts: Set<string> = (nitroApp[MOUNT_PATHS_KEY] ??=
+        new Set<string>());
+      mounts.add(path);
+    }
     h3["~middleware"].push(middleware);
   }
 }
