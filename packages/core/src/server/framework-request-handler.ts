@@ -55,6 +55,22 @@ const MIDDLEWARE_DISPATCHER_PATCHED_KEY =
 const REQUEST_CONTEXT_BOUNDARY_KEY = "_agentNativeRequestContextBoundary";
 const INIT_GUARD_KEY = "_agentNativeFrameworkInitGuard";
 const INIT_PROVEN_KEY = "_agentNativeFrameworkInitProven";
+const warnedOnce = new Set<string>();
+
+/**
+ * Warn the first time a condition is seen in this isolate.
+ *
+ * These sites sit on the per-request path, so an unconditional warn would flood
+ * the log for whatever runtime broke — but staying silent is worse: the two
+ * callers below are how the init guard tells "mounted too late for this request"
+ * and "this mount answered its own 404" apart, and losing either changes the
+ * response rather than just the diagnostics.
+ */
+function warnOnce(key: string, message: string): void {
+  if (warnedOnce.has(key)) return;
+  warnedOnce.add(key);
+  console.warn(`[agent-native] ${message}`);
+}
 const MOUNT_PATHS_KEY = "_agentNativeFrameworkMountPaths";
 /** Mount path stamped on every middleware `registerMiddleware` creates. */
 const MOUNT_PATH_KEY = "_agentNativeMountPath";
@@ -636,8 +652,12 @@ function ensureGlobalMiddlewareDispatch(nitroApp: any): void {
     try {
       const context = ((event as any).context ??= {});
       context[DISPATCH_SNAPSHOT_KEY] = list;
-    } catch {
-      // Event without a writable context — diagnostics only, keep serving.
+    } catch (err) {
+      warnOnce(
+        "dispatch-snapshot",
+        "could not record this request's dispatch snapshot, so a late-mounted " +
+          `gated route cannot be recovered for it: ${String((err as Error)?.message ?? err)}`,
+      );
     }
     return list;
   };
@@ -1310,8 +1330,12 @@ function registerMiddleware(
       // from a catch-all's 404 on a path whose mount does not exist yet.
       try {
         ((event as any).context ??= {})[HANDLED_BY_KEY] = path || "(global)";
-      } catch {
-        // Diagnostics only — never fail a served response over it.
+      } catch (err) {
+        warnOnce(
+          "handled-by",
+          "could not record which mount served this request; a mount's own 404 " +
+            `may be replayed as if its route were missing: ${String((err as Error)?.message ?? err)}`,
+        );
       }
       return result;
     } catch (err) {
