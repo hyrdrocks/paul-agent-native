@@ -162,6 +162,42 @@ describe("handleMcpConnect", () => {
     delete process.env.MCP_SERVER_NAME;
   });
 
+  describe("server id", () => {
+    it("defaults to agent-native-<first hostname label>", async () => {
+      getSessionMock.mockResolvedValue({ email: "u@example.com" });
+      const res = await handleMcpConnect(ev({}), "/info");
+      expect(await res.json()).toMatchObject({ serverId: "agent-native-mail" });
+    });
+
+    it("honours MCP_SERVER_NAME over the hostname guess", async () => {
+      process.env.MCP_SERVER_NAME = "dispatch-paulsjob";
+      getSessionMock.mockResolvedValue({ email: "u@example.com" });
+      const page = await handleMcpConnect(ev({}), "/");
+      expect(await page.text()).toContain(
+        "claude mcp add --transport http dispatch-paulsjob",
+      );
+      const info = await handleMcpConnect(ev({}), "/info");
+      expect(await info.json()).toMatchObject({
+        serverId: "dispatch-paulsjob",
+      });
+    });
+
+    it("prefers an explicit route option over MCP_SERVER_NAME", async () => {
+      process.env.MCP_SERVER_NAME = "from-env";
+      getSessionMock.mockResolvedValue({ email: "u@example.com" });
+      const res = await handleMcpConnect(ev({}), "/info", {
+        serverName: "from-options",
+      });
+      expect(await res.json()).toMatchObject({ serverId: "from-options" });
+    });
+
+    it("GET /info requires a session", async () => {
+      getSessionMock.mockResolvedValue(null);
+      const res = await handleMcpConnect(ev({}), "/info");
+      expect(res.status).toBe(401);
+    });
+  });
+
   describe("connect page", () => {
     it("serves the configured login HTML when unauthenticated", async () => {
       getSessionMock.mockResolvedValue(null);
@@ -286,34 +322,6 @@ describe("handleMcpConnect", () => {
         label: "laptop",
         jti: payload.jti,
       });
-    });
-
-    it("names the server from MCP_SERVER_NAME when the app passes no option", async () => {
-      // A deployment consuming a pre-composed core-routes plugin cannot reach
-      // `mcpConnectServerName`, so without this the derived name is the only one
-      // available and the server cannot be renamed at all.
-      process.env.MCP_SERVER_NAME = "dispatch";
-      getSessionMock.mockResolvedValue({ email: "u@example.com" });
-      const res = await handleMcpConnect(ev({ method: "POST" }), "/token");
-      expect((await res.json()).serverName).toBe("dispatch");
-    });
-
-    it("lets an explicit option win over MCP_SERVER_NAME", async () => {
-      // An app that named its server in code made a deliberate choice; a
-      // deployment-wide variable must not silently take it over.
-      process.env.MCP_SERVER_NAME = "from-env";
-      getSessionMock.mockResolvedValue({ email: "u@example.com" });
-      const res = await handleMcpConnect(ev({ method: "POST" }), "/token", {
-        serverName: "from-option",
-      });
-      expect((await res.json()).serverName).toBe("from-option");
-    });
-
-    it("falls through to the derived name when MCP_SERVER_NAME is blank", async () => {
-      process.env.MCP_SERVER_NAME = "   ";
-      getSessionMock.mockResolvedValue({ email: "u@example.com" });
-      const res = await handleMcpConnect(ev({ method: "POST" }), "/token");
-      expect((await res.json()).serverName).toBe("agent-native-mail");
     });
 
     it("defaults token lifetime to 365 days", async () => {
