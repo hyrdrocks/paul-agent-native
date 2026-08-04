@@ -511,11 +511,15 @@ export async function resolveFetchToolKeyAllowlist(
 export function createAgentChatPlugin(
   options?: AgentChatPluginOptions,
 ): NitroPluginDef {
-  return (nitroApp: any) => {
-    markDefaultPluginProvided(nitroApp, "agent-chat");
-    // Nitro v3 calls plugins synchronously and doesn't await async return
-    // values. We track the async init so the framework's readiness gate
-    // holds /_agent-native requests until routes are registered.
+  // The init body, deliberately NOT started here. Nitro calls plugins at
+  // isolate scope, where Cloudflare Workers refuses `setTimeout`, `fetch` and
+  // every other I/O call ("Disallowed operation called within global scope") and
+  // where work it does attribute to the request that warmed the isolate is
+  // canceled the moment that request answers — which took every other
+  // concurrent request's continuation with it and left /_agent-native/actions
+  // answering 404. `trackPluginInit` starts this inside a request context there,
+  // and immediately on Node.
+  const runInit = async (nitroApp: any) => {
     const initPromise = (async () => {
       const { awaitBootstrap } = await import("./framework-request-handler.js");
       await awaitBootstrap(nitroApp);
@@ -6160,7 +6164,15 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
         }),
       );
     });
-    trackPluginInit(nitroApp, initPromise, {
+    return initPromise;
+  };
+
+  return (nitroApp: any) => {
+    markDefaultPluginProvided(nitroApp, "agent-chat");
+    // Nitro v3 calls plugins synchronously and doesn't await async return
+    // values. We track the async init so the framework's readiness gate
+    // holds /_agent-native requests until routes are registered.
+    trackPluginInit(nitroApp, () => runInit(nitroApp), {
       paths: [
         options?.path ?? "/_agent-native/agent-chat",
         "/_agent-native/actions",

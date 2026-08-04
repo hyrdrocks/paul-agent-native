@@ -273,6 +273,8 @@ Für MCP-Clients, die keinen Remote-OAuth URL direkt hinzufügen können, öffne
 
 Starten Sie den Agent-Client nach der Verbindung neu, damit er den neuen MCP-Server aufnimmt.
 
+Die Server-ID in diesem Block (oben `mail`) ist standardmäßig `agent-native-<erstes Label Ihres Hostnamens>`. Setzen Sie `MCP_SERVER_NAME` in der Umgebung des Deployments, um sie selbst zu wählen – die Connect-Seite, der kopierbare Config-Block und Device-Flow-Grants verwenden denselben Wert. Eine App, die `mcpConnectServerName` an `createCoreRoutesPlugin` übergibt, behält diesen Namen; die Umgebungsvariable greift nur, wenn die Option fehlt.
+
 Verwenden Sie diesen manuellen Trägerblock für MCP-Clients, die den standardmäßigen Remote-MCP OAuth-Fluss nicht abschließen können, oder für einmaliges Debuggen, wenn Sie explizit ein Token einfügen möchten.
 
 ### Standardfernbedienung MCP OAuth {#standard-oauth}

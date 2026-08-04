@@ -1301,20 +1301,18 @@ export async function readLegacyCoreRouteInitSettings(
 export function createCoreRoutesPlugin(
   options: CoreRoutesPluginOptions = {},
 ): NitroPluginDef {
-  return async (nitroApp: any) => {
-    markDefaultPluginProvided(nitroApp, "core-routes");
-    // No-op when called from inside the bootstrap (auto-mount path).
-    // Otherwise wait so other default plugins finish mounting first.
-    let resolveInit: () => void = () => {};
-    let rejectInit: (error: unknown) => void = () => {};
-    const initPromise = new Promise<void>((resolve, reject) => {
-      resolveInit = resolve;
-      rejectInit = reject;
-    });
-    trackPluginInit(nitroApp, initPromise, {
-      paths: [FRAMEWORK_ROUTE_PREFIX, "/mcp", "/.well-known"],
-    });
-    try {
+  // The init body, as a thunk. `trackPluginInit` runs it immediately on Node and
+  // starts it inside the first request's context on Workers, where a Nitro
+  // plugin runs at isolate scope: workerd refuses I/O there outright, and work
+  // attributed to the request that warmed the isolate is canceled the moment
+  // that request answers — which is how a cold isolate ended up serving
+  // /_agent-native/config as a 404.
+  const runInit = async (nitroApp: any) => {
+    // The inner block is only here to keep this body's indentation — and so its
+    // diff — unchanged by the move out of the plugin function.
+    {
+      // No-op when called from inside the bootstrap (auto-mount path).
+      // Otherwise wait so other default plugins finish mounting first.
       await awaitBootstrap(nitroApp);
 
       const { persistedEnvVars, builderDisconnected } =
@@ -4275,16 +4273,20 @@ export function createCoreRoutesPlugin(
           }),
         );
       }
-      resolveInit();
-    } catch (error) {
-      // Do NOT rethrow. Nitro invokes plugins as `try { plugin(app) } catch`,
-      // which cannot catch an async rejection, so rethrowing here surfaces as
-      // an unhandledRejection: Node exits, the serverless container dies, and
-      // every in-flight request on it returns a bare 502. `rejectInit` already
-      // routes this failure to the readiness gate, which answers the affected
-      // paths with a retryable 503 instead.
-      rejectInit(error);
     }
+  };
+
+  return (nitroApp: any) => {
+    markDefaultPluginProvided(nitroApp, "core-routes");
+    // A rejection here is not rethrown into Nitro: it invokes plugins as
+    // `try { plugin(app) } catch`, which cannot catch an async rejection, so a
+    // throw would surface as an unhandledRejection — Node exits, the serverless
+    // container dies, and every in-flight request on it returns a bare 502.
+    // `trackPluginInit` records the failure instead, and the readiness gate
+    // answers the affected paths with a retryable 503.
+    trackPluginInit(nitroApp, () => runInit(nitroApp), {
+      paths: [FRAMEWORK_ROUTE_PREFIX, "/mcp", "/.well-known"],
+    });
   };
 }
 

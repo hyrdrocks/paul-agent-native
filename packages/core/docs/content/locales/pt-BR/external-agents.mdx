@@ -273,6 +273,8 @@ Para clientes MCP que não podem adicionar um OAuth URL remoto diretamente, abra
 
 Reinicie o cliente do agente após conectar-se para que ele receba o novo servidor MCP.
 
+O id do servidor nesse bloco (`mail` acima) é `agent-native-<primeiro rótulo do seu nome de host>` por padrão. Defina `MCP_SERVER_NAME` no ambiente do deploy para escolhê-lo você mesmo — a página de conexão, a configuração copiável e as concessões do fluxo de dispositivo usam o mesmo valor. Um app que passa `mcpConnectServerName` para `createCoreRoutesPlugin` mantém esse nome; a variável de ambiente só se aplica quando a opção está ausente.
+
 Use este bloco de portador manual para clientes MCP que não podem concluir o fluxo remoto padrão MCP OAuth ou para depuração única quando você deseja colar explicitamente um token.
 
 ### Remoto padrão MCP OAuth {#standard-oauth}

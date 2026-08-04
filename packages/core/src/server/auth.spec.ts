@@ -199,6 +199,83 @@ describe("server/auth", () => {
       errorSpy.mockRestore();
     });
 
+    it("reports a degraded mount when Better Auth init fails", async () => {
+      // The fallback path mounts the guard and the minimal routes but NOT Better
+      // Auth's catch-all at /_agent-native/auth/ba, so every sign-in call the
+      // client makes would reach the router's no-match 404. `autoMountAuth`
+      // still returns true (the app IS locked) — the incomplete mount has to be
+      // readable separately, which is how createAuthPlugin turns it into a
+      // retryable 503.
+      vi.stubEnv("NODE_ENV", "production");
+      delete process.env.ACCESS_TOKEN;
+      delete process.env.ACCESS_TOKENS;
+      vi.doMock("./better-auth-instance.js", () => ({
+        getBetterAuth: vi.fn(async () => {
+          throw new Error("db unreachable");
+        }),
+        getBetterAuthSync: vi.fn(() => undefined),
+      }));
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const { autoMountAuth, getAuthMountFailure } = await import("./auth.js");
+      const app = createMockApp();
+
+      expect(await autoMountAuth(app)).toBe(true);
+      expect((getAuthMountFailure(app)?.cause as Error)?.message).toBe(
+        "db unreachable",
+      );
+      const mountedPaths = app.use.mock.calls.map((call: any[]) => call[0]);
+      expect(mountedPaths).not.toContain("/_agent-native/auth/ba");
+
+      errorSpy.mockRestore();
+      logSpy.mockRestore();
+    });
+
+    it("re-attempts a degraded mount instead of short-circuiting on the guard", async () => {
+      // The already-mounted fast path keys on the guard existing. After a failed
+      // init the guard exists but the routes do not, so short-circuiting there
+      // would make the retry a no-op that reports success forever.
+      vi.stubEnv("NODE_ENV", "production");
+      delete process.env.ACCESS_TOKEN;
+      delete process.env.ACCESS_TOKENS;
+      let attempt = 0;
+      const handler = vi.fn(async () => new Response("{}"));
+      vi.doMock("./better-auth-instance.js", () => ({
+        getBetterAuth: vi.fn(async () => {
+          attempt += 1;
+          if (attempt === 1) throw new Error("db unreachable");
+          return {
+            handler,
+            api: {
+              getSession: vi.fn(async () => null),
+              signInEmail: vi.fn(),
+              signUpEmail: vi.fn(),
+              signOut: vi.fn(),
+            },
+          };
+        }),
+        getBetterAuthSync: vi.fn(() => undefined),
+      }));
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const { autoMountAuth, getAuthMountFailure } = await import("./auth.js");
+      const app = createMockApp();
+
+      await autoMountAuth(app);
+      expect(getAuthMountFailure(app)).toBeTruthy();
+
+      await autoMountAuth(app);
+
+      expect(getAuthMountFailure(app)).toBeUndefined();
+      const mountedPaths = app.use.mock.calls.map((call: any[]) => call[0]);
+      expect(mountedPaths).toContain("/_agent-native/auth/ba");
+
+      errorSpy.mockRestore();
+      logSpy.mockRestore();
+    });
+
     it("lets logout opt the current browser out of AUTH_DISABLED inside an HTTPS iframe", async () => {
       vi.stubEnv("NODE_ENV", "production");
       vi.stubEnv("AUTH_DISABLED", "1");

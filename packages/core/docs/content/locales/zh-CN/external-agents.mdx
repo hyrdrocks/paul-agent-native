@@ -270,6 +270,8 @@ npx -y @agent-native/core@latest reconnect https://plan.agent-native.com --clien
 
 连接后重新启动代理客户端，以便它获取新的 MCP 服务器。
 
+该块中的服务器 id（上面的 `mail`）默认为 `agent-native-<主机名的第一个标签>`。在部署环境中设置 `MCP_SERVER_NAME` 即可自行指定 —— 连接页面、可复制的配置和设备流程授权都使用同一个值。向 `createCoreRoutesPlugin` 传入 `mcpConnectServerName` 的应用会保留该名称；仅当未提供该选项时才使用环境变量。
+
 对于无法完成标准远程 MCP OAuth 流程的 MCP 客户端，或者当您明确想要粘贴令牌时进行一次性调试，请使用此手动承载块。
 
 ### 标准遥控器MCP OAuth {#standard-oauth}
