@@ -38,7 +38,16 @@ its init finished: `/_agent-native/*`, `/mcp/*` and `/.well-known/*` fall throug
 to a guard that reports a retryable 503 naming the unfinished inits. A route that
 genuinely does not exist still 404s.
 
-Two things make that guard reliable. It no longer steps aside when a route
+Readiness is derived from init state — a clean bootstrap plus every tracked init
+having settled, counted cumulatively — rather than from a flag some request sets
+when it is released. Both alternatives failed in production: the live entry list
+is pruned as entries settle, so "nothing pending" also reads true before anything
+was ever recorded, and a release-time flag stopped being set at all once requests
+gained an earlier way out, which stranded gated paths that no mount claims (the
+auth guard, a global middleware, is what answers `/_agent-native/config`) until
+the readiness deadline expired.
+
+Two things make the init guard reliable. It no longer steps aside when a route
 matched — on an SSR app h3 resolves the catch-all for `/mcp` and the app's own
 404 page answers, which is not a framework answer at all. And readiness is now a
 positive record rather than an inference: tracked entries are pruned once they

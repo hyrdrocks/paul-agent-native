@@ -54,7 +54,8 @@ const MIDDLEWARE_DISPATCHER_PATCHED_KEY =
   "_agentNativeMiddlewareDispatcherPatched";
 const REQUEST_CONTEXT_BOUNDARY_KEY = "_agentNativeRequestContextBoundary";
 const INIT_GUARD_KEY = "_agentNativeFrameworkInitGuard";
-const INIT_PROVEN_KEY = "_agentNativeFrameworkInitProven";
+const TRACKED_TOTAL_KEY = "_agentNativeTrackedInitTotal";
+const SETTLED_TOTAL_KEY = "_agentNativeSettledInitTotal";
 const warnedOnce = new Set<string>();
 
 /**
@@ -404,8 +405,29 @@ function describeFrameworkReadiness(nitroApp: any): ReadinessSnapshot {
           : "pending",
     pending: entries.filter((entry) => !entry.state.settled).map(label),
     failed: entries.filter((entry) => entry.state.error).map(label),
-    proven: nitroApp?.[INIT_PROVEN_KEY] === true,
+    proven: isInitProven(nitroApp),
   };
+}
+
+/**
+ * Whether this isolate has finished initializing — clean bootstrap, and every
+ * init ever tracked has settled.
+ *
+ * Derived from cumulative counters rather than from the live entry list, and
+ * never from which request happened to observe it. Both alternatives have now
+ * failed in production: the entry list is pruned once entries settle, so
+ * "nothing pending" also reads true before anything was ever recorded; and a
+ * flag set by whichever request released through the completion branch stopped
+ * being set at all once requests gained an earlier way out, which left
+ * `/_agent-native/config` — whose own mount lands late in its plugin's init —
+ * waiting out the full readiness deadline on 22 of 30 samples.
+ */
+function isInitProven(nitroApp: any): boolean {
+  const state = nitroApp?.[BOOTSTRAP_STATE_KEY] as InitState | undefined;
+  if (!state?.settled || state.error) return false;
+  const tracked = (nitroApp[TRACKED_TOTAL_KEY] as number | undefined) ?? 0;
+  const settled = (nitroApp[SETTLED_TOTAL_KEY] as number | undefined) ?? 0;
+  return settled >= tracked;
 }
 
 function isFrameworkInitIncomplete(snapshot: ReadinessSnapshot): boolean {
@@ -808,7 +830,6 @@ async function awaitFrameworkRoutesReadyForRequest(
         const bootstrapPromise = nitroApp[BOOTSTRAP_PROMISE_KEY];
         if (bootstrapPromise) await bootstrapPromise;
         await awaitPluginsReady(nitroApp, reqPath);
-        nitroApp[INIT_PROVEN_KEY] = true;
         return true;
       })(),
       new Promise<boolean>((resolve) => {
@@ -852,24 +873,10 @@ async function pollFrameworkRoutesReady(
     const bootstrapSettled = !bootstrapState || bootstrapState.settled;
 
     startDeferredPluginInits(nitroApp, event);
-    const pending = bootstrapSettled
-      ? relevantPluginEntries(nitroApp).filter((entry) => !entry.state.settled)
-      : [];
-    const routeReady = bootstrapSettled
-      ? hasFrameworkRouteFor(nitroApp, reqPath)
-      : false;
 
-    // Releasing needs BOTH: the bookkeeping says init is done, and either this
-    // isolate has completed a readiness pass before or the route being asked
-    // for is actually registered. On a cold isolate the bookkeeping alone has
-    // been wrong — pruned entries and a settled bootstrap read as "ready" to a
-    // request that arrived before any of it existed, and it left with a 404.
-    if (
-      bootstrapSettled &&
-      pending.length === 0 &&
-      (nitroApp[INIT_PROVEN_KEY] === true || routeReady)
-    ) {
-      nitroApp[INIT_PROVEN_KEY] = true;
+    // This isolate is initialized, so any gated path may be dispatched — the
+    // routes that exist are all the routes there are going to be.
+    if (isInitProven(nitroApp)) {
       prunePluginEntries(nitroApp);
       return true;
     }
@@ -882,10 +889,12 @@ async function pollFrameworkRoutesReady(
     // and not the declared-`paths` guess that under-waited before, which could
     // not tell which plugin owned the route at all.
     //
-    // Deliberately does NOT mark the isolate proven: init is still unfinished,
-    // so a later request for a route that is still missing must keep waiting
-    // rather than inherit this one's release.
-    if (routeReady) return true;
+    // It records nothing about the isolate: init is still unfinished, and a
+    // later request for a route that is still missing must keep waiting rather
+    // than inherit this one's release. Readiness is derived from init state
+    // alone (isInitProven), never from the fact that some request got served.
+    if (bootstrapSettled && hasFrameworkRouteFor(nitroApp, reqPath))
+      return true;
 
     if (Date.now() >= deadline) return false;
     await sleep(interval);
@@ -940,6 +949,9 @@ export function trackPluginInit(
     retry: options.retry ?? start,
   };
 
+  // Counted cumulatively, so pruning the settled entries below cannot make an
+  // isolate look initialized that never was (see isInitProven).
+  nitroApp[TRACKED_TOTAL_KEY] = (nitroApp[TRACKED_TOTAL_KEY] ?? 0) + 1;
   const existing = nitroApp[PLUGIN_READY_KEY] as PluginReadyEntry[] | undefined;
   if (existing) {
     existing.push(entry);
@@ -975,13 +987,18 @@ function attachTrackedInit(
   // Attach a no-op catch so the promise doesn't surface as an unhandled
   // rejection when Nitro v3 drops the async return value. The actual error
   // is still observable when awaitPluginsReady() re-awaits the promise.
+  const countSettled = () => {
+    nitroApp[SETTLED_TOTAL_KEY] = (nitroApp[SETTLED_TOTAL_KEY] ?? 0) + 1;
+  };
   entry.promise = promise.then(
     () => {
       state.settled = true;
+      countSettled();
     },
     (err) => {
       state.settled = true;
       state.error = err;
+      countSettled();
       console.error(
         "[agent-native] Plugin init failed:",
         (err as Error).message || err,

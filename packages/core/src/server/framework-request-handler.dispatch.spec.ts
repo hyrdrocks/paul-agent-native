@@ -292,6 +292,43 @@ describe("cold-isolate dispatch on Cloudflare Workers", () => {
     warn.mockRestore();
   });
 
+  it("releases a gated path that no mount claims, once init is finished", async () => {
+    const nitroApp = createNitroApp();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // `/_agent-native/config` has no mount of its own anywhere in the framework:
+    // the auth guard — a GLOBAL middleware, not a route — is what answers it.
+    // So "is a route for this path registered" is false for it forever, and the
+    // only thing that can release it is the isolate being initialized.
+    getH3App(nitroApp).use((event: any) =>
+      event.url.pathname === "/_agent-native/config"
+        ? new Response(null, { status: 401 })
+        : undefined,
+    );
+    trackPluginInit(
+      nitroApp,
+      async () => {
+        getH3App(nitroApp).use("/mcp", () => ({ mcp: "ok" }));
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      },
+      { paths: ["/_agent-native", "/mcp"] },
+    );
+
+    // Releases on the evidence that its own route exists, and so completes no
+    // full readiness pass.
+    expect((await get(nitroApp, "/mcp")).status).toBe(200);
+
+    // While readiness was a flag set by whichever request released through the
+    // completion branch, nothing set it here — and this path waited out the
+    // whole deadline. 22 of 30 production samples answered 503 at 25-29s.
+    const started = Date.now();
+    const response = await get(nitroApp, "/_agent-native/config");
+
+    expect(response.status).toBe(401);
+    expect(Date.now() - started).toBeLessThan(1500);
+    warn.mockRestore();
+  });
+
   it("leaves non-gated paths to the app", async () => {
     const nitroApp = createNitroApp();
     trackPluginInit(nitroApp, async () => {}, { paths: ["/_agent-native"] });
