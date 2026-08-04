@@ -54,8 +54,30 @@ export interface InitState {
   error?: unknown;
 }
 
-/** How often a waiting request re-reads an init flag. */
+/** How soon a waiting request first re-reads an init flag. */
 export const INIT_POLL_INTERVAL_MS = 10;
+
+/** Ceiling for the backed-off interval — see `nextPollInterval`. */
+export const INIT_POLL_MAX_INTERVAL_MS = 100;
+
+/**
+ * Grow a poll interval toward the ceiling.
+ *
+ * A waiter polls inside the very isolate it is waiting on, so polling is not
+ * free: at a flat 10ms, nine parked requests spend ~22,500 wakeups across a 25s
+ * deadline competing for the CPU that the init needs to finish. Measured in
+ * production, raising the deadline made cold starts strictly worse — 2 of 12
+ * requests failed at 25s, 7 of 12 at 60s — because requests that would have been
+ * shed instead stayed resident and kept polling, lengthening the init they were
+ * all waiting on.
+ *
+ * Doubling from 10ms reaches the ceiling in ~5 iterations, so a fast init is
+ * still observed within ~10-20ms and a long one costs at most one extra
+ * interval of latency.
+ */
+export function nextPollInterval(current: number): number {
+  return Math.min(current * 2, INIT_POLL_MAX_INTERVAL_MS);
+}
 
 /**
  * True on runtimes where awaiting a promise created by another request is
@@ -132,12 +154,13 @@ export async function pollForValue<T>(
   read: () => T | undefined,
   options: { timeoutMs: number; intervalMs?: number },
 ): Promise<T | undefined> {
-  const interval = options.intervalMs ?? INIT_POLL_INTERVAL_MS;
+  let interval = options.intervalMs ?? INIT_POLL_INTERVAL_MS;
   const deadline = Date.now() + options.timeoutMs;
   for (;;) {
     const value = read();
     if (value !== undefined) return value;
     if (Date.now() >= deadline) return undefined;
     await sleep(interval);
+    interval = nextPollInterval(interval);
   }
 }

@@ -22,6 +22,7 @@ import type { InitState } from "./cross-request-init.js";
 import {
   INIT_POLL_INTERVAL_MS,
   isCrossRequestPromiseUnsafe,
+  nextPollInterval,
   keepAliveAcrossRequests,
   sleep,
 } from "./cross-request-init.js";
@@ -586,11 +587,13 @@ async function pollUntilBootstrapSettled(
   timeoutMs: number,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
+  let interval = INIT_POLL_INTERVAL_MS;
   for (;;) {
     const state = nitroApp[BOOTSTRAP_STATE_KEY] as InitState | undefined;
     if (!state || state.settled) return true;
     if (Date.now() >= deadline) return false;
-    await sleep(INIT_POLL_INTERVAL_MS);
+    await sleep(interval);
+    interval = nextPollInterval(interval);
   }
 }
 
@@ -656,6 +659,7 @@ async function pollFrameworkRoutesReady(
   event?: H3Event,
 ): Promise<boolean> {
   const deadline = Date.now() + frameworkReadyDeadlineMs();
+  let interval = INIT_POLL_INTERVAL_MS;
   for (;;) {
     const bootstrapState = nitroApp[BOOTSTRAP_STATE_KEY] as
       | InitState
@@ -666,6 +670,9 @@ async function pollFrameworkRoutesReady(
     const pending = bootstrapSettled
       ? relevantPluginEntries(nitroApp).filter((entry) => !entry.state.settled)
       : [];
+    const routeReady = bootstrapSettled
+      ? hasFrameworkRouteFor(nitroApp, reqPath)
+      : false;
 
     // Releasing needs BOTH: the bookkeeping says init is done, and either this
     // isolate has completed a readiness pass before or the route being asked
@@ -675,15 +682,29 @@ async function pollFrameworkRoutesReady(
     if (
       bootstrapSettled &&
       pending.length === 0 &&
-      (nitroApp[INIT_PROVEN_KEY] === true ||
-        hasFrameworkRouteFor(nitroApp, reqPath))
+      (nitroApp[INIT_PROVEN_KEY] === true || routeReady)
     ) {
       nitroApp[INIT_PROVEN_KEY] = true;
       prunePluginEntries(nitroApp);
       return true;
     }
+
+    // The route this request came for is mounted, so waiting for the remaining
+    // inits buys it nothing: no other plugin can un-register it. Holding anyway
+    // serialises every gated request on a cold isolate behind the slowest init
+    // in the app, and each held request is one more waiter polling the isolate
+    // that is trying to finish. This narrowing is evidence — the route exists —
+    // and not the declared-`paths` guess that under-waited before, which could
+    // not tell which plugin owned the route at all.
+    //
+    // Deliberately does NOT mark the isolate proven: init is still unfinished,
+    // so a later request for a route that is still missing must keep waiting
+    // rather than inherit this one's release.
+    if (routeReady) return true;
+
     if (Date.now() >= deadline) return false;
-    await sleep(INIT_POLL_INTERVAL_MS);
+    await sleep(interval);
+    interval = nextPollInterval(interval);
   }
 }
 
@@ -962,9 +983,11 @@ export async function awaitPluginsReady(
   if (isCrossRequestPromiseUnsafe()) {
     // Poll the flags; the promises belong to whichever request tracked them.
     const deadline = Date.now() + frameworkReadyDeadlineMs();
+    let interval = INIT_POLL_INTERVAL_MS;
     while (!relevant.every((entry) => entry.state.settled)) {
       if (Date.now() >= deadline) return;
-      await sleep(INIT_POLL_INTERVAL_MS);
+      await sleep(interval);
+      interval = nextPollInterval(interval);
     }
   } else {
     await Promise.all(

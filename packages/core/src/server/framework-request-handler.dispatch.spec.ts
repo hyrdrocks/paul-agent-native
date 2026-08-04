@@ -186,6 +186,38 @@ describe("cold-isolate dispatch on Cloudflare Workers", () => {
     expect(await response.json()).toEqual({ mcp: "ok" });
   });
 
+  it("releases a request whose own route is mounted while other inits run", async () => {
+    const nitroApp = createNitroApp();
+    let slowFinished = false;
+
+    trackPluginInit(
+      nitroApp,
+      async () => {
+        getH3App(nitroApp).use("/mcp", () => ({ mcp: "ok" }));
+      },
+      { paths: ["/mcp"] },
+    );
+    // An unrelated init that outlives the deadline. Making /mcp queue behind it
+    // is what serialised every gated request on a cold isolate behind the
+    // slowest plugin in the app — and each request held that way is another
+    // waiter polling the isolate that is trying to finish.
+    trackPluginInit(
+      nitroApp,
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        slowFinished = true;
+      },
+      { paths: ["/_agent-native/terminal"] },
+    );
+
+    const started = Date.now();
+    const response = await get(nitroApp, "/mcp");
+
+    expect(response.status).toBe(200);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(slowFinished).toBe(false);
+  });
+
   it("leaves non-gated paths to the app", async () => {
     const nitroApp = createNitroApp();
     trackPluginInit(nitroApp, async () => {}, { paths: ["/_agent-native"] });
