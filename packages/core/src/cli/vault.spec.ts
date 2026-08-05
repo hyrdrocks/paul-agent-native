@@ -1,16 +1,20 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   EXIT,
+  createVaultSecret,
   discoverConnectedApps,
   leaseSecrets,
   listVaultSecrets,
+  formatVaultAddUsage,
   formatVaultExecUsage,
   formatVaultUsage,
+  promptForSecretValue,
   runVaultExec,
   type ConnectedApp,
   type VaultExecDeps,
@@ -36,6 +40,8 @@ interface Harness {
   spawnChild: ReturnType<typeof vi.fn>;
   leaseSecrets: ReturnType<typeof vi.fn>;
   listSecrets: ReturnType<typeof vi.fn>;
+  createSecret: ReturnType<typeof vi.fn>;
+  promptSecret: ReturnType<typeof vi.fn>;
   discoverConnectedApps: ReturnType<typeof vi.fn>;
   stdoutText: () => string;
 }
@@ -59,11 +65,21 @@ function harness(overrides: Partial<VaultExecDeps> = {}): Harness {
     { credentialKey: "STRIPE_KEY", name: "Stripe", value: FAKE_VALUE },
   ]);
   const spawnChild = vi.fn(async () => 0);
+  // The value is what the operator types, so it exists nowhere in argv.
+  const promptSecret = vi.fn(async () => FAKE_VALUE);
+  // The create action answers with the stored row, value included; the CLI has
+  // to stay incapable of surfacing it.
+  const createSecret = vi.fn(async (draft: { credentialKey: string }) => ({
+    credentialKey: draft.credentialKey,
+    value: FAKE_VALUE,
+  }));
 
   const deps: VaultExecDeps = {
     discoverConnectedApps,
     leaseSecrets,
     listSecrets,
+    createSecret,
+    promptSecret,
     spawnChild,
     env: {},
     stderr: (line) => lines.push(line),
@@ -79,6 +95,8 @@ function harness(overrides: Partial<VaultExecDeps> = {}): Harness {
     spawnChild: (overrides.spawnChild ?? spawnChild) as any,
     leaseSecrets: (overrides.leaseSecrets ?? leaseSecrets) as any,
     listSecrets: (overrides.listSecrets ?? listSecrets) as any,
+    createSecret: (overrides.createSecret ?? createSecret) as any,
+    promptSecret: (overrides.promptSecret ?? promptSecret) as any,
     discoverConnectedApps: (overrides.discoverConnectedApps ??
       discoverConnectedApps) as any,
   };
@@ -659,6 +677,272 @@ describe("runVaultExec — list", () => {
   });
 });
 
+describe("runVaultExec — add", () => {
+  it("creates the secret with the value read from the prompt", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(
+      ["add", "MY_API_TOKEN", "Vendor API token"],
+      h.deps,
+    );
+
+    expect(code).toBe(0);
+    expect(h.promptSecret).toHaveBeenCalledTimes(1);
+    expect(h.createSecret).toHaveBeenCalledWith(
+      {
+        credentialKey: "MY_API_TOKEN",
+        name: "Vendor API token",
+        value: FAKE_VALUE,
+      },
+      expect.objectContaining({ serverName: "dispatch" }),
+    );
+  });
+
+  it("has no way to pass the value in argv: there is no value flag", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(
+      ["add", "MY_API_TOKEN", "Vendor API token", "--value", FAKE_VALUE],
+      h.deps,
+    );
+
+    expect(code).toBe(EXIT.USAGE);
+    expect(h.createSecret).not.toHaveBeenCalled();
+    expect(h.promptSecret).not.toHaveBeenCalled();
+    expect(h.stderrText()).toContain("Unknown option: --value");
+  });
+
+  it("has no way to pass the value in argv: a third positional is refused", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(
+      ["add", "MY_API_TOKEN", "Vendor API token", FAKE_VALUE],
+      h.deps,
+    );
+
+    expect(code).toBe(EXIT.USAGE);
+    expect(h.createSecret).not.toHaveBeenCalled();
+    expect(h.promptSecret).not.toHaveBeenCalled();
+  });
+
+  it("sends whatever the prompt returned, so stdin is the only source", async () => {
+    const h = harness({
+      promptSecret: vi.fn(async () => "typed-at-the-prompt"),
+    });
+
+    await runVaultExec(
+      ["add", "MY_API_TOKEN", "Vendor API token", "--app", "dispatch"],
+      h.deps,
+    );
+
+    const [draft] = h.createSecret.mock.calls[0];
+    expect(draft.value).toBe("typed-at-the-prompt");
+  });
+
+  it("takes the deployment as an argument on the subcommand", async () => {
+    const h = harness({
+      discoverConnectedApps: vi.fn(() => [app("dispatch"), app("plan")]),
+    });
+
+    const code = await runVaultExec(
+      ["add", "K", "A key", "--app", "plan"],
+      h.deps,
+    );
+
+    expect(code).toBe(0);
+    expect(h.createSecret).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        serverName: "plan",
+        bearer: "fake-bearer-plan",
+      }),
+    );
+  });
+
+  it("never prints the value, not even the one the deployment echoes back", async () => {
+    const h = harness();
+
+    await runVaultExec(["add", "K", "A key"], h.deps);
+
+    expect(h.stdoutText()).not.toContain(FAKE_VALUE);
+    expect(h.stderrText()).not.toContain(FAKE_VALUE);
+    expect(h.stderrText()).not.toContain("fake-bearer");
+  });
+
+  it("does not prompt before it knows which deployment it is talking to", async () => {
+    const h = harness({ discoverConnectedApps: vi.fn(() => []) });
+
+    expect(await runVaultExec(["add", "K", "A key"], h.deps)).toBe(
+      EXIT.NO_CREDENTIAL,
+    );
+    expect(h.promptSecret).not.toHaveBeenCalled();
+    expect(h.createSecret).not.toHaveBeenCalled();
+  });
+
+  it("refuses with 66 when several apps are connected and none selected", async () => {
+    const h = harness({
+      discoverConnectedApps: vi.fn(() => [app("dispatch"), app("plan")]),
+    });
+
+    const code = await runVaultExec(["add", "K", "A key"], h.deps);
+
+    expect(code).toBe(EXIT.AMBIGUOUS_APP);
+    expect(h.promptSecret).not.toHaveBeenCalled();
+  });
+
+  it("refuses an empty value rather than storing one", async () => {
+    const h = harness({ promptSecret: vi.fn(async () => "") });
+
+    const code = await runVaultExec(["add", "K", "A key"], h.deps);
+
+    expect(code).toBe(EXIT.NO_VALUE);
+    expect(h.createSecret).not.toHaveBeenCalled();
+    expect(h.stderrText()).toContain("No value");
+  });
+
+  it("does not report an unreadable terminal as a malformed command", async () => {
+    const h = harness({
+      promptSecret: vi.fn(async () => {
+        throw new Error("Standard input closed before a value was entered.");
+      }),
+    });
+
+    const code = await runVaultExec(["add", "K", "A key"], h.deps);
+
+    expect(code).toBe(EXIT.NO_VALUE);
+    expect(code).not.toBe(EXIT.USAGE);
+    expect(h.createSecret).not.toHaveBeenCalled();
+    expect(h.stderrText()).toContain("closed before a value");
+  });
+
+  it("confirms the key the deployment stored, not the one that was typed", async () => {
+    const h = harness({
+      createSecret: vi.fn(async () => ({ credentialKey: "NORMALIZED_KEY" })),
+    });
+
+    await runVaultExec(["add", " NORMALIZED_KEY ", "A key"], h.deps);
+
+    expect(h.stderrText()).toContain("NORMALIZED_KEY");
+  });
+
+  it("keeps a value the operator typed with surrounding whitespace intact", async () => {
+    const h = harness({ promptSecret: vi.fn(async () => "  padded  ") });
+
+    await runVaultExec(["add", "K", "A key"], h.deps);
+
+    const [draft] = h.createSecret.mock.calls[0];
+    expect(draft.value).toBe("  padded  ");
+  });
+
+  it("surfaces a refusal from the deployment with its own exit code", async () => {
+    const h = harness({
+      createSecret: vi.fn(async () => {
+        throw new Error("Vault add refused by dispatch: HTTP 403");
+      }),
+    });
+
+    const code = await runVaultExec(["add", "K", "A key"], h.deps);
+
+    expect(code).toBe(EXIT.REQUEST_REFUSED);
+    expect(h.stderrText()).toContain("HTTP 403");
+  });
+
+  it("returns 64 when the description is missing and never prompts", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["add", "K"], h.deps);
+
+    expect(code).toBe(EXIT.USAGE);
+    expect(h.promptSecret).not.toHaveBeenCalled();
+    expect(h.createSecret).not.toHaveBeenCalled();
+  });
+
+  it("returns 64 when no key is given at all", async () => {
+    const h = harness();
+
+    expect(await runVaultExec(["add"], h.deps)).toBe(EXIT.USAGE);
+    expect(h.promptSecret).not.toHaveBeenCalled();
+  });
+
+  it("shows help without prompting or contacting the deployment", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["add", "--help"], h.deps);
+
+    expect(code).toBe(0);
+    expect(h.stdoutText()).toContain("--app");
+    expect(h.promptSecret).not.toHaveBeenCalled();
+    expect(h.createSecret).not.toHaveBeenCalled();
+  });
+
+  it("says in its usage that the value is never an argument", async () => {
+    expect(formatVaultAddUsage()).toContain("argv");
+    expect(formatVaultUsage()).toContain("add");
+  });
+
+  it("confirms the write by naming the key, on stderr, leaving stdout clean", async () => {
+    const h = harness();
+
+    await runVaultExec(["add", "MY_API_TOKEN", "Vendor API token"], h.deps);
+
+    expect(h.stderrText()).toContain("MY_API_TOKEN");
+    expect(h.stdoutText()).toBe("");
+  });
+});
+
+describe("promptForSecretValue", () => {
+  function streams() {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const written: string[] = [];
+    output.on("data", (chunk) => written.push(String(chunk)));
+    return { input, output, written: () => written.join("") };
+  }
+
+  it("resolves on Enter, without the terminal ever sending EOF", async () => {
+    const { input, output, written } = streams();
+
+    const pending = promptForSecretValue("Value for K: ", { input, output });
+    input.write(`${FAKE_VALUE}\n`);
+
+    await expect(pending).resolves.toBe(FAKE_VALUE);
+    // Still open: the operator pressed Enter, not Ctrl-D.
+    expect(input.writableEnded).toBe(false);
+    expect(written()).not.toContain(FAKE_VALUE);
+  });
+
+  it("does not echo the typed characters", async () => {
+    const { input, output, written } = streams();
+
+    const pending = promptForSecretValue("Value for K: ", { input, output });
+    for (const char of FAKE_VALUE) input.write(char);
+    input.write("\n");
+
+    await pending;
+    expect(written()).not.toContain(FAKE_VALUE);
+    expect(written()).not.toContain(FAKE_VALUE.slice(0, 4));
+  });
+
+  it("prints the prompt itself, so the operator knows what is being asked", async () => {
+    const { input, output, written } = streams();
+
+    const pending = promptForSecretValue("Value for K: ", { input, output });
+    input.write("x\n");
+    await pending;
+
+    expect(written()).toContain("Value for K:");
+  });
+
+  it("rejects when standard input ends before a value is entered", async () => {
+    const { input, output } = streams();
+
+    const pending = promptForSecretValue("Value for K: ", { input, output });
+    input.end();
+
+    await expect(pending).rejects.toThrow(/closed before/i);
+  });
+});
+
 describe("runVaultExec — no secret value ever reaches stderr", () => {
   const cases: {
     name: string;
@@ -712,6 +996,21 @@ describe("runVaultExec — no secret value ever reaches stderr", () => {
       },
     },
     { name: "unknown subcommand", argv: ["lst"], deps: {} },
+    { name: "add", argv: ["add", "K", "A key"], deps: {} },
+    {
+      name: "add refused",
+      argv: ["add", "K", "A key"],
+      deps: {
+        createSecret: vi.fn(async () => {
+          throw new Error("Vault add refused by dispatch: HTTP 403");
+        }),
+      },
+    },
+    {
+      name: "add with an empty value",
+      argv: ["add", "K", "A key"],
+      deps: { promptSecret: vi.fn(async () => "") },
+    },
   ];
 
   for (const { name, argv, deps } of cases) {
@@ -1041,6 +1340,91 @@ describe("listVaultSecrets", () => {
 
     await expect(listVaultSecrets(app("dispatch"))).rejects.toThrow(
       /credentialKey/,
+    );
+  });
+});
+
+describe("createVaultSecret", () => {
+  function stubFetch(status: number, body: unknown) {
+    const fetchMock = vi.fn(async () => ({
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  const draft = {
+    credentialKey: "MY_API_TOKEN",
+    name: "Vendor API token",
+    value: FAKE_VALUE,
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("posts the draft to the action route with the bearer and an explicit user agent", async () => {
+    const fetchMock = stubFetch(200, {
+      id: "sec_1",
+      credentialKey: "MY_API_TOKEN",
+      value: FAKE_VALUE,
+    });
+
+    await createVaultSecret(draft, app("dispatch"));
+
+    const [url, init] = fetchMock.mock.calls[0] as any;
+    expect(url).toBe(
+      "https://dispatch.test/_agent-native/actions/create-vault-secret",
+    );
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual(draft);
+    expect(init.headers.authorization).toBe("Bearer fake-bearer-dispatch");
+    // A default runtime agent string is rejected outright by the edge proxy in
+    // front of at least one deployment.
+    expect(init.headers["user-agent"]).toBeTruthy();
+  });
+
+  it("carries no value out of the deployment's reply, which contains one", async () => {
+    stubFetch(200, {
+      id: "sec_1",
+      credentialKey: "MY_API_TOKEN",
+      value: FAKE_VALUE,
+    });
+
+    const stored = await createVaultSecret(draft, app("dispatch"));
+
+    expect(stored).toEqual({ credentialKey: "MY_API_TOKEN" });
+    expect(JSON.stringify(stored)).not.toContain(FAKE_VALUE);
+  });
+
+  it("surfaces the refusal from the route's `error` field, not a bare status", async () => {
+    stubFetch(403, { error: "Vault writes require an admin" });
+
+    await expect(createVaultSecret(draft, app("dispatch"))).rejects.toThrow(
+      /require an admin/,
+    );
+  });
+
+  it("refuses a 200 that names no stored secret, without claiming it was stored", async () => {
+    stubFetch(200, { ok: true });
+
+    await expect(createVaultSecret(draft, app("dispatch"))).rejects.toThrow(
+      /whether it was stored is unknown/,
+    );
+  });
+
+  it("names the deployment rather than the value when the call cannot be made", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("getaddrinfo ENOTFOUND dispatch.test");
+      }),
+    );
+
+    await expect(createVaultSecret(draft, app("dispatch"))).rejects.toThrow(
+      /Could not reach dispatch/,
     );
   });
 });
