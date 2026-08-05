@@ -161,8 +161,18 @@ function parseFlags(tokens: string[], valueFlags: Set<string>): ParsedFlags {
   return parsed;
 }
 
-const EXEC_VALUE_FLAGS = new Set(["key", "app"]);
+/** Every subcommand that spends a lease names its keys and its source alike. */
+const LEASE_VALUE_FLAGS = new Set(["key", "app"]);
 const LIST_VALUE_FLAGS = new Set(["app"]);
+
+/**
+ * A credential key is free text, so it can be something no shell can assign —
+ * `A,B` is a legal key and an illegal variable name. `exec` puts such a key in
+ * a child's environment unharmed; an assignment cannot carry it, so `env`
+ * refuses it before spending a lease rather than emitting a line that would
+ * break, or silently reshape, whatever sources it.
+ */
+const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** `--app` is a credential source on every subcommand that takes it. */
 function takeApp(flags: ParsedFlags): string | undefined {
@@ -172,6 +182,35 @@ function takeApp(flags: ParsedFlags): string | undefined {
     return undefined;
   }
   return given[0];
+}
+
+/** `--key` is named the same way, and refused the same way, on every
+ *  subcommand that leases. */
+function takeKeys(flags: ParsedFlags): string[] {
+  const keys: string[] = [];
+  const seen = new Set<string>();
+  for (const key of flags.values.get("key") ?? []) {
+    // Never comma-split: `credentialKey` is free text, so a comma-bearing key
+    // is a real key and splitting it would silently lease the wrong thing.
+    if (seen.has(key)) {
+      flags.errors.push(`Duplicate --key ${key}`);
+      continue;
+    }
+    seen.add(key);
+    keys.push(key);
+  }
+
+  if (keys.length === 0) {
+    flags.errors.push(
+      "Missing --key. Name every credential explicitly; there is no --all.",
+    );
+  }
+  if (keys.length > MAX_LEASED_KEYS) {
+    flags.errors.push(
+      `Too many keys: ${keys.length}. A lease covers at most ${MAX_LEASED_KEYS} keys.`,
+    );
+  }
+  return keys;
 }
 
 interface ParsedListArgs {
@@ -203,7 +242,7 @@ function parseExecArgv(argv: string[]): ParsedExecArgs {
   const separator = argv.indexOf("--");
   const flags = parseFlags(
     separator === -1 ? argv : argv.slice(0, separator),
-    EXEC_VALUE_FLAGS,
+    LEASE_VALUE_FLAGS,
   );
   const rest = separator === -1 ? [] : argv.slice(separator + 1);
 
@@ -211,17 +250,7 @@ function parseExecArgv(argv: string[]): ParsedExecArgs {
   if (parsed.help) return parsed;
 
   parsed.app = takeApp(flags);
-  const seenKeys = new Set<string>();
-  for (const key of flags.values.get("key") ?? []) {
-    // Never comma-split: `credentialKey` is free text, so a comma-bearing key
-    // is a real key and splitting it would silently lease the wrong thing.
-    if (seenKeys.has(key)) {
-      flags.errors.push(`Duplicate --key ${key}`);
-      continue;
-    }
-    seenKeys.add(key);
-    parsed.keys.push(key);
-  }
+  parsed.keys = takeKeys(flags);
   parsed.errors = flags.errors;
 
   if (separator === -1) {
@@ -235,18 +264,36 @@ function parseExecArgv(argv: string[]): ParsedExecArgs {
     parsed.commandArgs = rest.slice(1);
   }
 
-  if (parsed.keys.length === 0) {
-    parsed.errors.push(
-      "Missing --key. Name every credential explicitly; there is no --all.",
-    );
-  }
-  if (parsed.keys.length > MAX_LEASED_KEYS) {
-    parsed.errors.push(
-      `Too many keys: ${parsed.keys.length}. A lease covers at most ${MAX_LEASED_KEYS} keys.`,
-    );
+  return parsed;
+}
+
+interface ParsedEnvArgs {
+  help: boolean;
+  keys: string[];
+  app?: string;
+  errors: string[];
+}
+
+function parseEnvArgv(argv: string[]): ParsedEnvArgs {
+  const flags = parseFlags(argv, LEASE_VALUE_FLAGS);
+  if (flags.help) return { help: true, keys: [], errors: [] };
+
+  const app = takeApp(flags);
+  const keys = takeKeys(flags);
+  for (const key of keys) {
+    if (!SHELL_NAME.test(key)) {
+      flags.errors.push(
+        `--key ${key} cannot be exported: a shell variable name must match ${SHELL_NAME.source}. Lease it with \`agent-native vault exec\` instead.`,
+      );
+    }
   }
 
-  return parsed;
+  return {
+    help: false,
+    keys,
+    ...(app ? { app } : {}),
+    errors: flags.errors,
+  };
 }
 
 /**
@@ -404,6 +451,7 @@ export async function runVaultExec(
     return 0;
   }
   if (subcommand === "list") return runVaultList(rest, deps);
+  if (subcommand === "env") return runVaultEnv(rest, deps);
   if (subcommand !== "exec") {
     stderr(`Unknown vault subcommand: ${subcommand ?? "(none)"}`);
     stderr("");
@@ -511,6 +559,100 @@ async function runVaultList(
   return 0;
 }
 
+/**
+ * POSIX single-quoting: inside `'…'` every byte is literal, so the only case to
+ * handle is the quote itself, which ends the string, gets escaped, and reopens
+ * it. Newlines and `$(…)` need nothing further.
+ */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * Said at the moment it happens as well as in `--help`: an operator who reached
+ * for `env` out of habit should learn here that `exec` is the stronger command.
+ */
+const ENV_WEAKER_NOTICE = [
+  "This is weaker than running a child process. `agent-native vault exec` hands",
+  "the values to one command and nothing else; these assignments last as long as",
+  "the shell that sourced them, are inherited by everything it starts, and are",
+  "visible to anything that can read that shell. Reach for `vault env` only when",
+  "you cannot control how the process is launched.",
+];
+
+/**
+ * The same lease as `vault exec`, printed instead of executed — one call to the
+ * same dependency, so it leaves one audit record of the same shape. Weaker than
+ * `exec` in the way that matters: the values outlive the command they were
+ * leased for, and the caller decides what reads them. The warning is stderr
+ * only, so stdout stays sourceable.
+ */
+async function runVaultEnv(
+  argv: string[],
+  deps: VaultExecDeps,
+): Promise<number> {
+  const stdout = deps.stdout ?? console.log;
+  const { stderr } = deps;
+
+  const parsed = parseEnvArgv(argv);
+  if (parsed.help) {
+    stdout(formatVaultEnvUsage());
+    return 0;
+  }
+  if (parsed.errors.length > 0) {
+    for (const error of parsed.errors) stderr(error);
+    stderr("");
+    stderr(formatVaultEnvUsage());
+    return EXIT.USAGE;
+  }
+
+  const resolved = resolveCredentialSource(deps, parsed.app);
+  if (!resolved.ok) {
+    stderr(resolved.message);
+    return resolved.code;
+  }
+
+  const leaseId = (deps.newLeaseId ?? randomUUID)();
+  let lease: VaultLease;
+  try {
+    lease = await deps.leaseSecrets(parsed.keys, leaseId, resolved.app);
+  } catch (err) {
+    stderr(errorMessage(err));
+    return EXIT.LEASE_REFUSED;
+  }
+
+  // Parsing already refused an unexportable key the operator asked for; a name
+  // the deployment added is refused here rather than emitted as a broken line.
+  const unexportable = Object.keys(lease.env).filter(
+    (key) => !SHELL_NAME.test(key),
+  );
+  if (unexportable.length > 0) {
+    stderr(
+      `Vault lease ${lease.leaseId} returned key(s) that cannot be exported: ${unexportable.join(", ")}. Nothing was written.`,
+    );
+    return EXIT.LEASE_REFUSED;
+  }
+
+  for (const [key, value] of Object.entries(lease.env)) {
+    stdout(`export ${key}=${shellQuote(value)}`);
+  }
+  // The receipt travels with the values, exactly as `exec` passes it to the
+  // child, so "this was audited" stays checkable in the shell that sourced it.
+  // A leased key of the same name is overwritten by it, so say so by name —
+  // last assignment wins in the sourcing shell, and a silent loss here would
+  // hand the caller a variable holding something other than what they leased.
+  if (lease.env[LEASE_ENV_VAR] !== undefined) {
+    stderr(`The lease id overrides the leased value of ${LEASE_ENV_VAR}.`);
+  }
+  stdout(`export ${LEASE_ENV_VAR}=${shellQuote(lease.leaseId)}`);
+
+  stderr(
+    `Vault lease ${lease.leaseId} from ${resolved.app.serverName} (${parsed.keys.length} key(s)). Check the audit log to confirm.`,
+  );
+  for (const line of ENV_WEAKER_NOTICE) stderr(line);
+  return 0;
+}
+
 export function formatVaultUsage(): string {
   return [
     "Usage: agent-native vault <subcommand> [options]",
@@ -518,6 +660,7 @@ export function formatVaultUsage(): string {
     "Subcommands:",
     "  exec    Run a command with workspace vault secrets in its environment.",
     "  list    Print the secret keys stored in a workspace vault. Never values.",
+    "  env     Print leased secrets as shell assignments. Weaker than exec.",
     "",
     "Every subcommand takes --app <NAME> to name the deployment supplying the",
     "credential, so one installation serves every deployment you have connected.",
@@ -549,6 +692,54 @@ export function formatVaultListUsage(): string {
     `  ${EXIT.NO_CREDENTIAL}  no connect bearer found on this machine`,
     `  ${EXIT.AMBIGUOUS_APP}  several connected apps, none selected`,
     `  ${EXIT.REQUEST_REFUSED}  the deployment refused the request or was unreachable`,
+  ].join("\n");
+}
+
+export function formatVaultEnvUsage(): string {
+  return [
+    "Usage: agent-native vault env --key KEY [--key KEY...] [--app NAME]",
+    "",
+    "Leases workspace vault secrets and prints them as shell assignments on",
+    "stdout, for a long-lived process you did not launch and cannot relaunch:",
+    "",
+    '  eval "$(agent-native vault env --key ANTHROPIC_API_KEY --app dispatch)"',
+    "",
+    "PREFER `agent-native vault exec`. This command is weaker than running a",
+    "child process, in the way that matters: `exec` hands the values to one",
+    "command and nothing else, while these assignments last as long as the shell",
+    "that sourced them, are inherited by everything it starts afterwards, and are",
+    "visible to anything that can read that shell. Printing them to stdout also",
+    "puts them one redirect, one `set -x`, or one scrollback screenshot away from",
+    "somewhere you did not intend. Reach for this only when you genuinely cannot",
+    "control how the process is launched.",
+    "",
+    "It leases through the same path as `vault exec`, so it produces the same",
+    "audit record. It is not a second way to reach a secret; it is the same lease",
+    "with a different output shape.",
+    "",
+    "Options:",
+    "  --key <KEY>     Credential key to lease. Required, repeatable, and never",
+    "                  comma-split. A key that is not a valid shell variable name",
+    "                  is refused here — lease it with `vault exec` instead.",
+    "  --app <NAME>    Which connected app supplies the credential. This selects a",
+    "                  credential source, not a principal and not a scope. With",
+    "                  several apps connected and none selected, the command",
+    "                  refuses and names them rather than guessing.",
+    "  --help          Show this message.",
+    "",
+    "The lease id is printed to stderr and exported as",
+    `  ${LEASE_ENV_VAR}`,
+    'so "this was audited" is a claim you can go and check. Only the assignments',
+    "reach stdout; every notice goes to stderr, so the output stays sourceable.",
+    "",
+    "Exit codes:",
+    `  ${EXIT.USAGE}  malformed invocation`,
+    `  ${EXIT.NO_CREDENTIAL}  no connect bearer found on this machine`,
+    `  ${EXIT.AMBIGUOUS_APP}  several connected apps, none selected`,
+    `  ${EXIT.LEASE_REFUSED}  the server refused the lease`,
+    "",
+    "WHAT THIS DOES AND DOES NOT CLAIM",
+    "  This is hygiene, not containment — see `agent-native vault exec --help`.",
   ].join("\n");
 }
 

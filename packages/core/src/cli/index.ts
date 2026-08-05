@@ -1243,6 +1243,10 @@ Usage:
   agent-native vault list [--app NAME]
                                 Print the secret keys in a workspace vault.
                                 Keys and display names only, never values.
+  agent-native vault env --key KEY [--app NAME]
+                                Print leased secrets as shell assignments, for a
+                                process you cannot launch yourself. Weaker than
+                                'vault exec' — prefer that where you can.
   agent-native script <name>    Run an action (deprecated alias for 'action')
   agent-native typecheck        Run TypeScript type checking
   agent-native create [name]    Scaffold a new agent-native workspace with a

@@ -9,6 +9,7 @@ import {
   discoverConnectedApps,
   leaseSecrets,
   listVaultSecrets,
+  formatVaultEnvUsage,
   formatVaultExecUsage,
   formatVaultUsage,
   runVaultExec,
@@ -516,7 +517,9 @@ describe("runVault — subcommand dispatch", () => {
     expect(code).toBe(0);
     expect(h.stdoutText()).toContain("exec");
     expect(h.stdoutText()).toContain("list");
+    expect(h.stdoutText()).toContain("env");
     expect(formatVaultUsage()).toContain("list");
+    expect(formatVaultUsage()).toContain("env");
   });
 });
 
@@ -659,6 +662,179 @@ describe("runVaultExec — list", () => {
   });
 });
 
+describe("runVaultExec — env", () => {
+  it("emits a shell assignment for every leased key", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(
+      ["env", "--key", "A", "--key", "B"],
+      h.deps,
+    );
+
+    expect(code).toBe(0);
+    const out = h.stdoutText();
+    expect(out).toContain(`export A='${FAKE_VALUE}'`);
+    expect(out).toContain(`export B='${FAKE_VALUE}'`);
+  });
+
+  it("leases through the same audited path as exec, with the same receipt", async () => {
+    const h = harness();
+
+    await runVaultExec(["env", "--key", "A"], h.deps);
+
+    // Same dependency, same argument shape as the exec happy path: one lease,
+    // one audit record, only the output shape differs.
+    expect(h.leaseSecrets).toHaveBeenCalledWith(
+      ["A"],
+      "lease-0001",
+      expect.objectContaining({ serverName: "dispatch" }),
+    );
+    expect(h.stdoutText()).toContain(
+      "export AGENT_NATIVE_VAULT_LEASE='lease-0001'",
+    );
+    expect(h.stderrText()).toContain("lease-0001");
+    expect(h.spawnChild).not.toHaveBeenCalled();
+  });
+
+  it("says plainly that it is weaker than running a child process", async () => {
+    const h = harness();
+
+    await runVaultExec(["env", "--key", "A"], h.deps);
+
+    const warning = h.stderrText().toLowerCase();
+    expect(warning).toContain("weaker");
+    expect(warning).toContain("vault exec");
+  });
+
+  it("quotes a value that contains a quote so the output stays sourceable", async () => {
+    const h = harness({
+      leaseSecrets: vi.fn(async (keys: string[], leaseId: string) => ({
+        leaseId,
+        env: { A: `it's ${FAKE_VALUE}` },
+      })),
+    });
+
+    const code = await runVaultExec(["env", "--key", "A"], h.deps);
+
+    expect(code).toBe(0);
+    expect(h.stdoutText()).toContain(`export A='it'\\''s ${FAKE_VALUE}'`);
+  });
+
+  it("takes the deployment as an argument on the subcommand", async () => {
+    const h = harness({
+      discoverConnectedApps: vi.fn(() => [app("dispatch"), app("plan")]),
+    });
+
+    const code = await runVaultExec(
+      ["env", "--app", "plan", "--key", "A"],
+      h.deps,
+    );
+
+    expect(code).toBe(0);
+    expect(h.leaseSecrets).toHaveBeenCalledWith(
+      ["A"],
+      "lease-0001",
+      expect.objectContaining({
+        serverName: "plan",
+        bearer: "fake-bearer-plan",
+      }),
+    );
+  });
+
+  it("refuses a key that cannot become a shell variable, before leasing", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["env", "--key", "A,B"], h.deps);
+
+    expect(code).toBe(EXIT.USAGE);
+    expect(h.stderrText()).toContain("A,B");
+    expect(h.leaseSecrets).not.toHaveBeenCalled();
+    expect(h.stdoutText()).toBe("");
+  });
+
+  it("returns 64 with no --key and never contacts the deployment", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["env"], h.deps);
+
+    expect(code).toBe(EXIT.USAGE);
+    expect(h.leaseSecrets).not.toHaveBeenCalled();
+  });
+
+  it("returns 64 on an unknown option", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["env", "--all"], h.deps);
+
+    expect(code).toBe(EXIT.USAGE);
+    expect(h.stderrText()).toContain("Unknown option: --all");
+    expect(h.leaseSecrets).not.toHaveBeenCalled();
+  });
+
+  it("refuses with 66 when several apps are connected and none selected", async () => {
+    const h = harness({
+      discoverConnectedApps: vi.fn(() => [app("dispatch"), app("plan")]),
+    });
+
+    const code = await runVaultExec(["env", "--key", "A"], h.deps);
+
+    expect(code).toBe(EXIT.AMBIGUOUS_APP);
+    expect(h.leaseSecrets).not.toHaveBeenCalled();
+  });
+
+  it("returns 65 when no app is connected on this machine", async () => {
+    const h = harness({ discoverConnectedApps: vi.fn(() => []) });
+
+    expect(await runVaultExec(["env", "--key", "A"], h.deps)).toBe(
+      EXIT.NO_CREDENTIAL,
+    );
+    expect(h.leaseSecrets).not.toHaveBeenCalled();
+  });
+
+  it("returns 67 on a refused lease and emits nothing on stdout", async () => {
+    const h = harness({
+      leaseSecrets: vi.fn(async () => {
+        throw new Error(
+          "Vault lease refused (all-or-nothing): no vault secret for A",
+        );
+      }),
+    });
+
+    const code = await runVaultExec(["env", "--key", "A"], h.deps);
+
+    expect(code).toBe(EXIT.LEASE_REFUSED);
+    expect(h.stdoutText()).toBe("");
+  });
+
+  it("names the lease variable when the receipt overrides a leased value", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(
+      ["env", "--key", "AGENT_NATIVE_VAULT_LEASE"],
+      h.deps,
+    );
+
+    expect(code).toBe(0);
+    // Last assignment wins in the sourcing shell, so the receipt is what
+    // survives — and the caller is told, by name and never by value.
+    const lines = h.stdoutText().split("\n");
+    expect(lines.at(-1)).toBe("export AGENT_NATIVE_VAULT_LEASE='lease-0001'");
+    expect(h.stderrText()).toContain("AGENT_NATIVE_VAULT_LEASE");
+    expect(h.stderrText()).not.toContain(FAKE_VALUE);
+  });
+
+  it("shows help without leasing, and the help states the weakness", async () => {
+    const h = harness();
+
+    const code = await runVaultExec(["env", "--help"], h.deps);
+
+    expect(code).toBe(0);
+    expect(h.stdoutText().toLowerCase()).toContain("weaker");
+    expect(h.leaseSecrets).not.toHaveBeenCalled();
+    expect(formatVaultEnvUsage()).toContain("--app");
+  });
+});
+
 describe("runVaultExec — no secret value ever reaches stderr", () => {
   const cases: {
     name: string;
@@ -712,6 +888,18 @@ describe("runVaultExec — no secret value ever reaches stderr", () => {
       },
     },
     { name: "unknown subcommand", argv: ["lst"], deps: {} },
+    // `env` prints values on stdout by design; stderr still must not carry one.
+    { name: "env", argv: ["env", "--key", "K"], deps: {} },
+    {
+      name: "env lease refused",
+      argv: ["env", "--key", "K"],
+      deps: {
+        leaseSecrets: vi.fn(async () => {
+          throw new Error("refused: K");
+        }),
+      },
+    },
+    { name: "env usage error", argv: ["env"], deps: {} },
   ];
 
   for (const { name, argv, deps } of cases) {
