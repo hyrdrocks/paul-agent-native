@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
+import readline from "node:readline";
 
 import {
   CLIENTS,
@@ -23,6 +24,7 @@ export const EXIT = {
   LEASE_REFUSED: 67, // server said no (missing key, ambiguous key, auth)
   SPAWN_FAILED: 68, // command not found / not executable
   REQUEST_REFUSED: 69, // a non-lease vault call was refused or unreachable
+  NO_VALUE: 74, // the prompt yielded no value (EX_IOERR)
 } as const;
 
 /** Matches `lease-vault-secrets`, which refuses more than 50 keys server-side. */
@@ -30,6 +32,7 @@ const MAX_LEASED_KEYS = 50;
 
 const LEASE_ACTION = "lease-vault-secrets";
 const LIST_ACTION = "list-vault-secrets";
+const CREATE_ACTION = "create-vault-secret";
 const LEASE_ENV_VAR = "AGENT_NATIVE_VAULT_LEASE";
 
 /**
@@ -70,6 +73,17 @@ export interface VaultSecretSummary {
 }
 
 /**
+ * What `vault add` sends. `value` is only ever populated from the prompt: no
+ * parser writes this field, so there is no invocation that could put a secret
+ * in argv for the process table to show.
+ */
+export interface VaultSecretDraft {
+  credentialKey: string;
+  name: string;
+  value: string;
+}
+
+/**
  * The one seam the wrapper is tested through. The behaviours that matter most
  * — never spawning after a refusal, leased-wins merging, exit-code fidelity —
  * sit *between* parsing, resolving, and merging, so pinning those separately
@@ -83,6 +97,13 @@ export interface VaultExecDeps {
     app: ConnectedApp,
   ) => Promise<VaultLease>;
   listSecrets: (app: ConnectedApp) => Promise<VaultSecretSummary[]>;
+  createSecret: (
+    draft: VaultSecretDraft,
+    app: ConnectedApp,
+  ) => Promise<VaultSecretSummary>;
+  /** Reads one secret value from the terminal. Never echoes, never returns
+   *  until Enter, and throws rather than yielding "" if stdin ends first. */
+  promptSecret: (prompt: string) => Promise<string>;
   spawnChild: (
     cmd: string,
     args: string[],
@@ -108,6 +129,9 @@ interface ParsedFlags {
   /** Every occurrence, in order, so a repeatable flag and a once-only flag
    *  are told apart by the subcommand rather than by the parser. */
   values: Map<string, string[]>;
+  /** Collected, not rejected here: `add` takes two, `list` and `exec` take
+   *  none, and one parser deciding for all three is how the three drift. */
+  positionals: string[];
   errors: string[];
 }
 
@@ -119,13 +143,14 @@ function parseFlags(tokens: string[], valueFlags: Set<string>): ParsedFlags {
   const parsed: ParsedFlags = {
     help: false,
     values: new Map(),
+    positionals: [],
     errors: [],
   };
 
   for (let i = 0; i < tokens.length; i += 1) {
     const arg = tokens[i];
     if (!arg.startsWith("-")) {
-      parsed.errors.push(`Unexpected argument: ${arg}`);
+      parsed.positionals.push(arg);
       continue;
     }
 
@@ -163,6 +188,14 @@ function parseFlags(tokens: string[], valueFlags: Set<string>): ParsedFlags {
 
 const EXEC_VALUE_FLAGS = new Set(["key", "app"]);
 const LIST_VALUE_FLAGS = new Set(["app"]);
+const ADD_VALUE_FLAGS = new Set(["app"]);
+
+/** For the subcommands whose whole argument list is flags. */
+function rejectPositionals(flags: ParsedFlags): void {
+  for (const extra of flags.positionals) {
+    flags.errors.push(`Unexpected argument: ${extra}`);
+  }
+}
 
 /** `--app` is a credential source on every subcommand that takes it. */
 function takeApp(flags: ParsedFlags): string | undefined {
@@ -183,8 +216,51 @@ interface ParsedListArgs {
 function parseListArgv(argv: string[]): ParsedListArgs {
   const flags = parseFlags(argv, LIST_VALUE_FLAGS);
   if (flags.help) return { help: true, errors: [] };
+  rejectPositionals(flags);
   const app = takeApp(flags);
   return { help: false, ...(app ? { app } : {}), errors: flags.errors };
+}
+
+interface ParsedAddArgs {
+  help: boolean;
+  credentialKey?: string;
+  name?: string;
+  app?: string;
+  errors: string[];
+}
+
+/**
+ * Exactly two positionals: the key and its description. A third is refused
+ * rather than read as the value — an operator who types the secret on the
+ * command line has already put it in the process table and their shell
+ * history, so the only useful thing left to do is say so.
+ */
+function parseAddArgv(argv: string[]): ParsedAddArgs {
+  const flags = parseFlags(argv, ADD_VALUE_FLAGS);
+  if (flags.help) return { help: true, errors: [] };
+
+  const app = takeApp(flags);
+  const [credentialKey, name, ...extra] = flags.positionals;
+
+  if (!credentialKey) flags.errors.push("Missing KEY.");
+  else if (!name)
+    flags.errors.push(`Missing description for ${credentialKey}.`);
+  // The rejected token is NOT echoed. If it is the secret the operator tried
+  // to pass, repeating it into the transcript is the very leak this command
+  // exists to prevent.
+  if (extra.length > 0) {
+    flags.errors.push(
+      `${extra.length} unexpected argument(s) after KEY and description. The secret value is never given on the command line; \`add\` prompts for it.`,
+    );
+  }
+
+  return {
+    help: false,
+    ...(credentialKey ? { credentialKey } : {}),
+    ...(name ? { name } : {}),
+    ...(app ? { app } : {}),
+    errors: flags.errors,
+  };
 }
 
 /**
@@ -210,6 +286,7 @@ function parseExecArgv(argv: string[]): ParsedExecArgs {
   parsed.help = flags.help;
   if (parsed.help) return parsed;
 
+  rejectPositionals(flags);
   parsed.app = takeApp(flags);
   const seenKeys = new Set<string>();
   for (const key of flags.values.get("key") ?? []) {
@@ -404,6 +481,7 @@ export async function runVaultExec(
     return 0;
   }
   if (subcommand === "list") return runVaultList(rest, deps);
+  if (subcommand === "add") return runVaultAdd(rest, deps);
   if (subcommand !== "exec") {
     stderr(`Unknown vault subcommand: ${subcommand ?? "(none)"}`);
     stderr("");
@@ -511,6 +589,79 @@ async function runVaultList(
   return 0;
 }
 
+/**
+ * Stores a secret whose value this process only ever learns from stdin. The
+ * prompt runs *after* the deployment is resolved, so an operator is never
+ * asked to type a credential into a command that was going to refuse anyway.
+ */
+async function runVaultAdd(
+  argv: string[],
+  deps: VaultExecDeps,
+): Promise<number> {
+  const stdout = deps.stdout ?? console.log;
+  const { stderr } = deps;
+
+  const parsed = parseAddArgv(argv);
+  if (parsed.help) {
+    stdout(formatVaultAddUsage());
+    return 0;
+  }
+  if (parsed.errors.length > 0) {
+    for (const error of parsed.errors) stderr(error);
+    stderr("");
+    stderr(formatVaultAddUsage());
+    return EXIT.USAGE;
+  }
+
+  const resolved = resolveCredentialSource(deps, parsed.app);
+  if (!resolved.ok) {
+    stderr(resolved.message);
+    return resolved.code;
+  }
+
+  // Not a usage failure: "this terminal could not be read" and "you typed the
+  // command wrong" are different problems, and one exit code for both sends
+  // the reader to the wrong one.
+  let value: string;
+  try {
+    value = await deps.promptSecret(`Value for ${parsed.credentialKey!}: `);
+  } catch (err) {
+    stderr(errorMessage(err));
+    return EXIT.NO_VALUE;
+  }
+  // Not trimmed: a credential may legitimately begin or end with whitespace,
+  // and quietly storing a different string than the one entered is the kind of
+  // helpfulness that surfaces days later as an authentication failure.
+  if (value === "") {
+    stderr(`No value entered; ${parsed.credentialKey} was not stored.`);
+    return EXIT.NO_VALUE;
+  }
+
+  let stored: VaultSecretSummary;
+  try {
+    stored = await deps.createSecret(
+      {
+        credentialKey: parsed.credentialKey!,
+        name: parsed.name!,
+        value,
+      },
+      resolved.app,
+    );
+  } catch (err) {
+    stderr(errorMessage(err));
+    return EXIT.REQUEST_REFUSED;
+  }
+
+  // The key the deployment stored, not the one that was typed: it normalizes
+  // the key, so echoing the input back would confirm a row that may not exist
+  // under that name.
+  // stdout stays empty so `add` composes in a pipeline the way `list` does.
+  stderr(
+    `Stored ${stored.credentialKey} in ${resolved.app.serverName}'s vault.`,
+  );
+  return 0;
+}
+
 export function formatVaultUsage(): string {
   return [
     "Usage: agent-native vault <subcommand> [options]",
@@ -518,6 +669,7 @@ export function formatVaultUsage(): string {
     "Subcommands:",
     "  exec    Run a command with workspace vault secrets in its environment.",
     "  list    Print the secret keys stored in a workspace vault. Never values.",
+    "  add     Store a secret, reading its value from a prompt that does not echo.",
     "",
     "Every subcommand takes --app <NAME> to name the deployment supplying the",
     "credential, so one installation serves every deployment you have connected.",
@@ -549,6 +701,39 @@ export function formatVaultListUsage(): string {
     `  ${EXIT.NO_CREDENTIAL}  no connect bearer found on this machine`,
     `  ${EXIT.AMBIGUOUS_APP}  several connected apps, none selected`,
     `  ${EXIT.REQUEST_REFUSED}  the deployment refused the request or was unreachable`,
+  ].join("\n");
+}
+
+export function formatVaultAddUsage(): string {
+  return [
+    'Usage: agent-native vault add KEY "description" [--app NAME]',
+    "",
+    "Stores one secret in a workspace vault. The value is not an argument: the",
+    "command prompts for it and reads it from standard input, so it never enters",
+    "this process's argv where another local user reading the process table could",
+    "see it, and it never lands in your shell history. The prompt does not echo,",
+    "and it ends when you press Enter — no end-of-file keystroke is required, so",
+    "it works on terminals that cannot send one.",
+    "",
+    "An existing secret with the same key is updated rather than duplicated.",
+    "",
+    "Arguments:",
+    "  KEY             Credential key, e.g. MY_API_TOKEN.",
+    "  description     Human-readable label, shown by `vault list` and the web UI.",
+    "",
+    "Options:",
+    "  --app <NAME>    Which connected app's vault to write to. This selects a",
+    "                  credential source, not a principal and not a scope. With",
+    "                  several apps connected and none selected, the command",
+    "                  refuses and names them rather than guessing.",
+    "  --help          Show this message.",
+    "",
+    "Exit codes:",
+    `  ${EXIT.USAGE}  malformed invocation`,
+    `  ${EXIT.NO_CREDENTIAL}  no connect bearer found on this machine`,
+    `  ${EXIT.AMBIGUOUS_APP}  several connected apps, none selected`,
+    `  ${EXIT.REQUEST_REFUSED}  the deployment refused the request or was unreachable`,
+    `  ${EXIT.NO_VALUE}  no value came back from the prompt; nothing was stored`,
   ].join("\n");
 }
 
@@ -759,6 +944,86 @@ export async function listVaultSecrets(
   });
 }
 
+export async function createVaultSecret(
+  draft: VaultSecretDraft,
+  app: ConnectedApp,
+): Promise<VaultSecretSummary> {
+  const { ok, status, json } = await callVaultAction(app, CREATE_ACTION, {
+    method: "POST",
+    body: JSON.stringify(draft),
+  });
+
+  if (!ok) {
+    // `refusalDetail` reads the action's own message. The create action opts
+    // out of input capture and reports shape errors, so it has no value to
+    // echo back at us — but nothing here forwards the response body wholesale.
+    throw new Error(
+      `Vault add refused by ${app.serverName}: ${refusalDetail(json, status)}`,
+    );
+  }
+
+  // A 200 that names no secret cannot be reported as a write: the secret may
+  // or may not be there. The message says exactly that rather than blaming a
+  // missing action — a deployment that stored the row and then failed to read
+  // it back answers this way too.
+  const credentialKey = json?.credentialKey;
+  if (typeof credentialKey !== "string" || !credentialKey) {
+    throw new Error(
+      `Vault add to ${app.serverName} answered without naming a stored secret, so whether it was stored is unknown. Check \`agent-native vault list\`; if the action is missing, the deployment may not expose ${CREATE_ACTION}.`,
+    );
+  }
+  // Only the key is carried out: the response row holds the value, and a
+  // summary with no field for it cannot pass one to a printer by accident.
+  return { credentialKey };
+}
+
+/**
+ * Reads one secret from the terminal without echoing it.
+ *
+ * Ends on Enter, not on end-of-file: readline resolves the line and the input
+ * stream stays open, so a terminal that cannot send Ctrl-D still works. Every
+ * character readline would echo goes through `_writeToOutput`, which is
+ * silenced here — the prompt itself is written directly instead, so the
+ * operator still sees what is being asked.
+ */
+export function promptForSecretValue(
+  prompt: string,
+  streams: {
+    input?: NodeJS.ReadableStream;
+    output?: NodeJS.WritableStream;
+  } = {},
+): Promise<string> {
+  const input = (streams.input ?? process.stdin) as NodeJS.ReadableStream;
+  const output = (streams.output ?? process.stderr) as NodeJS.WritableStream;
+
+  return new Promise<string>((resolve, reject) => {
+    const rl = readline.createInterface({
+      input,
+      output: output as NodeJS.WritableStream & { write: any },
+      terminal: true,
+    });
+    (
+      rl as unknown as { _writeToOutput: (text: string) => void }
+    )._writeToOutput = () => {};
+
+    let answered = false;
+    output.write(prompt);
+    rl.on("close", () => {
+      // Stdin ended without a line. "Nothing was entered" must not read back
+      // as an empty value the caller could store.
+      if (!answered) {
+        reject(new Error("Standard input closed before a value was entered."));
+      }
+    });
+    rl.question("", (value) => {
+      answered = true;
+      output.write("\n");
+      rl.close();
+      resolve(value);
+    });
+  });
+}
+
 export async function leaseSecrets(
   keys: string[],
   leaseId: string,
@@ -829,6 +1094,8 @@ export async function runVault(argv: string[]): Promise<number> {
       discoverConnectedApps(process.cwd(), (message) => console.error(message)),
     leaseSecrets,
     listSecrets: listVaultSecrets,
+    createSecret: createVaultSecret,
+    promptSecret: (prompt) => promptForSecretValue(prompt),
     spawnChild,
     env: process.env,
     stderr: (line) => console.error(line),

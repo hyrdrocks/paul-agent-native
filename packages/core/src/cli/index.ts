@@ -1243,6 +1243,10 @@ Usage:
   agent-native vault list [--app NAME]
                                 Print the secret keys in a workspace vault.
                                 Keys and display names only, never values.
+  agent-native vault add KEY "description" [--app NAME]
+                                Store a secret in a workspace vault. The value
+                                is read from a prompt that does not echo, never
+                                from an argument.
   agent-native script <name>    Run an action (deprecated alias for 'action')
   agent-native typecheck        Run TypeScript type checking
   agent-native create [name]    Scaffold a new agent-native workspace with a
