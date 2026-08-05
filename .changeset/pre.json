@@ -24,12 +24,19 @@
     "clips-desktop": "0.1.1"
   },
   "changesets": [
+    "connect-bearer-every-client",
     "connect-codex-header-subtable",
     "lease-vault-secrets-action",
     "lease-vault-secrets-refusal-status",
+    "mcp-server-name-env",
+    "vault-add-subcommand",
     "vault-audit-parity",
     "vault-audit-tab-framework-log",
+    "vault-env-subcommand",
     "vault-exec-wrapper",
-    "vault-read-surface"
+    "vault-list-subcommand",
+    "vault-read-surface",
+    "workers-cross-request-init",
+    "workers-late-mount-dispatch"
   ]
 }

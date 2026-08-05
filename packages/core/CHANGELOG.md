@@ -1,5 +1,174 @@
 # @agent-native/core
 
+## 0.134.0-paul.2
+
+### Minor Changes
+
+- fe48d97: Add `agent-native connect <url> --bearer`, which mints a connect token through the existing device-code flow and writes it as an explicit bearer for every selected client, including the OAuth-capable ones that plain `connect` hands a URL-only entry. One browser approval — which may happen on a different machine — authenticates a headless VPS, CI runner, or container with no in-agent OAuth step and no pasted long-lived token. Plain `connect` is unchanged: OAuth-capable clients still get URL-only entries, which remains the better path wherever a browser exists. `--bearer` prints one stderr line saying a long-lived bearer was written and that OAuth is preferred where a browser exists; there is no confirmation prompt and no justification field. An approval that returns no token — a deployment running in open local-dev mode answers with an owner identity instead of a bearer — is refused rather than stored as an empty credential. Connect requests now send an explicit User-Agent, because the edge proxy in front of at least one deployment rejects a default scripting-library agent string in a way that reads exactly like the connect route being disabled; a proxy refusal of the unauthenticated connect route now says so instead of suggesting the feature is off.
+- 440e2ab: Add `agent-native vault add KEY "description" [--app NAME]`, which stores one
+  secret in a workspace vault with its value read from a prompt that does not
+  echo. The value is never an argument: there is no value flag and a third
+  positional is refused, so the secret cannot reach this process's argv where
+  another local user reading the process table would see it, and it never lands
+  in shell history. The prompt ends on Enter rather than on an end-of-file
+  keystroke, so terminals that cannot send one still work, and standard input
+  ending before a value is entered is a loud refusal rather than an empty secret
+  — exit `74`, kept distinct from the `64` that means the command itself was
+  malformed.
+
+  Like `list`, it calls the workspace action — `create-vault-secret` — over HTTP
+  with the connect bearer the machine already holds, and takes the deployment as
+  an argument on the subcommand. No value reaches stdout or stderr on any path:
+  the confirmation names only the key, and the type carrying the deployment's
+  reply has no field for a value even though the action answers with the stored
+  row.
+
+- bb7058f: Add `agent-native vault env --key KEY [--key KEY...] [--app NAME]`, which leases
+  workspace vault secrets and prints them as shell assignments, so a long-lived
+  process an operator did not launch — and cannot relaunch — can still receive
+  them. It leases through the same call as `vault exec`, so it produces the same
+  audit record: it is not a second way to reach a secret, only the same lease with
+  a different output shape. The lease id is exported alongside the values as
+  `AGENT_NATIVE_VAULT_LEASE`, and only the assignments reach stdout, so every
+  notice stays out of the sourced output.
+
+  The command states plainly, in `--help` and on stderr at the moment it runs,
+  that it is weaker than running a child process: the values last as long as the
+  shell that sourced them and are inherited by everything it starts. A credential
+  key that is not a valid shell variable name is refused before a lease is spent
+  rather than emitted as a line that would break whatever sources it. `vault exec`
+  is unchanged.
+
+- 00fdc7f: Add `agent-native vault list [--app NAME]`, which prints the credential keys and
+  display names of the secrets in a workspace vault and never a value — not even a
+  masked preview — so seeing what is available cannot put a credential in a
+  transcript. It calls `list-vault-secrets` over HTTP with the connect bearer the
+  machine already holds, discovered through the CLI's existing multi-client,
+  multi-scope scan, and takes the deployment as an argument so one installation
+  serves every connected app. This opens the vault subcommand dispatch point:
+  `exec` behaves exactly as before, and an unknown subcommand still exits `64`.
+
+  Every vault call now goes out through one request path, so the explicit
+  `User-Agent` — load-bearing, because the edge proxy in front of at least one
+  deployment rejects a default runtime agent string with an error that reads like
+  a disabled route — is sent by `vault exec`'s lease call as well.
+
+### Patch Changes
+
+- df8bafe: Let a deployment name its MCP server with `MCP_SERVER_NAME`.
+
+  The connect page, the copyable client config and device-flow grants all report a
+  server id that defaulted to `agent-native-<first label of the hostname>`. The
+  only way to change it was `createCoreRoutesPlugin({ mcpConnectServerName })`,
+  which a deployment consuming a pre-composed core-routes plugin cannot reach —
+  recomposing it would need that package's own private options — so such
+  deployments could not rename their MCP server at all.
+
+  `MCP_SERVER_NAME` now fills in when no explicit option was passed. Precedence is
+  explicit option, then env, then the derived default: an app that named its server
+  in code keeps that name, so a deployment-wide variable cannot silently take it
+  over.
+
+  `mcpConnectAppName` already had an equivalent escape hatch — core-routes falls
+  back to `getAppName()`, which reads `APP_NAME` — so the human-readable app name
+  needed no change.
+
+- 0e4ee8b: Fix cold-isolate 404s and 503s on Cloudflare Workers deploys.
+
+  Framework bootstrap and plugin inits started at isolate scope and were memoized
+  as isolate-global promises that every concurrent request awaited. On Workers a
+  promise belongs to the request context that created it, so once the request that
+  warmed the isolate answered, workerd canceled the continuations the other
+  in-flight requests were parked on. A concurrent burst against a cold isolate came
+  back as a mix of 200s, no-match 404s (routes the canceled init never registered)
+  and 503s at the readiness deadline; `/_agent-native/*` and `/mcp` were affected
+  alike.
+
+  On Workers, bootstrap and tracked plugin inits now start inside a real request
+  context under that request's `waitUntil`, and waiting requests observe completion
+  flags they poll in their own context instead of awaiting a foreign promise. Node
+  keeps the existing shared-promise path.
+
+  `trackPluginInit(nitroApp, init, …)` now accepts a thunk (`() => Promise<void>`)
+  as well as a promise, and plugin authors should pass a thunk — that is what lets
+  the framework choose where the init runs and re-run it after a failure. Passing a
+  promise still works.
+
+  Two further cold-isolate 404 sources are closed. Request-time readiness no
+  longer waits only for the plugin inits whose declared `paths` match the request:
+  `paths` says where a plugin registers its own routes, which is a different
+  question from which plugin owns the route being requested — `/mcp` is mounted by
+  the agent-chat init while `/mcp/oauth` is mounted by core-routes, so a `/mcp`
+  request was released as soon as core-routes finished and 404'd a handler that was
+  still being mounted. On Workers every gated request now waits for every tracked
+  init (they all run concurrently on a cold isolate, so the wall-clock cost is
+  unchanged); Node keeps its existing scoped behaviour.
+
+  And a gated prefix no longer answers a bare 404 while the isolate cannot prove
+  its init finished: `/_agent-native/*`, `/mcp/*` and `/.well-known/*` fall through
+  to a guard that reports a retryable 503 naming the unfinished inits. A route that
+  genuinely does not exist still 404s.
+
+  Readiness is derived from init state — a clean bootstrap plus every tracked init
+  having settled, counted cumulatively — rather than from a flag some request sets
+  when it is released. Both alternatives failed in production: the live entry list
+  is pruned as entries settle, so "nothing pending" also reads true before anything
+  was ever recorded, and a release-time flag stopped being set at all once requests
+  gained an earlier way out, which stranded gated paths that no mount claims (the
+  auth guard, a global middleware, is what answers `/_agent-native/config`) until
+  the readiness deadline expired.
+
+  Two things make the init guard reliable. It no longer steps aside when a route
+  matched — on an SSR app h3 resolves the catch-all for `/mcp` and the app's own
+  404 page answers, which is not a framework answer at all. And readiness is now a
+  positive record rather than an inference: tracked entries are pruned once they
+  settle, so "nothing pending" could equally mean "nothing was ever recorded", and
+  a request arriving before the bookkeeping existed read the second as the first.
+  An isolate that has never completed a readiness pass must also find the requested
+  route actually registered before the gate releases it.
+  This matters most for MCP clients, which make a handful of discovery and
+  handshake calls without retrying, so one 404 on `/mcp` or
+  `/.well-known/oauth-authorization-server` drops the connection outright.
+
+  Waiting is also narrowed and cheapened. A gated request is released as soon as a
+  route matching its own path is registered, even while other inits are still
+  running — no other plugin can un-register it, and holding on serialised every
+  gated request on a cold isolate behind the slowest plugin in the app. That is
+  evidence (the route exists) rather than the declared-`paths` guess that
+  under-waited before. And waiters now back off from 10ms toward 100ms instead of
+  polling flat: a waiter polls inside the isolate it is waiting on, so nine parked
+  requests at 10ms spent ~22,500 wakeups over a 25s deadline competing for the CPU
+  the init needed — which is why raising the deadline made cold starts measurably
+  worse rather than better.
+
+  Also: a bootstrap or Better Auth init that fails once no longer poisons the
+  instance for its whole lifetime (the memo is cleared and the attempt retried,
+  bounded), and a Better Auth init failure now surfaces as a retryable 503 on
+  `/_agent-native/auth` instead of a bare 404 — `autoMountAuth` still returns true
+  for the locked-app fallback, and the new `getAuthMountFailure(app)` reports that
+  the mount is incomplete.
+
+- 0276138: Serve gated routes whose mount lands after the request was dispatched.
+
+  The readiness gate releases a request on completion flags, and h3 snapshots the
+  middleware list immediately afterwards. On a cold Cloudflare isolate the flags
+  went to `bootstrap=ready pending=[] failed=[]` while mounting was still running:
+  a `/mcp` request measured a 0ms readiness wait and was then dispatched against a
+  list missing 298 of the isolate's mounts, `/mcp` among them. Concurrent bursts
+  put 5 of 8 `/mcp` calls into a bare 404 this way, which drops an MCP client
+  outright.
+
+  The framework init guard now waits — bounded by mount progress, not just the
+  readiness deadline — for a mount that covers the requested path, then runs the
+  mounts that were registered after the snapshot. It also recovers a gated path
+  that Nitro's asset/SSR catch-all already answered with a bare 404, which is how
+  `/.well-known/agent-card.json` failed without ever reaching the "no route
+  matched" path. A framework mount's own 404 is left alone, so an action that
+  legitimately finds nothing is never re-run.
+
+  `registerMiddleware` also invalidates h3's memoized dispatcher and composed
+  chain, which until now only h3's own `use()` did.
+
 ## 0.134.0-paul.1
 
 ### Patch Changes
