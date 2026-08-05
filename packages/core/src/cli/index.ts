@@ -1240,6 +1240,9 @@ Usage:
                                 Run <cmd> with workspace vault secrets in its
                                 environment, without pasting them into a prompt.
                                 Hygiene, not containment — see 'vault --help'.
+  agent-native vault list [--app NAME]
+                                Print the secret keys in a workspace vault.
+                                Keys and display names only, never values.
   agent-native script <name>    Run an action (deprecated alias for 'action')
   agent-native typecheck        Run TypeScript type checking
   agent-native create [name]    Scaffold a new agent-native workspace with a
