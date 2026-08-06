@@ -47,7 +47,10 @@ import { DISPATCH_WORKSPACE_ROOT_REDIRECTS } from "../shared/workspace-app-id.js
 import { assertEmittedBackgroundFunctionOnDisk } from "./build.js";
 import {
   collectImmutableAssetPaths,
+  collectNetlifyPinnedMutableAssetPaths,
   IMMUTABLE_ASSET_CACHE_HEADERS,
+  NETLIFY_IMMUTABLE_ASSET_HEADER_PATH,
+  immutableAssetPathRegex,
 } from "./immutable-assets.js";
 
 export type WorkspaceDeployPreset = "cloudflare_pages" | "netlify" | "vercel";
@@ -517,14 +520,30 @@ function writeNetlifyRedirects(distDir: string, apps: string[]): void {
 function writeNetlifyHeaders(distDir: string, apps: string[]): void {
   const blocks = apps.flatMap((app) => {
     const staticDir = path.join(distDir, NETLIFY_WORKSPACE_STATIC_DIR, app);
-    return collectImmutableAssetPaths(staticDir).flatMap((assetPath) => [
-      netlifyHeaderBlock(`/${app}${assetPath}`),
-      netlifyHeaderBlock(`/${NETLIFY_WORKSPACE_STATIC_DIR}/${app}${assetPath}`),
-    ]);
+    if (collectImmutableAssetPaths(staticDir).length === 0) return [];
+
+    warnUnhashedAssetsPinnedByHeaderRule(app, staticDir);
+    return [
+      netlifyHeaderBlock(`/${app}${NETLIFY_IMMUTABLE_ASSET_HEADER_PATH}`),
+      netlifyHeaderBlock(
+        `/${NETLIFY_WORKSPACE_STATIC_DIR}/${app}${NETLIFY_IMMUTABLE_ASSET_HEADER_PATH}`,
+      ),
+    ];
   });
 
   if (blocks.length === 0) return;
   fs.writeFileSync(path.join(distDir, "_headers"), blocks.join("\n\n") + "\n");
+}
+
+function warnUnhashedAssetsPinnedByHeaderRule(
+  app: string,
+  staticDir: string,
+): void {
+  const mutable = collectNetlifyPinnedMutableAssetPaths(staticDir);
+  if (mutable.length === 0) return;
+  console.warn(
+    `[deploy] ${app}: ${mutable.length} file(s) under /assets/ carry no content hash and will be cached for a year as part of the ${NETLIFY_IMMUTABLE_ASSET_HEADER_PATH} rule. Move any file you replace in place out of public/assets/: ${mutable.join(", ")}`,
+  );
 }
 
 function netlifyHeaderBlock(pathname: string): string {
@@ -593,16 +612,20 @@ function vercelImmutableAssetHeaderRoutes(
 ): Array<Record<string, any>> {
   return apps.flatMap((app) => {
     const staticDir = path.join(outputDir, "static", app);
-    return collectImmutableAssetPaths(staticDir).map((assetPath) => ({
-      src: vercelRouteSrc(`/${app}${assetPath}`),
-      headers: IMMUTABLE_ASSET_CACHE_HEADERS,
-      continue: true,
-    }));
-  });
-}
+    if (collectImmutableAssetPaths(staticDir).length === 0) return [];
 
-function vercelRouteSrc(pathname: string): string {
-  return pathname.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Vercel matches `src` as a regex, so one route can require the content
+    // hash instead of taking a whole directory. Unhashed files an app ships
+    // under public/assets/ stay uncovered here even though the Netlify and
+    // Cloudflare globs cannot spare them.
+    return [
+      {
+        src: immutableAssetPathRegex(`/${app}`),
+        headers: IMMUTABLE_ASSET_CACHE_HEADERS,
+        continue: true,
+      },
+    ];
+  });
 }
 
 function vercelRedirect(src: string, location: string): Record<string, any> {
