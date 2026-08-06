@@ -1,6 +1,6 @@
 # @agent-native/dispatch
 
-## 1.0.0-paul.0
+## 0.17.0-paul.0
 
 ### Minor Changes
 
