@@ -9,18 +9,21 @@
 // it wants and an output directory, and reads the manifest printed on stdout to
 // learn what it got.
 //
-// This script IS the documentation for the build half. A README step that has
-// drifted from reality passes silently — someone follows it, gets a stale dist/,
-// and whatever gate the consumer runs is the only thing between them and a false
-// acceptance run. A script that has drifted throws.
+// This script IS the documentation for the build half: a written procedure that
+// has drifted from reality passes silently, and a script that has drifted throws.
 //
 // Usage:
 //   node scripts/pack-workspace-packages.ts --out-dir <dir> <package>...
 //
-//   --out-dir <dir>     where the tarballs land (required; created if absent)
+//   --out-dir <dir>     where the tarballs land (required; created if absent).
+//                       Prior versions of the packages named here are removed
+//                       from it; every other file in it is left alone.
 //   --manifest <file>   also write the stdout manifest here
 //   --no-install        skip the dependency install (deps already present)
 //   --no-prebuild       skip the workspace prebuild (dist/ already current)
+//
+// Both skip flags are recorded in the manifest, because a tarball packed over a
+// stale dist/ is indistinguishable from a fresh one to whoever installs it.
 //
 // Packages are named by their directory under packages/. Progress goes to
 // stderr and the JSON manifest to stdout, so the manifest can be piped.
@@ -69,6 +72,13 @@ export interface PackedPackage {
 
 export interface PackManifest {
   source: { commit: string; dirty: boolean };
+  /**
+   * Which build steps this run actually performed. Not every package has a
+   * `prepack` of its own, so a skipped prebuild can produce a tarball carrying
+   * whatever `dist/` happened to be on disk — and nothing downstream can tell
+   * that from a fresh build. A consumer that cares reads this and refuses.
+   */
+  build: { installed: boolean; prebuilt: boolean };
   packages: PackedPackage[];
 }
 
@@ -162,9 +172,14 @@ export function resolvePackageTargets(
   });
 }
 
+/** The filename stem `pnpm pack` derives from a package name. */
+export function tarballPrefix(packageName: string): string {
+  return packageName.replace(/^@/, "").replace(/\//g, "-");
+}
+
 /** The filename `pnpm pack` writes, derived rather than guessed by glob. */
 export function tarballName(packageName: string, version: string): string {
-  return `${packageName.replace(/^@/, "").replace(/\//g, "-")}-${version}.tgz`;
+  return `${tarballPrefix(packageName)}-${version}.tgz`;
 }
 
 /**
@@ -179,10 +194,7 @@ export function staleTarballs(
   const patterns = packed.map(
     (entry) =>
       new RegExp(
-        `^${entry.name
-          .replace(/^@/, "")
-          .replace(/\//g, "-")
-          .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-\\d.*\\.tgz$`,
+        `^${tarballPrefix(entry.name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-\\d.*\\.tgz$`,
       ),
   );
   return existingFiles.filter((file) =>
@@ -193,10 +205,13 @@ export function staleTarballs(
 export function buildManifest(input: {
   commit: string;
   dirty: boolean;
+  installed: boolean;
+  prebuilt: boolean;
   packed: PackedPackage[];
 }): PackManifest {
   return {
     source: { commit: input.commit, dirty: input.dirty },
+    build: { installed: input.installed, prebuilt: input.prebuilt },
     packages: input.packed,
   };
 }
@@ -277,6 +292,11 @@ function main(argv: string[]): void {
       ["scripts/prebuild-workspace-packages.ts", "postinstall"],
       workspaceRoot,
     );
+  } else {
+    // Some packages have no `prepack` of their own, so for those this step is
+    // the only thing that rebuilds dist/. Skipping it can pack a stale build
+    // that looks identical to a fresh one from the outside.
+    say("SKIPPING the workspace prebuild — packing whatever dist/ is on disk");
   }
 
   // Pack into a staging directory and only touch the output directory once every
@@ -327,7 +347,12 @@ function main(argv: string[]): void {
       say(`  → ${path.join(options.outDir, entry.tarball)}`);
     }
 
-    const manifest = buildManifest({ ...source, packed });
+    const manifest = buildManifest({
+      ...source,
+      installed: options.install,
+      prebuilt: options.prebuild,
+      packed,
+    });
     const serialized = `${JSON.stringify(manifest, null, 2)}\n`;
     if (options.manifestPath) {
       writeFileSync(path.resolve(options.manifestPath), serialized);

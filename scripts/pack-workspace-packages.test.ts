@@ -199,6 +199,8 @@ describe("buildManifest", () => {
     const manifest = buildManifest({
       commit: "abc1234",
       dirty: false,
+      installed: true,
+      prebuilt: true,
       packed: [
         {
           name: "@agent-native/core",
@@ -211,6 +213,7 @@ describe("buildManifest", () => {
 
     assert.deepEqual(manifest, {
       source: { commit: "abc1234", dirty: false },
+      build: { installed: true, prebuilt: true },
       packages: [
         {
           name: "@agent-native/core",
@@ -226,9 +229,23 @@ describe("buildManifest", () => {
     const manifest = buildManifest({
       commit: "abc1234",
       dirty: true,
+      installed: true,
+      prebuilt: true,
       packed: [],
     });
 
     assert.equal(manifest.source.dirty, true);
+  });
+
+  it("records a skipped build step, which the tarball itself cannot show", () => {
+    const manifest = buildManifest({
+      commit: "abc1234",
+      dirty: false,
+      installed: false,
+      prebuilt: false,
+      packed: [],
+    });
+
+    assert.deepEqual(manifest.build, { installed: false, prebuilt: false });
   });
 });
