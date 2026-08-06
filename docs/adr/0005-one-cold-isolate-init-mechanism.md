@@ -39,3 +39,14 @@ twice.
 We accept the polling cost under a concurrent cold burst. If cold-start
 failures under load reappear, the fix is to bound the number of resident waiters
 or shed earlier — not to reintroduce a second init mechanism.
+
+The policy is now written as code, and it fits behind the wrapper with one
+addition the plan did not anticipate: the memo takes an optional h3 event.
+Polling only works when the creator holds its own work open, and the measurement
+above is unambiguous that no other context can do that for it — a memo with no
+way to reach a `waitUntil` would leave every waiter to time out and duplicate
+the attempt, which is the design this ADR rejected, reached by accident. The
+parameter is optional, so no call site changes; the consequence is that a store
+routine which never threads its event through gets the duplicate-attempt
+behaviour on Workers rather than the polled one. Threading the event from the
+store call sites is follow-up work, not a second mechanism.
