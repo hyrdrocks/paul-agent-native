@@ -64,6 +64,8 @@
     "guard:content-product-conformance": "tsx scripts/validate-content-product-impact-workflow.ts",
     "guard:content-product-docs": "tsx scripts/validate-content-product-docs.ts",
     "test:content-product-docs": "tsx --test scripts/validate-content-product-docs.test.ts",
+    "pack:workspace-packages": "node scripts/pack-workspace-packages.ts",
+    "test:pack-workspace-packages": "tsx --test scripts/pack-workspace-packages.test.ts",
     "content-product-impact": "tsx scripts/validate-content-product-impact.ts",
     "test:content-product-impact": "tsx --test scripts/validate-content-product-impact.test.ts scripts/validate-content-product-impact-workflow.test.ts",
     "guard:workspace-skills": "tsx scripts/sync-workspace-core-skills.ts --check",
