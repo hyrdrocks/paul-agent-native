@@ -41,6 +41,19 @@ in the same organisation (spec #5, Out of Scope).
 Every binding name is a framework constant, not app configuration. Renaming any
 of them yields a binding nothing reads.
 
+**This table names the bindings the resources were provisioned for, not the ones
+the release emits.** Measured on the first real deploy of `paul-design-app`
+(#12): the generated `wrangler.json` carries `DB` and `ASSETS` and nothing else.
+`packages/core`'s deploy step emits `d1_databases` and no other binding, whatever
+build variables are set — there is no R2, queue or Browser Rendering emitter in
+it, and no `resolveCloudflareR2Binding` or
+`configureCloudflareModuleBackgroundQueue` named below exists in it either. So
+`CLOUDFLARE_R2_BUCKET_NAME` is inert on both sides today, uploads and durable
+background runs are not wired, and the local-versus-remote R2 divergence below
+cannot arise yet because neither target binds R2 at all. Set the variables
+anyway, as Build-time configuration says: they must not be able to drift apart
+before the emitters land.
+
 | Binding | Kind | Resource | Name is fixed by |
 | --- | --- | --- | --- |
 | `DB` | D1 | `paul-design-app` (id `256288ec-77ac-4e9d-ab1b-8d415e4ee997`, region APAC) | `CLOUDFLARE_D1_BINDING_NAME`, read by `getCloudflareD1Binding()` |
@@ -221,10 +234,16 @@ The database, bucket and both queues remain.
 
 ## Known gaps for #12
 
-- **`design.paulsjob.ai` does not exist.** The first deploy with a
-  `custom_domain` route creates it. No DNS record was created here.
-- **No secrets are set on any Worker**, because no Worker exists.
-  `BETTER_AUTH_SECRET`, `A2A_SECRET` and the provider key are all still to do.
+- ~~**`design.paulsjob.ai` does not exist.**~~ Closed in #12: the first deploy
+  created the DNS record and the certificate, as predicted.
+- ~~**No secrets are set on any Worker.**~~ Partly closed in #12:
+  `BETTER_AUTH_SECRET` and `A2A_SECRET` are set on `paul-design-app`.
+  `ANTHROPIC_API_KEY` is still unset, so agent turns fail on that deploy.
+- **The first action call of a cold isolate is slow enough to time out.**
+  `POST /_agent-native/actions/create-design` exceeded 15 s on two of five e2e
+  runs against the deploy and passed on immediate retry each time. Cold isolate
+  plus cold D1, not a failure of the write path — the same shape as the dispatch
+  app's open "sign-up and sign-in fail on cold Worker isolates".
 - **The Design template carries 51 pre-existing `no-env-credentials` findings**
   (`npx agent-native doctor --only no-env-credentials` in
   `sonhyrd/agent-native`'s `templates/design`). None are provider keys or
