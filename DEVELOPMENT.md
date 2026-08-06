@@ -152,3 +152,21 @@ Individual packages:
 pnpm --filter @agent-native/core build
 pnpm --filter mail build
 ```
+
+## Packing packages for a consumer
+
+An app that consumes this workspace's packages as committed tarballs rather than
+from the registry gets them from:
+
+```bash
+pnpm pack:workspace-packages --out-dir <dir> core dispatch
+```
+
+The package list is an argument, so the consumer declares what it needs and this
+workspace stays unaware of who is asking. The command installs dependencies
+without native builds, prebuilds the workspace in topological order, packs each
+named package, and only writes into `--out-dir` once every package has packed.
+Progress goes to stderr; a JSON manifest naming each package, version and
+tarball goes to stdout (and to `--manifest <file>`), which is what a consumer
+reads to rewrite its own dependency specs. Consuming, verifying and gating on
+the result belong to the consumer, not here.
