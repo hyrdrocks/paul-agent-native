@@ -25,3 +25,7 @@ that acknowledges a handoff without proving a consumer claimed the run opts in,
 one that returns a synchronous accepted status does not. Callers hand a run to a
 transport with no path through the new `deliverBackgroundHandoff`, so no call
 site needs to know which hosts POST and which do not.
+
+`@agent-native/core/agent/durable-background` is now an export subpath, so a
+consumer can ask which transport this process actually resolves without pulling
+the whole server graph.

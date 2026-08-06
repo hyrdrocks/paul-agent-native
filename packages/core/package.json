@@ -316,6 +316,7 @@
     "./agent/engine": "./dist/agent/engine/index.js",
     "./agent/harness": "./dist/agent/harness/index.js",
     "./agent/json-schema-validator": "./dist/agent/json-schema-validator.js",
+    "./agent/durable-background": "./dist/agent/durable-background.js",
     "./eval": "./dist/eval/index.js",
     "./tsconfig.base.json": "./tsconfig.base.json"
   },
