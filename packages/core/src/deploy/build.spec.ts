@@ -16,6 +16,7 @@ import {
   addImmutableAssetRouteRulesForClientBuild,
   assertEmittedBackgroundFunctionOnDisk,
   assertNoCloudflareWorkerStubDynamicImports,
+  assertNoWorkerChunkImportCycles,
   assertSingleTemplateNetlifyBuildOutput,
   bundleYjsRuntimeForServerlessOutput,
   CLOUDFLARE_WORKER_ESBUILD_EXTERNALS,
@@ -35,6 +36,7 @@ import {
   emitSingleTemplateNetlifyKeepWarmFunction,
   findInstalledFfmpegStaticPackage,
   findInstalledResvgPackages,
+  findWorkerChunkImportCycles,
   isServerlessNativePlatformPackage,
   generateCloudflarePagesStaticShellFromManifest,
   generateCloudflareModuleWorkerEntry,
@@ -52,6 +54,8 @@ import {
   runNitroBuildPipeline,
   sanitizeServerlessFunctionPackageManifest,
   shouldBundleFfmpegStaticForServerless,
+  WORKER_FRAMEWORK_CHUNK_NAME,
+  workerFrameworkCodeSplitting,
   writeSingleTemplateNetlifyRedirects,
 } from "./build.js";
 import { IMMUTABLE_ASSET_CACHE_CONTROL } from "./immutable-assets.js";
@@ -74,6 +78,125 @@ describe("nitroNoExternalsForPreset", () => {
     expect(nitroNoExternalsForPreset("cloudflare-pages")).toBe(true);
     expect(nitroNoExternalsForPreset("cloudflare_module")).toBe(true);
     expect(nitroNoExternalsForPreset("deno-deploy")).toBe(true);
+  });
+});
+
+describe("workerFrameworkCodeSplitting", () => {
+  it("claims every installed @agent-native package for one chunk", () => {
+    const [group] = workerFrameworkCodeSplitting().groups;
+    expect(group.name).toBe(WORKER_FRAMEWORK_CHUNK_NAME);
+    expect(
+      group.test.test("/app/node_modules/@agent-native/core/dist/index.js"),
+    ).toBe(true);
+    // pnpm reaches a `file:` tarball install through its store, so the path
+    // that matters is the realpath inside .pnpm, not the top-level symlink.
+    expect(
+      group.test.test(
+        "/app/node_modules/.pnpm/@agent-native+creative-context@file+vendor+x.tgz_a/node_modules/@agent-native/creative-context/dist/index.js",
+      ),
+    ).toBe(true);
+  });
+
+  it("leaves everything else on Nitro's own per-package grouping", () => {
+    const [group] = workerFrameworkCodeSplitting().groups;
+    expect(group.test.test("/app/actions/list-designs.ts")).toBe(false);
+    expect(group.test.test("/app/node_modules/nitro/dist/runtime/x.mjs")).toBe(
+      false,
+    );
+    // Third-party packages keep their own chunks: pulling a lazily imported
+    // one into the eagerly evaluated chunk runs its module-scope
+    // `require("node:...")` during startup, which workerd rejects.
+    expect(
+      group.test.test(
+        "/app/node_modules/.pnpm/@playwright+test@1.0.0/node_modules/@playwright/test/index.js",
+      ),
+    ).toBe(false);
+    expect(
+      group.test.test(
+        "/app/node_modules/.pnpm/zod@4.4.3/node_modules/zod/index.js",
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("findWorkerChunkImportCycles", () => {
+  it("reports a cycle between two emitted chunks", () => {
+    const dir = makeTempDir();
+    const libs = path.join(dir, "_libs", "@agent-native");
+    fs.mkdirSync(libs, { recursive: true });
+    fs.writeFileSync(
+      path.join(libs, "core.mjs"),
+      'import{v as a}from"./creative-context+[...].mjs";export const z=a;',
+    );
+    fs.writeFileSync(
+      path.join(libs, "creative-context+[...].mjs"),
+      'import{z as b}from"./core.mjs";export const v=b;',
+    );
+
+    const cycles = findWorkerChunkImportCycles(dir);
+
+    expect(cycles).toHaveLength(1);
+    expect(cycles[0]).toEqual(
+      expect.arrayContaining([
+        "_libs/@agent-native/core.mjs",
+        "_libs/@agent-native/creative-context+[...].mjs",
+      ]),
+    );
+  });
+
+  it("ignores dynamic imports, which do not evaluate during linking", () => {
+    const dir = makeTempDir();
+    fs.writeFileSync(
+      path.join(dir, "index.mjs"),
+      'import{a}from"./_libs/vendor.mjs";export const b=a;',
+    );
+    fs.mkdirSync(path.join(dir, "_libs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "_libs", "vendor.mjs"),
+      'export const a=()=>import("../index.mjs");',
+    );
+
+    expect(findWorkerChunkImportCycles(dir)).toEqual([]);
+  });
+
+  it("finds nothing in an acyclic single-vendor-chunk output", () => {
+    const dir = makeTempDir();
+    fs.mkdirSync(path.join(dir, "_libs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "index.mjs"),
+      'export*from"./_libs/vendor+[...].mjs";',
+    );
+    fs.writeFileSync(
+      path.join(dir, "_libs", "vendor+[...].mjs"),
+      "export const a=1;",
+    );
+
+    expect(findWorkerChunkImportCycles(dir)).toEqual([]);
+  });
+});
+
+describe("assertNoWorkerChunkImportCycles", () => {
+  it("names the cycling chunks instead of leaving workerd to fail at boot", () => {
+    const dir = makeTempDir();
+    fs.mkdirSync(path.join(dir, "_libs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "_libs", "a.mjs"),
+      'import{b}from"./b.mjs";export const a=b;',
+    );
+    fs.writeFileSync(
+      path.join(dir, "_libs", "b.mjs"),
+      'import{a}from"./a.mjs";export const b=a;',
+    );
+
+    expect(() => assertNoWorkerChunkImportCycles(dir)).toThrow(/_libs\/a\.mjs/);
+    expect(() => assertNoWorkerChunkImportCycles(dir)).toThrow(/_libs\/b\.mjs/);
+  });
+
+  it("passes an output with no chunk cycle", () => {
+    const dir = makeTempDir();
+    fs.writeFileSync(path.join(dir, "index.mjs"), "export const a=1;");
+
+    expect(() => assertNoWorkerChunkImportCycles(dir)).not.toThrow();
   });
 });
 

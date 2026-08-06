@@ -4013,6 +4013,12 @@ export function resolveNitroBundledYjsEntry(): string {
 /**
  * Edge runtimes have no node_modules, while Node/serverless outputs only need
  * the small set above bundled to keep their package manifests traceable.
+ *
+ * Worker and Deno presets set `node: false`, and Nitro only installs its
+ * externals plugin when `node` is true — so on those presets this value is read
+ * by nothing and nothing in the output is a Nitro external. Anything left as a
+ * bare import there is a module Rolldown could not resolve, not a dependency
+ * Nitro chose to keep outside the bundle.
  */
 export function nitroNoExternalsForPreset(
   targetPreset: string,
@@ -4025,6 +4031,149 @@ export function nitroNoExternalsForPreset(
         targetPreset === "aws-lambda"
       ? []
       : NITRO_SERVER_RUNTIME_BUNDLED_DEPS;
+}
+
+export const WORKER_FRAMEWORK_CHUNK_NAME = "_libs/@agent-native/framework";
+
+/**
+ * Matches an installed `@agent-native/*` package. Deliberately unanchored:
+ * under pnpm the real path runs through `node_modules/.pnpm/<id>/node_modules/`,
+ * so only the inner segment names the package.
+ */
+const WORKER_FRAMEWORK_CHUNK_TEST = /node_modules[/\\]@agent-native[/\\]/;
+
+/**
+ * Keeps every installed `@agent-native/*` package in one chunk for Worker and
+ * Deno output.
+ *
+ * Nitro declares one code-splitting group per installed package and then lets
+ * Rolldown merge those groups down to far fewer physical chunks, so two
+ * framework packages that share a dependency end up on opposite sides of a
+ * merge and import each other across the chunk boundary — one chunk holding
+ * zod, the other drizzle-orm. ESM evaluates one side of such a cycle first, and
+ * a module-scope read of the other side's `const` throws "Cannot access 'X'
+ * before initialization" while workerd is still linking, so the Worker never
+ * boots although install, resolution, bundling and the size check all passed.
+ * Workspace sources never match the group `test`, which is why this appears
+ * only once an app consumes the packages from node_modules, and only once it
+ * consumes two of them.
+ *
+ * Scoped to `@agent-native/*` rather than to all of node_modules on purpose.
+ * One chunk for every installed package also removes the cycle, but it drags
+ * lazily imported third-party packages into the eagerly evaluated chunk, and
+ * their module-scope `require("node:...")` then runs during startup — trading
+ * this failure for "No such module" at boot.
+ *
+ * Rolldown matches groups in declaration order and Nitro merges caller-supplied
+ * output config ahead of its own, so this takes precedence over the per-package
+ * grouping for these packages and leaves every other package on it.
+ * `advancedChunks` is not the option to reach for: Rolldown ignores it whenever
+ * `codeSplitting` is set, which Nitro always does, and warns rather than fails.
+ */
+export function workerFrameworkCodeSplitting(): {
+  groups: { test: RegExp; name: string }[];
+} {
+  return {
+    groups: [
+      { test: WORKER_FRAMEWORK_CHUNK_TEST, name: WORKER_FRAMEWORK_CHUNK_NAME },
+    ],
+  };
+}
+
+const STATIC_RELATIVE_IMPORT_RE =
+  /(?:^|[\s;})])(?:import|export)\s*(?:[^;"'()]*?from\s*)?["'](\.[^"']*)["']/g;
+
+function resolveEmittedChunkPath(fromFile: string, specifier: string): string {
+  const base = path.resolve(path.dirname(fromFile), specifier);
+  for (const candidate of [base, `${base}.mjs`, `${base}.js`]) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile())
+      return candidate;
+  }
+  return "";
+}
+
+/**
+ * Static-import cycles between the chunks emitted into `serverDir`.
+ *
+ * Only static imports count: they are what the module linker evaluates before
+ * any code runs, and they are the only ones that can observe a binding in its
+ * temporal dead zone. A dynamic `import()` inside a function body is fine and
+ * must not be reported.
+ */
+export function findWorkerChunkImportCycles(serverDir: string): string[][] {
+  const files: string[] = [];
+  function walk(dir: string) {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(p);
+      else if (entry.name.endsWith(".mjs") || entry.name.endsWith(".js"))
+        files.push(p);
+    }
+  }
+  walk(serverDir);
+
+  const edges = new Map<string, string[]>();
+  for (const file of files) {
+    const code = fs.readFileSync(file, "utf8");
+    const targets = new Set<string>();
+    for (const match of code.matchAll(STATIC_RELATIVE_IMPORT_RE)) {
+      const resolved = resolveEmittedChunkPath(file, match[1]);
+      if (resolved && resolved !== file) targets.add(resolved);
+    }
+    edges.set(file, [...targets]);
+  }
+
+  const rel = (file: string) =>
+    path.relative(serverDir, file).replace(/\\/g, "/");
+  const cycles: string[][] = [];
+  const seenCycles = new Set<string>();
+  const state = new Map<string, "visiting" | "done">();
+  const stack: string[] = [];
+
+  function visit(file: string) {
+    state.set(file, "visiting");
+    stack.push(file);
+    for (const next of edges.get(file) ?? []) {
+      const nextState = state.get(next);
+      if (nextState === "done") continue;
+      if (nextState === "visiting") {
+        const cycle = stack.slice(stack.indexOf(next)).map(rel);
+        const key = [...cycle].sort().join("|");
+        if (!seenCycles.has(key)) {
+          seenCycles.add(key);
+          cycles.push(cycle);
+        }
+        continue;
+      }
+      visit(next);
+    }
+    stack.pop();
+    state.set(file, "done");
+  }
+
+  for (const file of files) if (!state.has(file)) visit(file);
+  return cycles;
+}
+
+/**
+ * Turns a cycle that would only surface as a minified symbol in workerd's boot
+ * log into a build failure that names the chunks.
+ */
+export function assertNoWorkerChunkImportCycles(serverDir: string): void {
+  const cycles = findWorkerChunkImportCycles(serverDir);
+  if (cycles.length === 0) return;
+  const described = cycles
+    .map((cycle) => `  ${[...cycle, cycle[0]].join(" -> ")}`)
+    .join("\n");
+  throw new Error(
+    `[deploy] Worker output has static import cycles between emitted chunks:\n${described}\n` +
+      `The module linker evaluates one side of a cycle first, so a module-scope read of the ` +
+      `other side throws "Cannot access 'X' before initialization" and the Worker never boots. ` +
+      `Every installed @agent-native/* package belongs in the single ` +
+      `${WORKER_FRAMEWORK_CHUNK_NAME} chunk — check whether a code-splitting group is ` +
+      `putting them back into per-package chunks.`,
+  );
 }
 
 /**
@@ -4198,6 +4347,9 @@ export default bundle;
       ...(preset === "netlify" || preset === "vercel" || preset === "aws-lambda"
         ? { external: ["yjs"] }
         : {}),
+      ...(preset.startsWith("cloudflare") || preset.startsWith("deno")
+        ? { output: { codeSplitting: workerFrameworkCodeSplitting() } }
+        : {}),
       plugins: [
         ...(preset.startsWith("cloudflare")
           ? [createCloudflareModuleStubPlugin()]
@@ -4275,7 +4427,9 @@ export default bundle;
   }
 
   // Resolve remaining bare npm imports by bundling them into _libs/.
-  // Nitro sometimes leaves small packages as externals even with noExternals.
+  // These are modules Rolldown could not resolve, not Nitro externals: Worker
+  // and Deno presets run with `node: false`, where Nitro never installs its
+  // externals plugin at all.
   if (preset.startsWith("cloudflare") || preset.startsWith("deno")) {
     const { execFileSync } = await import("child_process");
     const { createRequire } = await import("module");
@@ -4659,6 +4813,15 @@ export default bundle;
 
     console.log(
       "[deploy] Patched bare Node imports, timer calls, and route finder for CF Workers",
+    );
+  }
+
+  // Last gate before the artifact ships: the cycle this catches passes install,
+  // resolution, bundling and the size check, and only workerd's module linker
+  // objects — by then the evidence is a minified symbol name.
+  if (preset.startsWith("cloudflare") || preset.startsWith("deno")) {
+    assertNoWorkerChunkImportCycles(
+      nitro.options.output.serverDir || path.join(cwd, "dist", "_worker.js"),
     );
   }
 
