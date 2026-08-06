@@ -5,7 +5,7 @@
  *   pnpm action generate-image --prompt "description"
  *   pnpm action generate-image --prompt "description" --slide-content "<div>...</div>"
  *   pnpm action generate-image --prompt "description" --deck-id "vkkvhkbJ_Q" --slide-id "sko-21"
- *   pnpm action generate-image --prompt "description" --count 3 --output public/assets/generated/img
+ *   pnpm action generate-image --prompt "description" --count 3 --output public/generated/img
  *
  * Options:
  *   --prompt              Image description (required)
@@ -15,7 +15,7 @@
  *   --model               Provider: 'gemini', 'openai', or 'auto' (default: auto)
  *   --reference-image-urls  Comma-separated URLs of extra reference images
  *   --count               Number of variations to generate (default: 1)
- *   --output              Output file path prefix (e.g. public/assets/generated/slide21)
+ *   --output              Output file path prefix (e.g. public/generated/slide21)
  *                         Files will be named {prefix}-v1.png, {prefix}-v2.png, etc.
  *   --help                Show this help
  */
