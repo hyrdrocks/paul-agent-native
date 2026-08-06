@@ -50,7 +50,11 @@ import {
   getRequestUserEmail,
   runWithRequestContext,
 } from "../server/request-context.js";
-import { fireInternalDispatch } from "../server/self-dispatch.js";
+import {
+  describeBackgroundDispatchTarget,
+  fireBackgroundDispatch,
+  fireInternalDispatch,
+} from "../server/self-dispatch.js";
 import {
   isReasoningEffort,
   normalizeReasoningEffortForRequest,
@@ -62,19 +66,19 @@ import {
   drainAgentWarnings,
   formatAgentWarningsForToolResult,
 } from "./action-warnings.js";
+import { backgroundTargetAcknowledgesWithoutClaim } from "./background-transports.js";
 import {
   buildSystemManifestSections,
   readContextXraySystemSections,
 } from "./context-xray/manifest.js";
 import {
   AGENT_CHAT_BACKGROUND_RUN_FIELD,
-  AGENT_CHAT_PROCESS_RUN_PATH,
   backgroundRuntimeDiagnosticDetail,
-  dispatchPathTargetsNetlifyBackgroundFunction,
   isAgentChatDurableBackgroundEnabled,
   isAgentChatForegroundSelfChainEnabled,
   isInBackgroundFunctionRuntime,
-  resolveAgentChatProcessRunDispatchPath,
+  reportUnclaimedQueueBackgroundRunOnce,
+  resolveBackgroundDispatchTarget,
   shouldUseBackgroundFunctionTimeoutForWorker,
 } from "./durable-background.js";
 import { applyContextXrayTransformForIteration } from "./engine/context-directives-transform.js";
@@ -6802,6 +6806,7 @@ export interface ChainServerDrivenContinuationDeps {
   emitRunText?: typeof emitRunText;
   insertRun?: typeof insertRun;
   fireInternalDispatch?: typeof fireInternalDispatch;
+  fireBackgroundDispatch?: typeof fireBackgroundDispatch;
   readBackgroundRunClaim?: typeof readBackgroundRunClaim;
   updateRunHeartbeat?: typeof updateRunHeartbeat;
   updateRunStatusIfRunning?: typeof updateRunStatusIfRunning;
@@ -6828,7 +6833,7 @@ export interface ContinuationDispatchBudget {
 /**
  * Sizes the dispatch retry budget by *remaining wall-clock capacity*, not by
  * dispatch TARGET — the two are independent concerns. `chainViaDurableBackground`
- * only picks where the dispatch goes (see `continuationDispatchPath` above);
+ * only picks where the dispatch goes (see `continuationTarget` above);
  * this picks how hard to retry getting it there.
  *
  * Three cases:
@@ -7031,6 +7036,8 @@ export async function chainServerDrivenContinuation(opts: {
     insertRun: opts.deps?.insertRun ?? insertRun,
     fireInternalDispatch:
       opts.deps?.fireInternalDispatch ?? fireInternalDispatch,
+    fireBackgroundDispatch:
+      opts.deps?.fireBackgroundDispatch ?? fireBackgroundDispatch,
     readBackgroundRunClaim:
       opts.deps?.readBackgroundRunClaim ?? readBackgroundRunClaim,
     updateRunHeartbeat: opts.deps?.updateRunHeartbeat ?? updateRunHeartbeat,
@@ -7123,11 +7130,13 @@ export async function chainServerDrivenContinuation(opts: {
   const nextRunId = d.generateRunId();
   const actionPreparationTool = lastUnfinishedPreparingActionTool(run);
   const continuationReason = backgroundContinuationReasonForRun(run);
-  const continuationDispatchPath = opts.chainViaDurableBackground
-    ? resolveAgentChatProcessRunDispatchPath()
-    : AGENT_CHAT_PROCESS_RUN_PATH;
+  const continuationTarget = resolveBackgroundDispatchTarget({
+    durableBackground: opts.chainViaDurableBackground,
+  });
+  const continuationDispatchDescription =
+    describeBackgroundDispatchTarget(continuationTarget);
   const continuationExpectsNetlifyBackgroundFunction =
-    dispatchPathTargetsNetlifyBackgroundFunction(continuationDispatchPath);
+    continuationTarget.expectsBackgroundRuntime;
   const dispatchBudget = resolveContinuationDispatchBudget({
     chainViaDurableBackground: opts.chainViaDurableBackground,
     workerProvenInBackgroundFunction:
@@ -7162,7 +7171,7 @@ export async function chainServerDrivenContinuation(opts: {
       .recordRunDiagnostic(
         runId,
         RUN_DIAG_STAGE.workerSetupStep,
-        `chain_dispatch_start nextRunId=${nextRunId} reason=${continuationReason} path=${continuationDispatchPath}`,
+        `chain_dispatch_start nextRunId=${nextRunId} reason=${continuationReason} target=${continuationDispatchDescription}`,
       )
       .catch(() => {});
     // ── TRANSACTIONAL HANDOFF ──────────────────────────────────────────────
@@ -7232,7 +7241,7 @@ export async function chainServerDrivenContinuation(opts: {
         backgroundContinuationCount: opts.backgroundContinuationCount,
         nextRunId,
         nextRowInserted,
-        continuationDispatchPath,
+        continuationTarget,
         dispatchBody,
         dispatchBudget,
         isLoopProtectionDispatchError,
@@ -7240,7 +7249,7 @@ export async function chainServerDrivenContinuation(opts: {
         deps: {
           sleep: d.sleep,
           updateRunHeartbeat: d.updateRunHeartbeat,
-          fireInternalDispatch: d.fireInternalDispatch,
+          fireBackgroundDispatch: d.fireBackgroundDispatch,
           readBackgroundRunClaim: d.readBackgroundRunClaim,
         },
       });
@@ -8503,12 +8512,13 @@ export function createProductionAgentHandler(
       }
 
       let dispatched = false;
-      const backgroundDispatchPath = resolveAgentChatProcessRunDispatchPath();
+      const backgroundTarget = resolveBackgroundDispatchTarget();
       const expectsNetlifyBackgroundFunction =
-        dispatchPathTargetsNetlifyBackgroundFunction(backgroundDispatchPath);
+        backgroundTarget.expectsBackgroundRuntime;
       try {
-        await fireInternalDispatch({
+        await fireBackgroundDispatch({
           event,
+          target: backgroundTarget,
           // On hosted Netlify this resolves to the background function's DEFAULT
           // url (/.netlify/functions/<name>, or per-app <app>-agent-background for
           // workspaces) — the function declares NO custom config.path, so it keeps
@@ -8518,8 +8528,9 @@ export function createProductionAgentHandler(
           // `_process-run` route and the same in-process catch-all handles it
           // inline. `fireInternalDispatch` strips the app base path for
           // /.netlify/* targets so the request reaches the host-root function url;
-          // the Authorization Bearer HMAC is preserved either way.
-          path: backgroundDispatchPath,
+          // the Authorization Bearer HMAC is preserved either way. On Workers
+          // this is a queue send instead, and the same signed token travels on
+          // the message — see `fireBackgroundDispatch`.
           taskId: runId,
           // A Netlify background function 202s on enqueue in well under a
           // second, so a 404/401/508 from it is an IMMEDIATE, knowable failure.
@@ -8639,6 +8650,20 @@ export function createProductionAgentHandler(
           () => null,
         );
         const priorDiag = priorClaim?.diagStage ?? "none";
+        // A failed handoff is a handled condition with a working fallback; a
+        // handoff a transport ACCEPTED and no consumer ever claimed is an
+        // undiagnosable deploy defect wearing the same clothes. Report the
+        // second one — the inline recovery below is exactly what would
+        // otherwise hide it. Which transports can be in that state is their own
+        // declaration, not something recognised here.
+        if (
+          dispatched &&
+          backgroundTargetAcknowledgesWithoutClaim(backgroundTarget)
+        ) {
+          reportUnclaimedQueueBackgroundRunOnce(
+            `runId=${runId} bgFnPriorDiag=${priorDiag}`,
+          );
+        }
         console.error(
           "[agent-chat] background worker did not claim the 202-dispatched run " +
             `within grace; recovering inline. bgFnPriorDiag=${priorDiag}`,

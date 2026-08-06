@@ -2,19 +2,22 @@ import crypto from "node:crypto";
 
 import { setResponseHeader, setResponseStatus } from "h3";
 
+import { isDurableBackgroundTarget } from "../agent/background-transports.js";
 import {
   AGENT_BACKGROUND_PROCESSOR_A2A,
   AGENT_BACKGROUND_PROCESSOR_FIELD,
-  dispatchPathTargetsNetlifyBackgroundFunction,
   isAgentChatDurableBackgroundEnabled,
-  resolveAgentChatProcessRunDispatchPath,
+  resolveBackgroundDispatchTarget,
 } from "../agent/durable-background.js";
 import { trackingIdentityProperties } from "../observability/tracking-identity.js";
 import { getA2ASecretByDomain } from "../org/context.js";
 import { findWorkspaceDispatchAgent } from "../server/agent-discovery.js";
 import { withConfiguredAppBasePath } from "../server/app-base-path.js";
 import { getOrigin, isConfiguredAppOrigin } from "../server/google-oauth.js";
-import { fireInternalDispatch } from "../server/self-dispatch.js";
+import {
+  fireBackgroundDispatch,
+  fireInternalDispatch,
+} from "../server/self-dispatch.js";
 import { agentChat } from "../shared/agent-chat.js";
 import { track } from "../tracking/registry.js";
 import {
@@ -293,11 +296,14 @@ async function fireProcessTaskDispatch(
   taskId: string,
   config: A2AConfig,
 ): Promise<void> {
-  const backgroundPath = resolveAgentChatProcessRunDispatchPath();
+  // The durable worker is reachable on whichever registered transport this host
+  // has; the in-process route is the portable one this function already falls
+  // back to.
+  const backgroundTarget = resolveBackgroundDispatchTarget();
   const useBackgroundWorker =
     isAgentChatDurableBackgroundEnabled({
       appOptIn: config.durableBackgroundRuns,
-    }) && dispatchPathTargetsNetlifyBackgroundFunction(backgroundPath);
+    }) && isDurableBackgroundTarget(backgroundTarget);
 
   if (!useBackgroundWorker) {
     await fireInternalDispatch({
@@ -312,9 +318,9 @@ async function fireProcessTaskDispatch(
     // A real Netlify background function acknowledges the enqueue quickly.
     // Await that acknowledgement so a missing or rejected worker can fall
     // back before the task is left in `working` with no processor.
-    await fireInternalDispatch({
+    await fireBackgroundDispatch({
       event,
-      path: backgroundPath,
+      target: backgroundTarget,
       taskId,
       body: {
         [AGENT_BACKGROUND_PROCESSOR_FIELD]: AGENT_BACKGROUND_PROCESSOR_A2A,

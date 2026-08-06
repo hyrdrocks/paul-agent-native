@@ -1,3 +1,7 @@
+import {
+  type BackgroundDispatchTarget,
+  deliverBackgroundHandoff,
+} from "../agent/background-transports.js";
 import { isLocalDatabase } from "../db/client.js";
 import { signInternalToken } from "../integrations/internal-token.js";
 /**
@@ -221,4 +225,54 @@ export async function fireInternalDispatch(
     dispatchPromise,
     new Promise<void>((resolve) => setTimeout(resolve, settleMs)),
   ]);
+}
+
+/**
+ * Fire one durable-background handoff at a resolved transport.
+ *
+ * The single place a target that is not addressed by a url is turned into an
+ * actual handoff, so no call site has to know which transports POST and which
+ * do not. A target WITH a path keeps `fireInternalDispatch` byte-for-byte,
+ * including the settle race and the awaited-response option.
+ *
+ * Throws on a failed handoff on every transport — the callers already catch
+ * that and degrade to an inline run.
+ */
+export async function fireBackgroundDispatch(
+  options: Omit<FireInternalDispatchOptions, "path"> & {
+    target: BackgroundDispatchTarget;
+  },
+): Promise<void> {
+  const { target, ...rest } = options;
+  if (target.path == null) {
+    // Such a transport confirms its own handoff before resolving — that is
+    // this transport's equivalent of the awaited 202 the HTTP handoff waits
+    // for, so `awaitResponse` needs no analogue and the settle race would be
+    // actively wrong here.
+    //
+    // The receiver has no inbound request to take an origin from, so it is
+    // resolved HERE through the same resolver the HTTP transport uses: one
+    // answer to "which URL is this deployment", not two.
+    const baseUrl =
+      options.baseUrl ?? resolveSelfDispatchBaseUrl(options.event);
+    await deliverBackgroundHandoff(target, {
+      taskId: options.taskId,
+      origin: new URL(baseUrl).origin,
+      body: options.body,
+    });
+    return;
+  }
+  await fireInternalDispatch({ ...rest, path: target.path });
+}
+
+/**
+ * How to describe a dispatch target in a diagnostic. A target with no path is
+ * named by its transport instead; printing an empty string or the framework
+ * route in its place is precisely the confusion these diagnostics exist to
+ * prevent.
+ */
+export function describeBackgroundDispatchTarget(
+  target: BackgroundDispatchTarget,
+): string {
+  return target.path ?? target.kind;
 }

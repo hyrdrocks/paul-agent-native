@@ -2,8 +2,9 @@ import {
   AGENT_BACKGROUND_PROCESSOR_FIELD,
   AGENT_BACKGROUND_PROCESSOR_ROUTE,
   AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD,
-  dispatchPathTargetsNetlifyBackgroundFunction,
-  resolveDurableBackgroundDispatchPath,
+  deliverBackgroundHandoff,
+  isDurableBackgroundTarget,
+  resolveBackgroundDispatchTarget,
   signScopedAgentAccessToken,
 } from "@agent-native/core/server";
 
@@ -64,11 +65,15 @@ export async function dispatchPostFinalizeJob(args: {
     process.env.VITE_APP_BASE_PATH || process.env.APP_BASE_PATH,
   );
   const processorRoute = `${basePath}/api/_agent-native-background/post-finalize-worker`;
-  const dispatchPath = resolveDurableBackgroundDispatchPath(processorRoute);
-  const workerUrl = resolveWorkerUrl(dispatchPath);
-  const usesDurableBackground =
-    dispatchPathTargetsNetlifyBackgroundFunction(dispatchPath);
-  const body = JSON.stringify({
+  // The durable worker is reachable on whichever transport this host
+  // registered; each carries its own budget and routes back to this same
+  // processor route through the background route-processor field. The
+  // in-process route is the portable fallback.
+  const target = resolveBackgroundDispatchTarget({
+    fallbackPath: processorRoute,
+  });
+  const usesDurableBackground = isDurableBackgroundTarget(target);
+  const jobBody = {
     ...job,
     token,
     ...(usesDurableBackground
@@ -77,18 +82,15 @@ export async function dispatchPostFinalizeJob(args: {
           [AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD]: processorRoute,
         }
       : {}),
-  });
+  };
+  const body = JSON.stringify(jobBody);
   const post = (url: string) =>
     fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
     });
-  const dispatch = post(workerUrl).then(async (initialResponse) => {
-    const response =
-      usesDurableBackground && !initialResponse.ok
-        ? await post(resolveWorkerUrl(processorRoute))
-        : initialResponse;
+  const assertAccepted = async (response: Response) => {
     if (response.ok) return;
     const detail = (await response.text().catch(() => "")).trim().slice(0, 300);
     throw new Error(
@@ -96,9 +98,44 @@ export async function dispatchPostFinalizeJob(args: {
         detail ? `: ${detail}` : ""
       }`,
     );
-  });
+  };
+  // A transport with no path of its own still runs the job at this route: the
+  // receiver calls back into it. That is why the url is resolved from the
+  // processor route rather than substituted for a missing dispatch path.
+  const workerUrl = resolveWorkerUrl(target.path ?? processorRoute);
+  const dispatch =
+    target.path == null
+      ? deliverBackgroundHandoff(target, {
+          taskId: postFinalizeJobResourceId(job.recordingId, job.kind),
+          origin: new URL(workerUrl).origin,
+          body: jobBody,
+        }).catch(async (handoffError: unknown) => {
+          // Same shape as the HTTP fast-fail fallback below: a transport that
+          // refuses the handoff is a known state with a working alternative,
+          // and the job runs on the portable route instead of being dropped.
+          console.error(
+            "[post-finalize] durable dispatch failed; falling back",
+            {
+              recordingId: args.recordingId,
+              kind: args.kind,
+              transport: target.kind,
+              error:
+                handoffError instanceof Error
+                  ? handoffError.message
+                  : String(handoffError),
+            },
+          );
+          await assertAccepted(await post(workerUrl));
+        })
+      : post(workerUrl).then(async (initialResponse) => {
+          const response =
+            usesDurableBackground && !initialResponse.ok
+              ? await post(resolveWorkerUrl(processorRoute))
+              : initialResponse;
+          await assertAccepted(response);
+        });
 
-  dispatch.catch((err) => {
+  dispatch.catch((err: unknown) => {
     console.error("[post-finalize] worker dispatch failed", {
       recordingId: args.recordingId,
       kind: args.kind,
