@@ -315,6 +315,7 @@
     "./styles/chat-history-list.css": "./dist/styles/chat-history-list.css",
     "./agent/engine": "./dist/agent/engine/index.js",
     "./agent/harness": "./dist/agent/harness/index.js",
+    "./agent/json-schema-validator": "./dist/agent/json-schema-validator.js",
     "./eval": "./dist/eval/index.js",
     "./tsconfig.base.json": "./tsconfig.base.json"
   },
@@ -342,6 +343,7 @@
     "@assistant-ui/store": ">=0.2.9 <0.2.14",
     "@assistant-ui/tap": "^0.5.14",
     "@builder.io/ai-utils": "^0.84.0",
+    "@cfworker/json-schema": "^4.1.1",
     "@clack/prompts": "^1.4.0",
     "@codemirror/lang-sql": "^6.10.0",
     "@codemirror/theme-one-dark": "^6.1.3",
