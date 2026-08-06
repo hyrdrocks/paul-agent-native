@@ -10,8 +10,9 @@ export const IMMUTABLE_ASSET_CACHE_HEADERS = {
   "netlify-cdn-cache-control": IMMUTABLE_ASSET_CACHE_CONTROL,
 } as const;
 
-export const IMMUTABLE_ASSET_PATH_PATTERN =
-  "^/assets/[^/]+-[A-Za-z0-9_-]{8}\\.[a-z0-9]+$";
+const IMMUTABLE_ASSET_FILENAME_PATTERN = "[^/]+-[A-Za-z0-9_-]{8}\\.[a-z0-9]+";
+
+export const IMMUTABLE_ASSET_PATH_PATTERN = `^/assets/${IMMUTABLE_ASSET_FILENAME_PATTERN}$`;
 
 const IMMUTABLE_ASSET_PATH_RE = new RegExp(IMMUTABLE_ASSET_PATH_PATTERN);
 
@@ -46,12 +47,59 @@ export function isImmutableAssetPath(pathname: string): boolean {
 export const IMMUTABLE_ASSET_ROUTE_GLOB = "/assets/**";
 
 /**
+ * The same collapse for a Netlify `_headers` file, which matches paths with
+ * `*` and `:placeholder` only and has no regex form — so nothing there can
+ * require a content hash in the filename.
+ *
+ * `:file` rather than `*` because a Netlify placeholder matches one path
+ * segment where `*` crosses `/`: this covers `assets/` itself and stops,
+ * leaving a subdirectory of hand-maintained files uncovered instead of pinned
+ * for a year. What it still cannot exclude is an unhashed file sitting
+ * *directly* in `assets/`, and no later block can take the header back —
+ * duplicate header names comma-join rather than override. Callers must report
+ * what they widened; see collectNetlifyPinnedMutableAssetPaths.
+ */
+export const NETLIFY_IMMUTABLE_ASSET_HEADER_PATH = "/assets/:file";
+
+/**
+ * The immutable policy as one anchored regex under `prefix`, for platforms
+ * whose static route config matches on a regex (Vercel's `src`). A regex can
+ * keep the exact hashed-filename test that a glob has to give up, so an
+ * unhashed file sitting in the same directory is *not* newly covered — the
+ * widening a `_headers` file is forced into is not forced here.
+ *
+ * `prefix` is a literal path segment, escaped rather than interpolated as
+ * pattern syntax.
+ */
+export function immutableAssetPathRegex(prefix: string): string {
+  return `^${escapeRegExp(prefix)}/assets/${IMMUTABLE_ASSET_FILENAME_PATTERN}$`;
+}
+
+function escapeRegExp(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
  * Files under `assets/` that the glob now covers but that no content hash
  * protects. Callers report these; a build that silently pins one for a year is
  * exactly the failure the glob trades away.
  */
 export function collectMutableAssetPaths(rootDir: string): string[] {
   return scanAssetPaths(rootDir).filter((p) => !isImmutableAssetPath(p));
+}
+
+/**
+ * The unhashed files NETLIFY_IMMUTABLE_ASSET_HEADER_PATH actually pins: the
+ * ones directly in `assets/`, not the subdirectories a single-segment
+ * placeholder leaves uncovered. Reporting the wider set would name files that
+ * are not in fact cached for a year.
+ */
+export function collectNetlifyPinnedMutableAssetPaths(
+  rootDir: string,
+): string[] {
+  return collectMutableAssetPaths(rootDir).filter(
+    (assetPath) => !assetPath.slice("/assets/".length).includes("/"),
+  );
 }
 
 export function normalizeBasePath(basePath: string | undefined): string {

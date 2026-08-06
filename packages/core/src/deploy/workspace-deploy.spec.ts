@@ -529,11 +529,10 @@ describe("workspace deploy", () => {
       path.join(tmpDir, "dist", "_headers"),
       "utf-8",
     );
-    expect(headers).toContain("/dispatch/assets/app-aB12_cdE.js");
-    expect(headers).toContain(
-      "/_workspace_static/dispatch/assets/app-aB12_cdE.js",
-    );
-    expect(headers).toContain("/starter/assets/app-aB12_cdE.js");
+    expect(headers).toContain("/dispatch/assets/:file");
+    expect(headers).toContain("/_workspace_static/dispatch/assets/:file");
+    expect(headers).toContain("/starter/assets/:file");
+    expect(headers).not.toContain("app-aB12_cdE.js");
     expect(headers).toContain(
       `cache-control: ${IMMUTABLE_ASSET_CACHE_CONTROL}`,
     );
@@ -750,7 +749,7 @@ describe("workspace deploy", () => {
     expect(config.version).toBe(3);
     expect(config.routes).toContainEqual({ handle: "filesystem" });
     expect(config.routes).toContainEqual({
-      src: "/dispatch/assets/app-aB12_cdE\\.js",
+      src: "^/dispatch/assets/[^/]+-[A-Za-z0-9_-]{8}\\.[a-z0-9]+$",
       headers: {
         "cache-control": IMMUTABLE_ASSET_CACHE_CONTROL,
         "cdn-cache-control": IMMUTABLE_ASSET_CACHE_CONTROL,
@@ -759,7 +758,7 @@ describe("workspace deploy", () => {
       continue: true,
     });
     expect(config.routes).toContainEqual({
-      src: "/starter/assets/app-aB12_cdE\\.js",
+      src: "^/starter/assets/[^/]+-[A-Za-z0-9_-]{8}\\.[a-z0-9]+$",
       headers: {
         "cache-control": IMMUTABLE_ASSET_CACHE_CONTROL,
         "cdn-cache-control": IMMUTABLE_ASSET_CACHE_CONTROL,
@@ -767,9 +766,22 @@ describe("workspace deploy", () => {
       },
       continue: true,
     });
-    expect(config.routes).not.toContainEqual(
-      expect.objectContaining({ src: "/dispatch/assets/app\\.js" }),
+
+    // The regex must still exclude the unhashed sibling in the same directory,
+    // which is what a /assets/ directory glob would newly cover.
+    const dispatchImmutableRoutes = immutableAssetRoutes(config.routes);
+    expect(dispatchImmutableRoutes).toHaveLength(2);
+    for (const route of dispatchImmutableRoutes) {
+      expect(route.src.startsWith("^")).toBe(true);
+    }
+    const dispatchSrc = new RegExp(dispatchImmutableRoutes[0]!.src);
+    expect(dispatchSrc.test("/dispatch/assets/app-aB12_cdE.js")).toBe(true);
+    expect(dispatchSrc.test("/dispatch/assets/app.js")).toBe(false);
+    expect(dispatchSrc.test("/dispatch/assets/logo.svg")).toBe(false);
+    expect(dispatchSrc.test("/dispatch/assets/nested/app-aB12_cdE.js")).toBe(
+      false,
     );
+    expect(dispatchSrc.test("/starter/assets/app-aB12_cdE.js")).toBe(false);
     expect(config.routes).toContainEqual({
       src: "/_agent-native/(.*)",
       dest: "/dispatch-server",
@@ -815,6 +827,148 @@ describe("workspace deploy", () => {
       src: "/starter/(.*)",
       dest: "/starter-server",
     });
+  });
+
+  it("keeps Netlify immutable header blocks bounded as assets scale", async () => {
+    execFile = vi.fn(((_cmd, args) => {
+      if (Array.isArray(args) && args[0] === "--filter") {
+        writeAppBuildOutput(tmpDir, String(args[1]), 400);
+      }
+      return Buffer.from("");
+    }) as typeof execFileSync);
+    makeWorkspaceApp(tmpDir, "dispatch");
+    makeWorkspaceApp(tmpDir, "starter");
+
+    await runWorkspaceDeploy({
+      workspaceRoot: tmpDir,
+      args: ["--preset=netlify", "--build-only"],
+      execFile: execFile as typeof execFileSync,
+    });
+
+    const staticAssets = fs.readdirSync(
+      path.join(tmpDir, "dist", "_workspace_static", "dispatch", "assets"),
+    );
+    expect(staticAssets.length).toBeGreaterThan(400);
+
+    const headers = fs.readFileSync(
+      path.join(tmpDir, "dist", "_headers"),
+      "utf-8",
+    );
+    // Two mount points per app, never one per asset: 800+ hashed files must
+    // still produce the same file a two-asset build does.
+    expect(netlifyHeaderPaths(headers)).toEqual([
+      "/dispatch/assets/:file",
+      "/_workspace_static/dispatch/assets/:file",
+      "/starter/assets/:file",
+      "/_workspace_static/starter/assets/:file",
+    ]);
+  });
+
+  it("names every unhashed file the Netlify glob pins for a year", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    execFile = vi.fn(((_cmd, args) => {
+      if (Array.isArray(args) && args[0] === "--filter") {
+        const app = String(args[1]);
+        writeAppBuildOutput(tmpDir, app);
+        const nested = path.join(
+          tmpDir,
+          "apps",
+          app,
+          "dist",
+          app,
+          "assets",
+          "generated",
+        );
+        fs.mkdirSync(nested, { recursive: true });
+        fs.writeFileSync(path.join(nested, "picture.png"), "");
+      }
+      return Buffer.from("");
+    }) as typeof execFileSync);
+    makeWorkspaceApp(tmpDir, "dispatch");
+
+    try {
+      await runWorkspaceDeploy({
+        workspaceRoot: tmpDir,
+        args: ["--preset=netlify", "--build-only"],
+        execFile: execFile as typeof execFileSync,
+      });
+
+      // Netlify `_headers` has no regex form, so the rule still covers an
+      // unhashed file sitting directly in assets/ and no later block can take
+      // the header back. The build must say which files rather than widen the
+      // policy silently — and must not name a nested file the single-segment
+      // placeholder leaves uncovered.
+      const widened = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes("carry no content hash"));
+      expect(widened).toHaveLength(1);
+      expect(widened[0]).toContain("dispatch: 1 file(s)");
+      expect(widened[0]).toContain("/assets/app.js");
+      expect(widened[0]).not.toContain("picture.png");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps Vercel immutable header routes bounded as assets scale", async () => {
+    execFile = vi.fn(((_cmd, args) => {
+      if (Array.isArray(args) && args[0] === "--filter") {
+        writeVercelAppBuildOutput(tmpDir, String(args[1]), 400);
+      }
+      return Buffer.from("");
+    }) as typeof execFileSync);
+    makeWorkspaceApp(tmpDir, "dispatch");
+    makeWorkspaceApp(tmpDir, "starter");
+
+    await runWorkspaceDeploy({
+      workspaceRoot: tmpDir,
+      args: ["--preset=vercel", "--build-only"],
+      execFile: execFile as typeof execFileSync,
+    });
+
+    const staticAssets = fs.readdirSync(
+      path.join(tmpDir, ".vercel", "output", "static", "dispatch", "assets"),
+    );
+    expect(staticAssets.length).toBeGreaterThan(400);
+
+    const config = JSON.parse(
+      fs.readFileSync(
+        path.join(tmpDir, ".vercel", "output", "config.json"),
+        "utf-8",
+      ),
+    );
+    expect(
+      immutableAssetRoutes(config.routes).map((route) => route.src),
+    ).toEqual([
+      "^/dispatch/assets/[^/]+-[A-Za-z0-9_-]{8}\\.[a-z0-9]+$",
+      "^/starter/assets/[^/]+-[A-Za-z0-9_-]{8}\\.[a-z0-9]+$",
+    ]);
+  });
+
+  it("emits no immutable header config for an app with no hashed assets", async () => {
+    execFile = vi.fn(((_cmd, args) => {
+      if (Array.isArray(args) && args[0] === "--filter") {
+        writeVercelAppBuildOutput(tmpDir, String(args[1]), 0, {
+          hashedAsset: false,
+        });
+      }
+      return Buffer.from("");
+    }) as typeof execFileSync);
+    makeWorkspaceApp(tmpDir, "dispatch");
+
+    await runWorkspaceDeploy({
+      workspaceRoot: tmpDir,
+      args: ["--preset=vercel", "--build-only"],
+      execFile: execFile as typeof execFileSync,
+    });
+
+    const config = JSON.parse(
+      fs.readFileSync(
+        path.join(tmpDir, ".vercel", "output", "config.json"),
+        "utf-8",
+      ),
+    );
+    expect(immutableAssetRoutes(config.routes)).toEqual([]);
   });
 
   it("allows local build-only deploy checks without A2A_SECRET", async () => {
@@ -1379,6 +1533,31 @@ describe("durable-background Netlify function emit (workspace, flag-gated)", () 
   });
 });
 
+function immutableAssetRoutes(
+  routes: Array<Record<string, any>>,
+): Array<{ src: string }> {
+  return routes.filter(
+    (route) =>
+      route.headers?.["cache-control"] === IMMUTABLE_ASSET_CACHE_CONTROL,
+  ) as Array<{ src: string }>;
+}
+
+function netlifyHeaderPaths(headers: string): string[] {
+  return headers
+    .split("\n")
+    .filter((line) => line.startsWith("/"))
+    .map((line) => line.trim());
+}
+
+function writeBulkHashedAssets(assetsDir: string, count: number): void {
+  for (let i = 0; i < count; i += 1) {
+    fs.writeFileSync(
+      path.join(assetsDir, `bulk${i}-aB12_cdE.js`),
+      "export {};",
+    );
+  }
+}
+
 function makeWorkspaceApp(
   workspaceRoot: string,
   app: string,
@@ -1418,9 +1597,17 @@ function makeWorkspaceApp(
   }
 }
 
-function writeAppBuildOutput(workspaceRoot: string, app: string): void {
+function writeAppBuildOutput(
+  workspaceRoot: string,
+  app: string,
+  bulkHashedAssets = 0,
+): void {
   const appDir = path.join(workspaceRoot, "apps", app);
   fs.mkdirSync(path.join(appDir, "dist", app, "assets"), { recursive: true });
+  writeBulkHashedAssets(
+    path.join(appDir, "dist", app, "assets"),
+    bulkHashedAssets,
+  );
   fs.mkdirSync(path.join(appDir, ".netlify", "functions-internal", "server"), {
     recursive: true,
   });
@@ -1468,7 +1655,12 @@ function writeAppBuildOutput(workspaceRoot: string, app: string): void {
   );
 }
 
-function writeVercelAppBuildOutput(workspaceRoot: string, app: string): void {
+function writeVercelAppBuildOutput(
+  workspaceRoot: string,
+  app: string,
+  bulkHashedAssets = 0,
+  opts: { hashedAsset?: boolean } = {},
+): void {
   const appDir = path.join(workspaceRoot, "apps", app);
   const staticDir = path.join(appDir, ".vercel", "output", "static", app);
   const functionDir = path.join(
@@ -1480,11 +1672,14 @@ function writeVercelAppBuildOutput(workspaceRoot: string, app: string): void {
   );
   fs.mkdirSync(path.join(staticDir, "assets"), { recursive: true });
   fs.mkdirSync(functionDir, { recursive: true });
+  writeBulkHashedAssets(path.join(staticDir, "assets"), bulkHashedAssets);
   fs.writeFileSync(path.join(staticDir, "assets", "app.js"), "export {};");
-  fs.writeFileSync(
-    path.join(staticDir, "assets", "app-aB12_cdE.js"),
-    "export {};",
-  );
+  if (opts.hashedAsset !== false) {
+    fs.writeFileSync(
+      path.join(staticDir, "assets", "app-aB12_cdE.js"),
+      "export {};",
+    );
+  }
   fs.writeFileSync(path.join(staticDir, "favicon.ico"), "");
   fs.writeFileSync(path.join(staticDir, "favicon.svg"), "<svg></svg>");
   fs.writeFileSync(path.join(staticDir, "manifest.json"), "{}");
