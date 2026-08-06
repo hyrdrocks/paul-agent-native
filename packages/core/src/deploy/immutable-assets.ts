@@ -19,9 +19,39 @@ export function isImmutableAssetPath(pathname: string): boolean {
   // Vite emits content-hashed production chunks under /assets/. Those URLs are
   // stable forever because any content change produces a new filename, so they
   // should be cached for a year at both the browser and CDN layer. Keep this
-  // exact hashed-file check; broad /assets/* immutable caching would pin
-  // manually named files like logo.png that templates may replace in place.
+  // exact hashed-file check wherever a header is decided per request; broad
+  // /assets/* immutable caching would pin manually named files like logo.png
+  // that templates may replace in place. Static header *files* cannot afford
+  // that precision — see IMMUTABLE_ASSET_ROUTE_GLOB.
   return IMMUTABLE_ASSET_PATH_RE.test(pathname);
+}
+
+/**
+ * The single route rule that carries the immutable policy into generated
+ * static header files (`_headers`).
+ *
+ * Cloudflare rejects a `_headers` file with more than 100 rules, and Nitro
+ * writes one rule per route rule, so enumerating each hashed asset fails
+ * `wrangler deploy` on any real app — `wrangler dev` only warns, which is how
+ * an over-limit file reaches a deploy unnoticed. A glob is the only shape that
+ * stays inside the cap at any asset count, and content hashing is what makes
+ * it safe: the filename changes when the bytes do.
+ *
+ * It is wider than `isImmutableAssetPath`: files a template ships under
+ * `public/assets/` are covered too, and no narrower rule can take that back —
+ * every matching `_headers` rule applies and duplicate header names are
+ * comma-joined rather than overridden. Ship static files that are replaced in
+ * place outside `/assets/`.
+ */
+export const IMMUTABLE_ASSET_ROUTE_GLOB = "/assets/**";
+
+/**
+ * Files under `assets/` that the glob now covers but that no content hash
+ * protects. Callers report these; a build that silently pins one for a year is
+ * exactly the failure the glob trades away.
+ */
+export function collectMutableAssetPaths(rootDir: string): string[] {
+  return scanAssetPaths(rootDir).filter((p) => !isImmutableAssetPath(p));
 }
 
 export function normalizeBasePath(basePath: string | undefined): string {
@@ -40,7 +70,15 @@ export function prefixAssetPath(
   return `${base}${pathname}`;
 }
 
+export function hasAssetsDir(rootDir: string): boolean {
+  return fs.existsSync(path.join(rootDir, "assets"));
+}
+
 export function collectImmutableAssetPaths(rootDir: string): string[] {
+  return scanAssetPaths(rootDir).filter(isImmutableAssetPath);
+}
+
+function scanAssetPaths(rootDir: string): string[] {
   const assetsDir = path.join(rootDir, "assets");
   if (!fs.existsSync(assetsDir)) return [];
 
@@ -55,8 +93,7 @@ export function collectImmutableAssetPaths(rootDir: string): string[] {
       }
       if (!entry.isFile()) continue;
 
-      const assetPath = `/assets/${relPath}`;
-      if (isImmutableAssetPath(assetPath)) paths.push(assetPath);
+      paths.push(`/assets/${relPath}`);
     }
   };
 

@@ -1983,8 +1983,7 @@ describe("runNitroBuildPipeline", () => {
       hooks: {
         prepare: async () => {
           calls.push("prepare");
-          routeRuleAtPrepare =
-            nitro.options.routeRules?.["/assets/entry.client-aB12_cdE.js"];
+          routeRuleAtPrepare = nitro.options.routeRules?.["/assets/**"];
         },
         copyPublicAssets: async () => {
           calls.push("copyPublicAssets");
@@ -2042,7 +2041,7 @@ describe("runNitroBuildPipeline", () => {
     ).toBe(true);
   });
 
-  it("adds exact immutable route rules for copied hashed client assets", async () => {
+  it("adds one immutable route rule per mount point for copied client assets", async () => {
     const { cwd, clientDir, publicOutputDir } = setupFixture();
     const nitro: any = {
       options: { output: { publicDir: publicOutputDir } },
@@ -2062,29 +2061,73 @@ describe("runNitroBuildPipeline", () => {
     });
 
     expect(
-      nitro.options.routeRules["/assets/entry.client-aB12_cdE.js"].headers[
-        "cache-control"
-      ],
+      nitro.options.routeRules["/assets/**"].headers["cache-control"],
     ).toBe(IMMUTABLE_ASSET_CACHE_CONTROL);
     expect(
-      nitro.options.routeRules["/docs/assets/entry.client-aB12_cdE.js"].headers[
-        "cdn-cache-control"
-      ],
+      nitro.options.routeRules["/docs/assets/**"].headers["cdn-cache-control"],
     ).toBe(IMMUTABLE_ASSET_CACHE_CONTROL);
     expect(
-      nitro.options.routeRules["/docs/assets/entry.client-aB12_cdE.js"].headers[
+      nitro.options.routeRules["/docs/assets/**"].headers[
         "netlify-cdn-cache-control"
       ],
     ).toBe(IMMUTABLE_ASSET_CACHE_CONTROL);
-    expect(nitro.options.routeRules["/assets/logo.png"]).toBeUndefined();
+    // No per-asset rule: Nitro writes one `_headers` line per route rule and
+    // Cloudflare rejects that file past 100 rules.
     expect(
-      nitro.options.routeRules["/assets/entry.client-abc.js"],
+      nitro.options.routeRules["/assets/entry.client-aB12_cdE.js"],
     ).toBeUndefined();
+    expect(Object.keys(nitro.options.routeRules)).toHaveLength(2);
   });
 
-  it("merges immutable headers into existing route rules", () => {
+  it("keeps the immutable rule count fixed as the asset count grows", () => {
+    const { clientDir } = setupFixture();
+    for (let i = 0; i < 500; i++) {
+      fs.writeFileSync(
+        path.join(
+          clientDir,
+          "assets",
+          `chunk-${String(i).padStart(4, "0")}-aB12_cdE.js`,
+        ),
+        "x",
+      );
+    }
+
+    const routeRules: Record<string, { headers?: Record<string, string> }> = {};
+    addImmutableAssetRouteRulesForClientBuild(routeRules, clientDir, "/docs");
+
+    expect(Object.keys(routeRules).sort()).toEqual([
+      "/assets/**",
+      "/docs/assets/**",
+    ]);
+  });
+
+  it("emits no immutable rule when the client build has no assets directory", () => {
+    const { cwd } = setupFixture();
+    const emptyClientDir = path.join(cwd, "build", "no-client");
+    fs.mkdirSync(emptyClientDir, { recursive: true });
+
+    const routeRules: Record<string, { headers?: Record<string, string> }> = {};
+    addImmutableAssetRouteRulesForClientBuild(routeRules, emptyClientDir);
+
+    expect(routeRules).toEqual({});
+  });
+
+  it("reports the non-hashed files the glob now covers", () => {
+    const { clientDir } = setupFixture();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    addImmutableAssetRouteRulesForClientBuild({}, clientDir);
+
+    const message = warn.mock.calls.map(([m]) => String(m)).join("\n");
+    expect(message).toContain("/assets/logo.png");
+    expect(message).toContain("/assets/entry.client-abc.js");
+    expect(message).not.toContain("/assets/entry.client-aB12_cdE.js");
+    warn.mockRestore();
+  });
+
+  it("merges immutable headers into an existing route rule", () => {
     const routeRules: Record<string, { headers?: Record<string, string> }> = {
-      "/assets/entry.client-aB12_cdE.js": {
+      "/assets/**": {
         headers: { "cross-origin-resource-policy": "cross-origin" },
       },
     };
@@ -2092,9 +2135,7 @@ describe("runNitroBuildPipeline", () => {
 
     addImmutableAssetRouteRulesForClientBuild(routeRules, clientDir);
 
-    expect(
-      routeRules["/assets/entry.client-aB12_cdE.js"].headers,
-    ).toMatchObject({
+    expect(routeRules["/assets/**"].headers).toMatchObject({
       "cross-origin-resource-policy": "cross-origin",
       "cache-control": IMMUTABLE_ASSET_CACHE_CONTROL,
       "cdn-cache-control": IMMUTABLE_ASSET_CACHE_CONTROL,
