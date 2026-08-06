@@ -31,6 +31,8 @@ vi.mock("../db/client.js", () => {
     getDbExec: () => sharedClient,
     isPostgres: () => false,
     getDialect: () => "sqlite",
+    isPlatformBoundDialect: () => false,
+    getDialectLabel: () => "SQLite (local file)",
     retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
   };
 });

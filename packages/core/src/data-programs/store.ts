@@ -19,6 +19,7 @@ import {
   ensureIndexExists,
   ensureColumnExists,
 } from "../db/ddl-guard.js";
+import { createInitMemo, type InitMemo } from "../db/init-memo.js";
 import { accessFilter, type AccessContext } from "../sharing/access.js";
 import { registerShareableResource } from "../sharing/registry.js";
 import {
@@ -54,8 +55,6 @@ const getDb = createGetDb({ dataPrograms, dataProgramShares });
 // Boot DDL
 // ---------------------------------------------------------------------------
 
-let _initPromise: Promise<void> | undefined;
-
 function isDuplicateColumnError(err: unknown): boolean {
   const code = String((err as { code?: unknown })?.code ?? "");
   const message = String((err as { message?: unknown })?.message ?? err)
@@ -79,71 +78,72 @@ async function ensureSqliteDataProgramRunsColumns(): Promise<void> {
   }
 }
 
-export async function ensureDataProgramTables(): Promise<void> {
-  if (!_initPromise) {
-    _initPromise = (async () => {
-      const client = getDbExec();
-      const pg = isPostgres();
-      const integerType = intType();
-      const runsCreateSql = dataProgramRunsCreateSql(integerType);
+async function initDataProgramTables(): Promise<void> {
+  const client = getDbExec();
+  const pg = isPostgres();
+  const integerType = intType();
+  const runsCreateSql = dataProgramRunsCreateSql(integerType);
 
-      if (pg) {
-        // PG guard: probe via information_schema, only issue DDL if missing,
-        // bounded lock_timeout — see ../db/ddl-guard.js.
-        await ensureTableExists("data_programs", DATA_PROGRAMS_CREATE_SQL_PG);
-        await ensureTableExists(
-          "data_program_shares",
-          DATA_PROGRAM_SHARES_CREATE_SQL_PG,
-        );
-        await ensureTableExists("data_program_runs", runsCreateSql);
-        await ensureColumnExists(
-          "data_program_runs",
-          "truncated",
-          DATA_PROGRAM_RUNS_TRUNCATED_COLUMN_SQL,
-        );
-        await ensureIndexExists(
-          "data_programs_app_owner_idx",
-          DATA_PROGRAMS_APP_OWNER_INDEX_SQL,
-        );
-        await ensureIndexExists(
-          "data_programs_app_name_idx",
-          DATA_PROGRAMS_APP_NAME_INDEX_SQL,
-        );
-        await ensureIndexExists(
-          "data_program_shares_resource_idx",
-          DATA_PROGRAM_SHARES_RESOURCE_INDEX_SQL,
-        );
-        await ensureIndexExists(
-          "data_program_runs_lookup_idx",
-          DATA_PROGRAM_RUNS_LOOKUP_INDEX_SQL,
-        );
-        return;
-      }
-
-      // SQLite (local dev): plain create-then-catch, matching staged-datasets-store.ts.
-      await client.execute(DATA_PROGRAMS_CREATE_SQL);
-      await client.execute(DATA_PROGRAM_SHARES_CREATE_SQL);
-      await client.execute(runsCreateSql);
-      await ensureSqliteDataProgramRunsColumns();
-      for (const ddl of [
-        DATA_PROGRAMS_APP_OWNER_INDEX_SQL,
-        DATA_PROGRAMS_APP_NAME_INDEX_SQL,
-        DATA_PROGRAM_SHARES_RESOURCE_INDEX_SQL,
-        DATA_PROGRAM_RUNS_LOOKUP_INDEX_SQL,
-      ]) {
-        try {
-          await client.execute(ddl);
-        } catch {
-          // Index already exists — harmless.
-        }
-      }
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
+  if (pg) {
+    // PG guard: probe via information_schema, only issue DDL if missing,
+    // bounded lock_timeout — see ../db/ddl-guard.js.
+    await ensureTableExists("data_programs", DATA_PROGRAMS_CREATE_SQL_PG);
+    await ensureTableExists(
+      "data_program_shares",
+      DATA_PROGRAM_SHARES_CREATE_SQL_PG,
+    );
+    await ensureTableExists("data_program_runs", runsCreateSql);
+    await ensureColumnExists(
+      "data_program_runs",
+      "truncated",
+      DATA_PROGRAM_RUNS_TRUNCATED_COLUMN_SQL,
+    );
+    await ensureIndexExists(
+      "data_programs_app_owner_idx",
+      DATA_PROGRAMS_APP_OWNER_INDEX_SQL,
+    );
+    await ensureIndexExists(
+      "data_programs_app_name_idx",
+      DATA_PROGRAMS_APP_NAME_INDEX_SQL,
+    );
+    await ensureIndexExists(
+      "data_program_shares_resource_idx",
+      DATA_PROGRAM_SHARES_RESOURCE_INDEX_SQL,
+    );
+    await ensureIndexExists(
+      "data_program_runs_lookup_idx",
+      DATA_PROGRAM_RUNS_LOOKUP_INDEX_SQL,
+    );
+    return;
   }
-  return _initPromise;
+
+  // SQLite (local dev): plain create-then-catch, matching staged-datasets-store.ts.
+  await client.execute(DATA_PROGRAMS_CREATE_SQL);
+  await client.execute(DATA_PROGRAM_SHARES_CREATE_SQL);
+  await client.execute(runsCreateSql);
+  await ensureSqliteDataProgramRunsColumns();
+  for (const ddl of [
+    DATA_PROGRAMS_APP_OWNER_INDEX_SQL,
+    DATA_PROGRAMS_APP_NAME_INDEX_SQL,
+    DATA_PROGRAM_SHARES_RESOURCE_INDEX_SQL,
+    DATA_PROGRAM_RUNS_LOOKUP_INDEX_SQL,
+  ]) {
+    try {
+      await client.execute(ddl);
+    } catch {
+      // coercion-ok: pre-existing idempotent DDL swallow; only reindented here.
+      // Index already exists — harmless.
+    }
+  }
 }
+
+// Wrapped rather than restructured: the memo is what keeps a request that ends
+// mid-init from leaving behind a promise later callers await forever. It also
+// takes the h3 event of the request that starts the work, which is the only
+// thing that can hold that work open — see `createInitMemo`.
+export const ensureDataProgramTables: InitMemo = createInitMemo(
+  initDataProgramTables,
+);
 
 export function registerDataProgramsShareable(): void {
   registerShareableResource({
@@ -165,7 +165,7 @@ export function registerDataProgramsShareable(): void {
 
 /** Test-only: reset the memoized init promise. */
 export function _resetDataProgramInitPromiseForTests(): void {
-  _initPromise = undefined;
+  ensureDataProgramTables.reset();
 }
 
 // ---------------------------------------------------------------------------

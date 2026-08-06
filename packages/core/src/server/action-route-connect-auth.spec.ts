@@ -77,6 +77,9 @@ async function buildOwnerResolver() {
 function mockEmptyDb() {
   const execute = vi.fn().mockResolvedValue({ rows: [] });
   vi.doMock("../db/client.js", () => ({
+    getDialect: () => "sqlite",
+    isPlatformBoundDialect: () => false,
+    getDialectLabel: () => "SQLite (local file)",
     getDbExec: () => ({ execute }),
     isPostgres: () => false,
     isLocalDatabase: () => true,

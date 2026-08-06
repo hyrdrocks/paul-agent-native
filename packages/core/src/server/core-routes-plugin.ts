@@ -1386,9 +1386,6 @@ export function createCoreRoutesPlugin(
       try {
         const { createObservabilityHandler } =
           await import("../observability/routes.js");
-        const { ensureObservabilityTables } =
-          await import("../observability/store.js");
-        ensureObservabilityTables().catch(() => {});
         getH3App(nitroApp).use(
           `${FRAMEWORK_ROUTE_PREFIX}/observability`,
           createObservabilityHandler(),
@@ -1399,13 +1396,12 @@ export function createCoreRoutesPlugin(
 
       // Audit log — durable, append-only record of who mutated what app data,
       // when, and (for the agent) in which run. Capture is automatic at the
-      // action seam; here we just ensure the table exists and start the
-      // retention purge. Best-effort so a missing DB never crashes boot.
+      // action seam; here we just start the retention purge. The store creates
+      // its tables lazily on first use. Best-effort so a missing DB never
+      // crashes boot.
       try {
-        const { ensureAuditTables } = await import("../audit/store.js");
         const { startAuditCleanupJob } =
           await import("../audit/cleanup-job.js");
-        ensureAuditTables().catch(() => {});
         startAuditCleanupJob();
       } catch {
         // Audit module not available — skip
@@ -3850,11 +3846,10 @@ export function createCoreRoutesPlugin(
 
       // ─── Extensions (sandboxed mini-app runtime + proxy) ────────────────
       try {
-        const { ensureExtensionsTables, registerExtensionsShareable } =
+        const { registerExtensionsShareable } =
           await import("../extensions/store.js");
         const { createExtensionsHandler } =
           await import("../extensions/routes.js");
-        ensureExtensionsTables().catch(() => {});
         registerExtensionsShareable();
         const extensionsHandler = createExtensionsHandler({
           extensionTools: options.extensionTools,
@@ -3866,11 +3861,8 @@ export function createCoreRoutesPlugin(
         getH3App(nitroApp).use(`${P}/tools`, extensionsHandler);
 
         // Extension-point slots — sub-system of extensions.
-        const { ensureSlotTables } =
-          await import("../extensions/slots/store.js");
         const { createSlotsHandler } =
           await import("../extensions/slots/routes.js");
-        ensureSlotTables().catch(() => {});
         getH3App(nitroApp).use(`${P}/slots`, createSlotsHandler());
       } catch {
         // Extensions module not available — skip
@@ -3878,9 +3870,8 @@ export function createCoreRoutesPlugin(
 
       // ─── Data programs (stored server-side JS scripts + run cache) ─────
       try {
-        const { ensureDataProgramTables, registerDataProgramsShareable } =
+        const { registerDataProgramsShareable } =
           await import("../data-programs/store.js");
-        ensureDataProgramTables().catch(() => {});
         registerDataProgramsShareable();
       } catch {
         // Data programs module not available — skip

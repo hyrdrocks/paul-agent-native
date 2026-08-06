@@ -1,9 +1,9 @@
 import {
   getDbExec,
-  getDialect,
   isLocalDatabase,
   isPostgres,
   intType,
+  supportsInteractiveTransactions,
   type DbExec,
 } from "../db/client.js";
 import { ensureIndexExists, ensureTableExists } from "../db/ddl-guard.js";
@@ -284,7 +284,13 @@ function buildAppStateCompareAndSetStatement(
   };
 }
 
-function buildD1CompareAndSetGuard(
+/**
+ * A statement that fails the surrounding batch when `operation`'s expectation
+ * no longer holds. Without an interactive transaction there is no way to read a
+ * row and abort mid-batch, so the abort is expressed as a deliberate primary
+ * key collision on the batch's own guard row.
+ */
+function buildCompareAndSetGuardStatement(
   sessionId: string,
   guardKey: string,
   operation: AppStateCompareAndSetOperation,
@@ -310,7 +316,14 @@ function buildD1CompareAndSetGuard(
   };
 }
 
-function isD1CompareAndSetMismatch(error: unknown): boolean {
+/**
+ * The guard row's primary-key violation, as the driver words it. This text is
+ * driver-specific, not portable: a batching dialect that reports a unique
+ * violation differently falls through and rethrows, surfacing the failure
+ * rather than reporting a mismatch that did not happen. Widen the match before
+ * adding such a dialect.
+ */
+function isCompareAndSetGuardCollision(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /unique constraint failed:\s*application_state\.session_id,\s*application_state\.key/i.test(
     message,
@@ -352,10 +365,11 @@ export async function appStateCompareAndSetMany(
 
   await ensureTable();
   const client = getDbExec();
-  if (getDialect() === "d1") {
+  if (!supportsInteractiveTransactions()) {
     if (!client.atomicBatch) {
       throw new Error(
-        "D1 application-state CAS requires atomic batch support.",
+        "Application state multi-key CAS requires atomic batch support on a " +
+          "dialect without interactive transactions.",
       );
     }
     const guardKey = `__agent_native_cas_guard__:${Date.now()}:${Math.random().toString(36).slice(2)}`;
@@ -364,7 +378,7 @@ export async function appStateCompareAndSetMany(
       args: [sessionId, guardKey, Date.now()],
     };
     const guards = orderedOperations.map((operation) =>
-      buildD1CompareAndSetGuard(sessionId, guardKey, operation),
+      buildCompareAndSetGuardStatement(sessionId, guardKey, operation),
     );
     const mutations = orderedOperations.map((operation) =>
       buildAppStateCompareAndSetStatement(
@@ -386,7 +400,7 @@ export async function appStateCompareAndSetMany(
         },
       ]);
     } catch (error) {
-      if (isD1CompareAndSetMismatch(error)) return false;
+      if (isCompareAndSetGuardCollision(error)) return false;
       throw error;
     }
     const mutationResults = results.slice(
@@ -398,7 +412,7 @@ export async function appStateCompareAndSetMany(
       mutationResults.some((result) => result.rowsAffected !== 1)
     ) {
       throw new Error(
-        "D1 application-state CAS completed without applying every mutation.",
+        "Batched application-state CAS completed without applying every mutation.",
       );
     }
   } else {

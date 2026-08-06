@@ -35,6 +35,7 @@ import {
   getObservabilityOverview,
   getTraceSummaries,
   getTraceSummary,
+  ensureObservabilityTables,
   getTraceSpansForRun,
   getEvalsForRun,
   insertFeedback,
@@ -103,6 +104,10 @@ function parseLimit(q: Record<string, any>, fallback = 100): number {
 
 export function createObservabilityHandler() {
   return defineEventHandler(async (event: H3Event) => {
+    // Pass the event: on a runtime that cancels a promise when its creating
+    // request answers, only this request's own keep-alive can hold the init
+    // open for the callers polling it.
+    await ensureObservabilityTables(event);
     const rawMethod = getMethod(event);
     const method = rawMethod === "HEAD" ? "GET" : rawMethod;
     const pathname = (event.url?.pathname || "")

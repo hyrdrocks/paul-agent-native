@@ -25,6 +25,7 @@ import { readBody } from "../../server/h3-helpers.js";
 import { recordChange } from "../../server/poll.js";
 import { runWithRequestContext } from "../../server/request-context.js";
 import {
+  ensureSlotTables,
   addExtensionSlotTarget,
   removeExtensionSlotTarget,
   listSlotsForExtension,
@@ -36,6 +37,10 @@ import {
 
 export function createSlotsHandler() {
   return defineEventHandler(async (event: H3Event) => {
+    // Pass the event: on a runtime that cancels a promise when its creating
+    // request answers, only this request's own keep-alive can hold the init
+    // open for the callers polling it.
+    await ensureSlotTables(event);
     const method = getMethod(event);
     const pathname = (event.url?.pathname || "")
       .replace(/^\/+/, "")

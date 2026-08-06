@@ -202,7 +202,55 @@ export function patchCloudflareModuleNitroEntry(code: string): string {
   return patched;
 }
 
-export function configureCloudflareModuleWorkerOutput(serverDir: string): void {
+/**
+ * The D1 binding name the database layer reads. `getCloudflareD1Binding()`
+ * looks at `env.DB` and nothing else, so this is fixed rather than
+ * configurable — a renameable binding would be configuration no reader honours.
+ */
+export const CLOUDFLARE_D1_BINDING_NAME = "DB";
+
+export interface CloudflareD1BindingConfig {
+  binding: string;
+  database_name: string;
+  database_id: string;
+}
+
+/**
+ * Resolve the Worker's D1 binding from the build environment.
+ *
+ * Absent means "this Worker uses an external DATABASE_URL" — emitting a
+ * binding with a placeholder id would break its deploy. Half-configured
+ * throws: a dropped binding leaves the Worker resolving the SQLite dialect and
+ * hitting the fail-closed `better-sqlite3` stub at the first query, which reads
+ * as a missing native module rather than as missing configuration.
+ */
+export function resolveCloudflareD1Binding(
+  env: NodeJS.ProcessEnv = process.env,
+): CloudflareD1BindingConfig | null {
+  const databaseName = env.CLOUDFLARE_D1_DATABASE_NAME?.trim();
+  const databaseId = env.CLOUDFLARE_D1_DATABASE_ID?.trim();
+  if (!databaseName && !databaseId) return null;
+  if (!databaseName) {
+    throw new Error(
+      "[deploy] CLOUDFLARE_D1_DATABASE_ID is set without CLOUDFLARE_D1_DATABASE_NAME — set both to bind D1, or neither to use DATABASE_URL",
+    );
+  }
+  if (!databaseId) {
+    throw new Error(
+      "[deploy] CLOUDFLARE_D1_DATABASE_NAME is set without CLOUDFLARE_D1_DATABASE_ID — set both to bind D1, or neither to use DATABASE_URL",
+    );
+  }
+  return {
+    binding: CLOUDFLARE_D1_BINDING_NAME,
+    database_name: databaseName,
+    database_id: databaseId,
+  };
+}
+
+export function configureCloudflareModuleWorkerOutput(
+  serverDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
   const configPath = path.join(serverDir, "wrangler.json");
   if (!fs.existsSync(configPath)) {
     throw new Error(
@@ -230,6 +278,16 @@ export function configureCloudflareModuleWorkerOutput(serverDir: string): void {
   config.compatibility_flags = [
     ...new Set([...compatibilityFlags, "nodejs_compat"]),
   ];
+  const d1Binding = resolveCloudflareD1Binding(env);
+  if (d1Binding) {
+    const existing = Array.isArray(config.d1_databases)
+      ? (config.d1_databases as CloudflareD1BindingConfig[])
+      : [];
+    config.d1_databases = [
+      ...existing.filter((entry) => entry?.binding !== d1Binding.binding),
+      d1Binding,
+    ];
+  }
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
   fs.writeFileSync(
     nitroEntryPath,
@@ -377,6 +435,51 @@ export const CLOUDFLARE_WORKER_STUB_SUBPATH_MODULES: Record<string, string> = {
     "",
   ].join("\n"),
 };
+
+/**
+ * Native packages that survive as bare specifiers inside already-emitted
+ * `_libs/` bundles, past the point where a Rolldown plugin can intercept
+ * them. They are rewritten to a generated sibling stub instead.
+ */
+export const CLOUDFLARE_UNRESOLVED_NATIVE_STUBS = [
+  "better-sqlite3",
+  "node-pty",
+  "cron-parser",
+] as const;
+
+/**
+ * Source for those generated sibling stubs.
+ *
+ * These are reached at runtime, not only during linking: a Worker that got
+ * here has a caller holding a live reference. An empty object plus a no-op
+ * `watch()` would let that caller read "no rows", "no terminal", "no next
+ * run" and carry on, which is indistinguishable from the capability working
+ * and finding nothing.
+ */
+export function cloudflareUnresolvedNativeStubSource(
+  moduleName: string,
+): string {
+  return [
+    // A function declaration, not an arrow: a caller reaching this through
+    // `new mod.Database()` must land in the body and see the real reason,
+    // not a bare "is not a constructor" from the engine.
+    `function unavailable() { throw new Error(${JSON.stringify(
+      `${moduleName} is unavailable in Cloudflare Workers`,
+    )}); }`,
+    "export const watch = unavailable;",
+    "export const parseExpression = unavailable;",
+    "export default new Proxy(function () { unavailable(); }, {",
+    "  get(_target, property) {",
+    "    if (property === Symbol.toPrimitive) return unavailable;",
+    "    if (property === 'then') return undefined;",
+    "    return unavailable;",
+    "  },",
+    "  apply: unavailable,",
+    "  construct: unavailable,",
+    "});",
+    "",
+  ].join("\n");
+}
 
 export function cloudflareWorkerStubAliasArgs(stubDir: string): string[] {
   const subpathAliases = Object.keys(CLOUDFLARE_WORKER_STUB_SUBPATH_MODULES)
@@ -4496,8 +4599,7 @@ export default bundle;
       "_libs",
     );
     if (fs.existsSync(libsDir2)) {
-      const NATIVE_STUBS = ["better-sqlite3", "node-pty", "cron-parser"];
-      for (const mod of NATIVE_STUBS) {
+      for (const mod of CLOUDFLARE_UNRESOLVED_NATIVE_STUBS) {
         const libFiles = fs
           .readdirSync(libsDir2)
           .filter((f) => f.endsWith(".mjs"));
@@ -4515,10 +4617,7 @@ export default bundle;
         const stubName = mod.replace(/[/@]/g, "__") + ".mjs";
         const stubPath = path.join(libsDir2, stubName);
         if (!fs.existsSync(stubPath)) {
-          fs.writeFileSync(
-            stubPath,
-            `export default {}; export const watch = () => ({ close() {} });\n`,
-          );
+          fs.writeFileSync(stubPath, cloudflareUnresolvedNativeStubSource(mod));
           console.log(`[deploy] Created stub for _libs/${stubName}`);
         }
 

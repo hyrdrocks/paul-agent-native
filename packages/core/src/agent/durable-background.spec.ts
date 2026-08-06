@@ -7,6 +7,7 @@ import {
   AGENT_CHAT_PROCESS_RUN_PATH,
   AGENT_CHAT_BACKGROUND_RUN_FIELD,
   BACKGROUND_FUNCTION_UNREACHABLE_NOTICE_KEY,
+  WORKERS_INLINE_DURABLE_BACKGROUND_NOTICE_KEY,
   backgroundRuntimeDiagnosticDetail,
   backgroundRunMarkerExpectsBackgroundRuntime,
   dispatchPathTargetsNetlifyBackgroundFunction,
@@ -16,6 +17,8 @@ import {
   isHostedRuntimeForDurableBackground,
   isNetlifyHostedRuntimeForDurableBackground,
   isInBackgroundFunctionRuntime,
+  isInBackgroundInvocationScope,
+  runInBackgroundInvocationScope,
   prepareProcessRunRequest,
   resolveAgentChatProcessRunDispatchPath,
   resolveDurableBackgroundDispatchPath,
@@ -68,7 +71,21 @@ afterEach(() => {
     globalThis as Record<string, unknown>,
     BACKGROUND_FUNCTION_UNREACHABLE_NOTICE_KEY,
   );
+  Reflect.deleteProperty(globalThis as Record<string, unknown>, "__cf_env");
+  Reflect.deleteProperty(
+    globalThis as Record<string, unknown>,
+    WORKERS_INLINE_DURABLE_BACKGROUND_NOTICE_KEY,
+  );
 });
+
+/**
+ * Mark the runtime as the Cloudflare Worker runtime. `__cf_env` is what
+ * `isCloudflareRuntime()` reads, and it is present under `wrangler dev` exactly
+ * as it is on a deployed Worker — which is the whole point of the case below.
+ */
+function makeCloudflareWorkersRuntime() {
+  (globalThis as Record<string, unknown>).__cf_env = {};
+}
 
 /** Mark the runtime as hosted (Netlify, not local). */
 function makeHosted() {
@@ -210,6 +227,187 @@ describe("isAgentChatDurableBackgroundEnabled (Netlify default-on gate)", () => 
     process.env.NETLIFY = "false";
     expect(isHostedRuntimeForDurableBackground()).toBe(false);
     expect(isAgentChatDurableBackgroundEnabled()).toBe(false);
+  });
+});
+
+describe("Cloudflare Workers counts as a hosted runtime", () => {
+  it("is hosted on the Workers runtime with no Netlify/AWS env at all", () => {
+    makeCloudflareWorkersRuntime();
+    expect(isHostedRuntimeForDurableBackground()).toBe(true);
+  });
+
+  it("is hosted in the LOCAL Worker runtime — there is no local carve-out here", () => {
+    // `wrangler dev` runs the real Worker runtime under the same constraints,
+    // so unlike NETLIFY_LOCAL (a Node server) there is nothing to carve out.
+    makeCloudflareWorkersRuntime();
+    process.env.A2A_SECRET = "shhh";
+    expect(isHostedRuntimeForDurableBackground()).toBe(true);
+    expect(isAgentChatDurableBackgroundEnabled()).toBe(true);
+  });
+
+  it("opens the durable gate by default on Workers, like deployed Netlify", () => {
+    makeCloudflareWorkersRuntime();
+    process.env.A2A_SECRET = "shhh";
+    Reflect.deleteProperty(process.env, "AGENT_CHAT_DURABLE_BACKGROUND");
+    expect(isAgentChatDurableBackgroundEnabled()).toBe(true);
+  });
+
+  it("restores the inline streaming loop for the explicit env opt-out", () => {
+    makeCloudflareWorkersRuntime();
+    process.env.A2A_SECRET = "shhh";
+    for (const val of ["0", "false", "no", "off", " Off "]) {
+      process.env.AGENT_CHAT_DURABLE_BACKGROUND = val;
+      expect(isAgentChatDurableBackgroundEnabled()).toBe(false);
+    }
+  });
+
+  it("still needs A2A_SECRET on Workers (the HMAC handoff is not optional)", () => {
+    makeCloudflareWorkersRuntime();
+    Reflect.deleteProperty(process.env, "A2A_SECRET");
+    expect(isAgentChatDurableBackgroundEnabled()).toBe(false);
+  });
+
+  it("leaves the Netlify-only default-on predicate alone", () => {
+    makeCloudflareWorkersRuntime();
+    expect(isNetlifyHostedRuntimeForDurableBackground()).toBe(false);
+  });
+
+  it("reports ONCE per isolate that the durable gate is open with nothing to hand off to", () => {
+    // Nothing on this trunk resolves to a durable transport yet, so an enabled
+    // gate on Workers hands the run to the in-process route: a real inline run,
+    // on the foreground clamp, not the budget the gate promised. Netlify's own
+    // notice keys off its function url and can never fire here, so a silent
+    // degrade is exactly what this replaces.
+    makeCloudflareWorkersRuntime();
+    process.env.A2A_SECRET = "shhh";
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    expect(resolveAgentChatProcessRunDispatchPath()).toBe(
+      AGENT_CHAT_PROCESS_RUN_PATH,
+    );
+    resolveDurableBackgroundDispatchPath("/whatever");
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0][0]).toContain("executes inline");
+    errorSpy.mockRestore();
+  });
+
+  it("stays quiet when the gate is closed on Workers (an inline run was asked for)", () => {
+    makeCloudflareWorkersRuntime();
+    process.env.A2A_SECRET = "shhh";
+    process.env.AGENT_CHAT_DURABLE_BACKGROUND = "false";
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    resolveAgentChatProcessRunDispatchPath();
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("stays quiet off the Workers runtime", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    resolveAgentChatProcessRunDispatchPath();
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+});
+
+describe("per-invocation background budget scope (Cloudflare Workers)", () => {
+  it("is out of scope by default", () => {
+    expect(isInBackgroundInvocationScope()).toBe(false);
+  });
+
+  it("lifts the long budget for the invocation that entered the scope", async () => {
+    makeCloudflareWorkersRuntime();
+    const inside = await runInBackgroundInvocationScope(async () => {
+      await Promise.resolve();
+      return shouldUseBackgroundFunctionTimeoutForWorker(null);
+    });
+    expect(inside).toBe(true);
+    expect(shouldUseBackgroundFunctionTimeoutForWorker(null)).toBe(false);
+  });
+
+  it("hides the long budget from a CONCURRENT foreground invocation in the same isolate", async () => {
+    // THE case an isolate-level marker gets wrong. One Worker isolate serves a
+    // queue invocation and a fetch invocation at once; a global set by the queue
+    // invocation would let this foreground turn take the 15-minute budget and
+    // then be killed when its client disconnects. Sequential tests never see it,
+    // so construct the overlap explicitly: the background invocation parks
+    // mid-await while the foreground invocation asks the same question.
+    makeCloudflareWorkersRuntime();
+    let backgroundIsParked!: () => void;
+    const parked = new Promise<void>((resolve) => {
+      backgroundIsParked = resolve;
+    });
+    let resumeBackground!: () => void;
+    const resume = new Promise<void>((resolve) => {
+      resumeBackground = resolve;
+    });
+
+    const background = runInBackgroundInvocationScope(async () => {
+      const beforePark = shouldUseBackgroundFunctionTimeoutForWorker(null);
+      backgroundIsParked();
+      await resume;
+      return {
+        beforePark,
+        afterResume: shouldUseBackgroundFunctionTimeoutForWorker(null),
+      };
+    });
+
+    await parked;
+    const foregroundSaw = {
+      inScope: isInBackgroundInvocationScope(),
+      longBudget: shouldUseBackgroundFunctionTimeoutForWorker(null),
+      runtime: isInBackgroundFunctionRuntime(),
+    };
+    resumeBackground();
+
+    expect(await background).toEqual({ beforePark: true, afterResume: true });
+    expect(foregroundSaw).toEqual({
+      inScope: false,
+      longBudget: false,
+      runtime: false,
+    });
+  });
+
+  it("ignores isolate-wide background signals on the Workers runtime", () => {
+    // The globalThis marker and the Lambda function name are per-isolate facts.
+    // On a host where one isolate serves concurrent invocations they cannot
+    // prove anything about THIS invocation, so on Workers the scope is the only
+    // signal that may lift the clamp.
+    makeCloudflareWorkersRuntime();
+    (
+      globalThis as Record<string, unknown>
+    ).__AGENT_NATIVE_BACKGROUND_RUNTIME__ = true;
+    process.env.AWS_LAMBDA_FUNCTION_NAME = "server-agent-background";
+    process.env.AGENT_CHAT_FORCE_BACKGROUND_RUNTIME = "true";
+    expect(isInBackgroundFunctionRuntime()).toBe(false);
+    expect(shouldUseBackgroundFunctionTimeoutForWorker(null)).toBe(false);
+  });
+
+  it("leaves the isolate-level marker intact for the host it was written for", () => {
+    // No Workers runtime: Netlify's emitted background entry still marks its own
+    // isolate at cold start and that marker still lifts the clamp, unchanged.
+    (
+      globalThis as Record<string, unknown>
+    ).__AGENT_NATIVE_BACKGROUND_RUNTIME__ = true;
+    expect(isInBackgroundInvocationScope()).toBe(false);
+    expect(isInBackgroundFunctionRuntime()).toBe(true);
+    expect(shouldUseBackgroundFunctionTimeoutForWorker(null)).toBe(true);
+  });
+
+  it("reports the scope in the runtime diagnostic detail", () => {
+    makeCloudflareWorkersRuntime();
+    const detail = runInBackgroundInvocationScope(() =>
+      backgroundRuntimeDiagnosticDetail(null),
+    );
+    expect(detail).toContain("invocationScope=true");
+    expect(detail).toContain("runtimeDetected=true");
+    expect(backgroundRuntimeDiagnosticDetail(null)).toContain(
+      "invocationScope=false",
+    );
   });
 });
 

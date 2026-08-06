@@ -6,7 +6,54 @@ import {
   AGENT_NATIVE_SOCIAL_IMAGE_PATH,
 } from "../shared/social-meta.js";
 import { BUILT_IN_AUTH_MARKETING } from "./auth-marketing.js";
-import { getOnboardingHtml } from "./onboarding-html.js";
+import { getConnectionLabel, getOnboardingHtml } from "./onboarding-html.js";
+
+// `getDialect()` memoizes its answer for the process, so the dialect is stubbed
+// rather than driven through a real binding — otherwise the first
+// platform-bound case here would pin every later assertion in this file.
+const dbClientStub = vi.hoisted(() => ({
+  platformBound: false,
+  dialectLabel: "Platform-Bound SQL",
+}));
+vi.mock("../db/client.js", async (importOriginal) => ({
+  ...((await importOriginal()) as object),
+  isPlatformBoundDialect: () => dbClientStub.platformBound,
+  getDialectLabel: () => dbClientStub.dialectLabel,
+}));
+
+describe("getConnectionLabel", () => {
+  afterEach(() => {
+    dbClientStub.platformBound = false;
+    vi.unstubAllEnvs();
+  });
+
+  it("takes the label from the dialect when the dialect is platform-bound", () => {
+    // A platform-bound dialect has no url and is not the local file — the
+    // dialect is the only thing that knows which product it is, and this
+    // surface must not second-guess the name it hands back.
+    vi.stubEnv("DATABASE_URL", "");
+    dbClientStub.platformBound = true;
+
+    expect(getConnectionLabel()).toBe("Platform-Bound SQL");
+  });
+
+  it("still reads an unset url on any other dialect as the local SQLite file", () => {
+    vi.stubEnv("DATABASE_URL", "");
+
+    expect(getConnectionLabel()).toBe("SQLite (local file)");
+  });
+
+  it("keeps reading a url this surface does not consult as the local file", () => {
+    // Netlify's managed url and app-prefixed urls resolve a real dialect that
+    // `DATABASE_URL` alone cannot see. Reporting them was never this label's
+    // job, and starting now would be a behaviour change smuggled in with the
+    // dialect label.
+    vi.stubEnv("DATABASE_URL", "");
+    vi.stubEnv("NETLIFY_DATABASE_URL", "postgres://netlify.example/db");
+
+    expect(getConnectionLabel()).toBe("SQLite (local file)");
+  });
+});
 
 describe("getOnboardingHtml", () => {
   afterEach(() => {

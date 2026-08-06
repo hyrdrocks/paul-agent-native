@@ -170,8 +170,8 @@ second *store* is fine, a second *read site* is the bug.
 
 ## Local run and deployed run take the same path
 
-ADR 0003 (reserved, moves with its code in Phase 1) records that the local
-Workers runtime counts as hosted. Concretely, for this app:
+ADR 0003 records that the local Workers runtime counts as hosted. Concretely,
+for this app:
 
 - Local development for anything Cloudflare-shaped is `just cf` in the app repo
   — a real `wrangler dev` on workerd against the generated `wrangler.json`, not
