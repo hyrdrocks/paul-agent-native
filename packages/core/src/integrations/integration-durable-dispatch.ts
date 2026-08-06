@@ -1,4 +1,5 @@
 import { hasConfiguredA2ASecret } from "../a2a/auth-policy.js";
+import { isDurableBackgroundTarget } from "../agent/background-transports.js";
 import {
   AGENT_BACKGROUND_PROCESSOR_FIELD,
   AGENT_BACKGROUND_PROCESSOR_INTEGRATION,
@@ -104,13 +105,12 @@ export function isIntegrationDurableDispatchEnabledForTask(
   ) {
     return false;
   }
-  // Any host transport that carries its own budget counts: the emitted Netlify
-  // function or the Cloudflare queue consumer. `inline-route` is the portable
-  // in-process route, which is what the non-durable path already uses.
+  // Any registered transport counts: they all carry their own budget. The
+  // in-process route is the portable one the non-durable path already uses.
   const target = resolveBackgroundDispatchTarget({
     fallbackPath: INTEGRATION_PROCESS_TASK_PATH,
   });
-  return target.kind !== "inline-route" && hasConfiguredA2ASecret();
+  return isDurableBackgroundTarget(target) && hasConfiguredA2ASecret();
 }
 
 async function recordDispatch(

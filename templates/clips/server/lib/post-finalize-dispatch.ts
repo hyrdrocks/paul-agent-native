@@ -2,8 +2,9 @@ import {
   AGENT_BACKGROUND_PROCESSOR_FIELD,
   AGENT_BACKGROUND_PROCESSOR_ROUTE,
   AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD,
+  deliverBackgroundHandoff,
+  isDurableBackgroundTarget,
   resolveBackgroundDispatchTarget,
-  sendBackgroundQueueMessage,
   signScopedAgentAccessToken,
 } from "@agent-native/core/server";
 
@@ -64,14 +65,14 @@ export async function dispatchPostFinalizeJob(args: {
     process.env.VITE_APP_BASE_PATH || process.env.APP_BASE_PATH,
   );
   const processorRoute = `${basePath}/api/_agent-native-background/post-finalize-worker`;
-  // The durable worker is reachable on any transport that carries its own
-  // budget: the emitted Netlify function url, or the Cloudflare queue consumer
-  // (which routes back to this same processor route through the background
-  // route-processor field). `inline-route` is the portable in-process route.
+  // The durable worker is reachable on whichever transport this host
+  // registered; each carries its own budget and routes back to this same
+  // processor route through the background route-processor field. The
+  // in-process route is the portable fallback.
   const target = resolveBackgroundDispatchTarget({
     fallbackPath: processorRoute,
   });
-  const usesDurableBackground = target.kind !== "inline-route";
+  const usesDurableBackground = isDurableBackgroundTarget(target);
   const jobBody = {
     ...job,
     token,
@@ -98,28 +99,32 @@ export async function dispatchPostFinalizeJob(args: {
       }`,
     );
   };
-  const workerUrl =
-    target.kind === "queue"
-      ? resolveWorkerUrl(processorRoute)
-      : resolveWorkerUrl(target.path);
+  // A transport with no path of its own still runs the job at this route: the
+  // receiver calls back into it. That is why the url is resolved from the
+  // processor route rather than substituted for a missing dispatch path.
+  const workerUrl = resolveWorkerUrl(target.path ?? processorRoute);
   const dispatch =
-    target.kind === "queue"
-      ? sendBackgroundQueueMessage({
+    target.path == null
+      ? deliverBackgroundHandoff(target, {
           taskId: postFinalizeJobResourceId(job.recordingId, job.kind),
           origin: new URL(workerUrl).origin,
           body: jobBody,
-        }).catch(async (queueError: unknown) => {
-          // Same shape as the Netlify fast-fail fallback below: a queue that
-          // refuses the send is a known state with a working alternative, and
-          // the job runs on the portable route instead of being dropped.
-          console.error("[post-finalize] queue dispatch failed; falling back", {
-            recordingId: args.recordingId,
-            kind: args.kind,
-            error:
-              queueError instanceof Error
-                ? queueError.message
-                : String(queueError),
-          });
+        }).catch(async (handoffError: unknown) => {
+          // Same shape as the HTTP fast-fail fallback below: a transport that
+          // refuses the handoff is a known state with a working alternative,
+          // and the job runs on the portable route instead of being dropped.
+          console.error(
+            "[post-finalize] durable dispatch failed; falling back",
+            {
+              recordingId: args.recordingId,
+              kind: args.kind,
+              transport: target.kind,
+              error:
+                handoffError instanceof Error
+                  ? handoffError.message
+                  : String(handoffError),
+            },
+          );
           await assertAccepted(await post(workerUrl));
         })
       : post(workerUrl).then(async (initialResponse) => {

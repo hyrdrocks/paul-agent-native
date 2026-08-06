@@ -1,5 +1,7 @@
-import { sendBackgroundQueueMessage } from "../agent/background-queue.js";
-import type { BackgroundDispatchTarget } from "../agent/durable-background.js";
+import {
+  type BackgroundDispatchTarget,
+  deliverBackgroundHandoff,
+} from "../agent/background-transports.js";
 import { isLocalDatabase } from "../db/client.js";
 import { signInternalToken } from "../integrations/internal-token.js";
 /**
@@ -228,10 +230,10 @@ export async function fireInternalDispatch(
 /**
  * Fire one durable-background handoff at a resolved transport.
  *
- * The single place the `queue` arm of `BackgroundDispatchTarget` is turned into
- * an actual send, so no call site has to know that a Cloudflare handoff is not
- * an HTTP POST. `http` and `inline-route` targets keep `fireInternalDispatch`
- * byte-for-byte, including the settle race and the awaited-response option.
+ * The single place a target that is not addressed by a url is turned into an
+ * actual handoff, so no call site has to know which transports POST and which
+ * do not. A target WITH a path keeps `fireInternalDispatch` byte-for-byte,
+ * including the settle race and the awaited-response option.
  *
  * Throws on a failed handoff on every transport — the callers already catch
  * that and degrade to an inline run.
@@ -242,18 +244,18 @@ export async function fireBackgroundDispatch(
   },
 ): Promise<void> {
   const { target, ...rest } = options;
-  if (target.kind === "queue") {
-    // A queue send resolves only once Cloudflare confirms the message is
-    // written to disk, which is this transport's equivalent of the awaited 202
-    // the Netlify handoff waits for — so `awaitResponse` needs no analogue and
-    // the settle race would be actively wrong here.
+  if (target.path == null) {
+    // Such a transport confirms its own handoff before resolving — that is
+    // this transport's equivalent of the awaited 202 the HTTP handoff waits
+    // for, so `awaitResponse` needs no analogue and the settle race would be
+    // actively wrong here.
     //
-    // The consumer has no inbound request to take an origin from, so it is
+    // The receiver has no inbound request to take an origin from, so it is
     // resolved HERE through the same resolver the HTTP transport uses: one
     // answer to "which URL is this deployment", not two.
     const baseUrl =
       options.baseUrl ?? resolveSelfDispatchBaseUrl(options.event);
-    await sendBackgroundQueueMessage({
+    await deliverBackgroundHandoff(target, {
       taskId: options.taskId,
       origin: new URL(baseUrl).origin,
       body: options.body,
@@ -264,12 +266,13 @@ export async function fireBackgroundDispatch(
 }
 
 /**
- * How to describe a dispatch target in a diagnostic. A `queue` target has no
- * path, and printing an empty string or the framework route in its place is
- * precisely the confusion these diagnostics exist to prevent.
+ * How to describe a dispatch target in a diagnostic. A target with no path is
+ * named by its transport instead; printing an empty string or the framework
+ * route in its place is precisely the confusion these diagnostics exist to
+ * prevent.
  */
 export function describeBackgroundDispatchTarget(
   target: BackgroundDispatchTarget,
 ): string {
-  return target.kind === "queue" ? "queue" : target.path;
+  return target.path ?? target.kind;
 }

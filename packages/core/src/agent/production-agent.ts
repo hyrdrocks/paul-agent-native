@@ -66,6 +66,7 @@ import {
   drainAgentWarnings,
   formatAgentWarningsForToolResult,
 } from "./action-warnings.js";
+import { backgroundTargetAcknowledgesWithoutClaim } from "./background-transports.js";
 import {
   buildSystemManifestSections,
   readContextXraySystemSections,
@@ -8649,11 +8650,16 @@ export function createProductionAgentHandler(
           () => null,
         );
         const priorDiag = priorClaim?.diagStage ?? "none";
-        // A failed send is a handled condition with a working fallback; a send
-        // the queue ACCEPTED and no consumer ever claimed is an undiagnosable
-        // deploy defect wearing the same clothes. Report the second one — the
-        // inline recovery below is exactly what would otherwise hide it.
-        if (dispatched && backgroundTarget.kind === "queue") {
+        // A failed handoff is a handled condition with a working fallback; a
+        // handoff a transport ACCEPTED and no consumer ever claimed is an
+        // undiagnosable deploy defect wearing the same clothes. Report the
+        // second one — the inline recovery below is exactly what would
+        // otherwise hide it. Which transports can be in that state is their own
+        // declaration, not something recognised here.
+        if (
+          dispatched &&
+          backgroundTargetAcknowledgesWithoutClaim(backgroundTarget)
+        ) {
           reportUnclaimedQueueBackgroundRunOnce(
             `runId=${runId} bgFnPriorDiag=${priorDiag}`,
           );

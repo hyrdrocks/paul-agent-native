@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 
 import { setResponseHeader, setResponseStatus } from "h3";
 
+import { isDurableBackgroundTarget } from "../agent/background-transports.js";
 import {
   AGENT_BACKGROUND_PROCESSOR_A2A,
   AGENT_BACKGROUND_PROCESSOR_FIELD,
@@ -295,14 +296,14 @@ async function fireProcessTaskDispatch(
   taskId: string,
   config: A2AConfig,
 ): Promise<void> {
-  // The durable worker is reachable on any host transport that carries its own
-  // budget — the emitted Netlify function, or the Cloudflare queue consumer.
-  // `inline-route` is the portable route this function already falls back to.
+  // The durable worker is reachable on whichever registered transport this host
+  // has; the in-process route is the portable one this function already falls
+  // back to.
   const backgroundTarget = resolveBackgroundDispatchTarget();
   const useBackgroundWorker =
     isAgentChatDurableBackgroundEnabled({
       appOptIn: config.durableBackgroundRuns,
-    }) && backgroundTarget.kind !== "inline-route";
+    }) && isDurableBackgroundTarget(backgroundTarget);
 
   if (!useBackgroundWorker) {
     await fireInternalDispatch({

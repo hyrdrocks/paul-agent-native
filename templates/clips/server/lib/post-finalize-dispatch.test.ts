@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mockSignScopedAgentAccessToken = vi.hoisted(() =>
   vi.fn(() => "signed-job-token"),
 );
-const mockSendBackgroundQueueMessage = vi.hoisted(() => vi.fn(async () => {}));
+const mockDeliverBackgroundHandoff = vi.hoisted(() => vi.fn(async () => {}));
 
 vi.mock("@agent-native/core/server", () => ({
   AGENT_BACKGROUND_PROCESSOR_FIELD: "__agentNativeProcessor",
@@ -23,7 +23,9 @@ vi.mock("@agent-native/core/server", () => ({
             path: options?.fallbackPath,
             expectsBackgroundRuntime: false,
           },
-  sendBackgroundQueueMessage: mockSendBackgroundQueueMessage,
+  deliverBackgroundHandoff: mockDeliverBackgroundHandoff,
+  isDurableBackgroundTarget: (target: { kind: string }) =>
+    target.kind !== "inline-route",
   signScopedAgentAccessToken: mockSignScopedAgentAccessToken,
 }));
 
@@ -184,24 +186,27 @@ describe("post-finalize dispatch", () => {
       kind: "transcript",
     });
 
-    expect(mockSendBackgroundQueueMessage).toHaveBeenCalledWith({
-      taskId: postFinalizeJobResourceId("rec-6", "transcript"),
-      origin: "https://clips.example",
-      body: {
-        recordingId: "rec-6",
-        kind: "transcript",
-        token: "signed-job-token",
-        __agentNativeProcessor: "route",
-        __agentNativeProcessorRoute:
-          "/api/_agent-native-background/post-finalize-worker",
+    expect(mockDeliverBackgroundHandoff).toHaveBeenCalledWith(
+      { kind: "queue", expectsBackgroundRuntime: true },
+      {
+        taskId: postFinalizeJobResourceId("rec-6", "transcript"),
+        origin: "https://clips.example",
+        body: {
+          recordingId: "rec-6",
+          kind: "transcript",
+          token: "signed-job-token",
+          __agentNativeProcessor: "route",
+          __agentNativeProcessorRoute:
+            "/api/_agent-native-background/post-finalize-worker",
+        },
       },
-    });
+    );
     expect(fetch).not.toHaveBeenCalled();
   });
 
   it("falls back to the portable route when the queue refuses the send", async () => {
     vi.stubEnv("AGENT_NATIVE_TEST_QUEUE_TRANSPORT", "true");
-    mockSendBackgroundQueueMessage.mockRejectedValueOnce(
+    mockDeliverBackgroundHandoff.mockRejectedValueOnce(
       new Error("queue over quota"),
     );
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});

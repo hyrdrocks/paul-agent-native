@@ -16,6 +16,17 @@ export {
   resolveDurableBackgroundDispatchPath,
 } from "../agent/durable-background.js";
 export {
+  type BackgroundHandoff,
+  type BackgroundTransport,
+  backgroundTargetAcknowledgesWithoutClaim,
+  deliverBackgroundHandoff,
+  INLINE_ROUTE_TRANSPORT_ID,
+  isDurableBackgroundTarget,
+  listBackgroundTransports,
+  registerBackgroundTransport,
+  unregisterBackgroundTransport,
+} from "../agent/background-transports.js";
+export {
   AGENT_BACKGROUND_QUEUE_BINDING,
   agentBackgroundQueueName,
   hasBoundBackgroundQueue,
