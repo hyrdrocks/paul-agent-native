@@ -437,14 +437,58 @@ export const CLOUDFLARE_WORKER_STUB_SUBPATH_MODULES: Record<string, string> = {
 };
 
 /**
- * Native packages that survive as bare specifiers inside already-emitted
- * `_libs/` bundles, past the point where a Rolldown plugin can intercept
- * them. They are rewritten to a generated sibling stub instead.
+ * Builtins whose bare specifier the post-build pass rewrites to `node:`.
+ * CF Workers resolves a builtin only under the prefix.
+ */
+export const CLOUDFLARE_WORKER_PATCHED_NODE_BUILTINS = [
+  "fs",
+  "path",
+  "os",
+  "crypto",
+  "http",
+  "https",
+  "stream",
+  "url",
+  "util",
+  "events",
+  "buffer",
+  "console",
+  "querystring",
+  "zlib",
+  "net",
+  "tls",
+  "assert",
+  "timers",
+  "child_process",
+  "module",
+  "process",
+  "sqlite",
+  "worker_threads",
+  "string_decoder",
+  "diagnostics_channel",
+  "async_hooks",
+  "perf_hooks",
+  "inspector",
+  "vm",
+] as const;
+
+/**
+ * Packages that survive as bare specifiers inside already-emitted chunks, past
+ * the point where a Rolldown plugin can intercept them. They are rewritten to a
+ * generated stub instead.
+ *
+ * A bare specifier left in the output is unresolvable on workerd whatever the
+ * package is — there is no node_modules to search — so an entry here costs
+ * nothing when the specifier was bundled away and is the difference between a
+ * fail-closed stub and a Worker that never starts when it was not. `postgres`
+ * is an optional peer core imports lazily: an app that correctly omits it must
+ * still boot.
  */
 export const CLOUDFLARE_UNRESOLVED_NATIVE_STUBS = [
   "better-sqlite3",
   "node-pty",
   "cron-parser",
+  "postgres",
 ] as const;
 
 /**
@@ -4064,9 +4108,16 @@ const WORKER_FRAMEWORK_CHUNK_TEST = /node_modules[/\\]@agent-native[/\\]/;
  * their module-scope `require("node:...")` then runs during startup — trading
  * this failure for "No such module" at boot.
  *
- * Rolldown matches groups in declaration order and Nitro merges caller-supplied
- * output config ahead of its own, so this takes precedence over the per-package
- * grouping for these packages and leaves every other package on it.
+ * This group does take precedence over the per-package grouping while leaving
+ * every other package on it — the emitted output is one `framework` chunk and no
+ * per-package `@agent-native/*` chunks — but not for the reason it is tempting
+ * to write down. Nitro passes its own `NODE_MODULES_RE` group as defu's FIRST
+ * argument and `rollupConfig` as its third, so this group is appended AFTER
+ * Nitro's, and Rolldown documents that at equal priority the smaller index wins.
+ * Neither ordering explains the result, so do not reason from position: what
+ * catches a regression here is `assertNoWorkerChunkImportCycles`, which fails
+ * the build rather than shipping a bundle that only breaks at boot.
+ *
  * `advancedChunks` is not the option to reach for: Rolldown ignores it whenever
  * `codeSplitting` is set, which Nitro always does, and warns rather than fails.
  */
@@ -4093,14 +4144,16 @@ function resolveEmittedChunkPath(fromFile: string, specifier: string): string {
 }
 
 /**
- * Static-import cycles between the chunks emitted into `serverDir`.
+ * Every module the Worker output emitted, at any depth.
  *
- * Only static imports count: they are what the module linker evaluates before
- * any code runs, and they are the only ones that can observe a binding in its
- * temporal dead zone. A dynamic `import()` inside a function body is fine and
- * must not be reported.
+ * Depth is not optional knowledge here: Nitro names an externalised package
+ * chunk after the package, so a scoped one lands at
+ * `_libs/@agent-native/framework.mjs`. A one-level `readdirSync` of `_libs`
+ * sees `@agent-native` as an entry, fails the `.mjs` test, and skips every
+ * file under it — which is how three post-build patches came to run on none of
+ * the chunks that needed them.
  */
-export function findWorkerChunkImportCycles(serverDir: string): string[][] {
+export function listEmittedWorkerChunkFiles(serverDir: string): string[] {
   const files: string[] = [];
   function walk(dir: string) {
     if (!fs.existsSync(dir)) return;
@@ -4112,6 +4165,164 @@ export function findWorkerChunkImportCycles(serverDir: string): string[][] {
     }
   }
   walk(serverDir);
+  return files.sort();
+}
+
+/**
+ * The specifier `fromFile` must use to reach `toFile`.
+ *
+ * Every rewrite into an emitted chunk goes through this. A depth assumed once —
+ * `./stub.mjs` for `_libs/`, `../_libs/stub.mjs` for `_chunks/` — is a depth
+ * that is wrong for the next chunk Nitro nests one level deeper, and workerd
+ * reports it as an unresolvable module rather than as a bad rewrite.
+ */
+function emittedChunkSpecifier(fromFile: string, toFile: string): string {
+  const rel = path.relative(path.dirname(fromFile), toFile).replace(/\\/g, "/");
+  return rel.startsWith(".") ? rel : `./${rel}`;
+}
+
+/**
+ * Points every import of `moduleName` at `target`, returning the code unchanged
+ * when there were none.
+ *
+ * Static and dynamic forms both count: core imports its optional peers with
+ * `await import("postgres")`, which a `from`-only pattern skips while the
+ * specifier still reaches workerd.
+ */
+export function rewriteEmittedChunkImportSpecifier(
+  code: string,
+  moduleName: string,
+  target: string,
+): string {
+  const escaped = moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // The lookbehind keeps a minified identifier that happens to end in `from`
+  // or `import` from matching.
+  const re = new RegExp(
+    `(?<![\\w$])((?:from|import)\\s*\\(?\\s*)(["'])${escaped}\\2`,
+    "g",
+  );
+  return code.replace(re, `$1$2${target}$2`);
+}
+
+export type CloudflareWorkerOutputPatchReport = {
+  /** Emitted chunks considered, relative to `serverDir`. */
+  scanned: string[];
+  /** Chunks the Node-builtin, `import.meta.url` or timer rules changed. */
+  patched: string[];
+  /** Modules a fail-closed stub was generated for. */
+  stubbed: string[];
+  /** Chunks whose imports were repointed at a generated stub. */
+  stubImporters: string[];
+};
+
+/**
+ * The Cloudflare post-build pass over the emitted Worker output.
+ *
+ * Reports what it touched because it cannot tell, on its own, whether patching
+ * nothing means there was nothing to patch: the pass ran for a year against a
+ * directory listing that never contained the chunks it was written for, logging
+ * the same success line either way.
+ */
+export function patchCloudflareWorkerOutput(
+  serverDir: string,
+): CloudflareWorkerOutputPatchReport {
+  const files = listEmittedWorkerChunkFiles(serverDir);
+  const rel = (file: string) =>
+    path.relative(serverDir, file).replace(/\\/g, "/");
+  if (files.length === 0) {
+    throw new Error(
+      `[deploy] Cloudflare post-build found no .mjs/.js output under ${serverDir}. ` +
+        `Nothing was patched, so the Worker still carries bare Node builtins, ` +
+        `an undefined import.meta.url and any global-scope timer — it would fail ` +
+        `at startup with no mention of this pass. Check that the preset's ` +
+        `serverDir is the directory Nitro actually wrote.`,
+    );
+  }
+
+  const report: CloudflareWorkerOutputPatchReport = {
+    scanned: files.map(rel),
+    patched: [],
+    stubbed: [],
+    stubImporters: [],
+  };
+
+  for (const file of files) {
+    const original = fs.readFileSync(file, "utf-8");
+    let code = original;
+
+    // 1. Bare Node.js builtins need the node: prefix on CF Workers.
+    for (const mod of CLOUDFLARE_WORKER_PATCHED_NODE_BUILTINS) {
+      code = code.replace(
+        new RegExp(`from\\s*["']${mod}["']`, "g"),
+        `from"node:${mod}"`,
+      );
+    }
+
+    // 2. React Router's server build calls createRequire(import.meta.url),
+    // which is undefined on CF Workers.
+    code = code.replace(/import\.meta\.url/g, '"file:///worker.mjs"');
+
+    // 3. CF Workers disallows timers in global scope.
+    if (code.includes("setInterval") && !code.includes("__timer_shim__")) {
+      const shim =
+        "/* __timer_shim__ */" +
+        "var __origSetInterval=globalThis.setInterval;" +
+        "globalThis.setInterval=function(){return{unref(){},ref(){},close(){}}};";
+      const restore =
+        ";(function(){if(typeof __origSetInterval!=='undefined')globalThis.setInterval=__origSetInterval})();";
+      code = shim + code + "\n" + restore;
+    }
+
+    if (code !== original) {
+      fs.writeFileSync(file, code);
+      report.patched.push(rel(file));
+    }
+  }
+
+  // Bare specifiers Nitro's bundler left behind cannot resolve on workerd.
+  // Point them at a generated stub that throws on use.
+  for (const mod of CLOUDFLARE_UNRESOLVED_NATIVE_STUBS) {
+    // Prefixed so the name cannot be one Nitro also emits. `_libs/postgres.mjs`
+    // is both what this stub would be called and what a chunk for a bundled
+    // `postgres` would be called, and writing the stub over that chunk replaces
+    // a working module with one that throws.
+    const stubPath = path.join(
+      serverDir,
+      "_libs",
+      `__unresolved__${mod.replace(/[/@]/g, "__")}.mjs`,
+    );
+    const importers: string[] = [];
+    for (const file of files) {
+      if (file === stubPath) continue;
+      const code = fs.readFileSync(file, "utf-8");
+      const rewritten = rewriteEmittedChunkImportSpecifier(
+        code,
+        mod,
+        emittedChunkSpecifier(file, stubPath),
+      );
+      if (rewritten === code) continue;
+      fs.mkdirSync(path.dirname(stubPath), { recursive: true });
+      fs.writeFileSync(stubPath, cloudflareUnresolvedNativeStubSource(mod));
+      fs.writeFileSync(file, rewritten);
+      importers.push(rel(file));
+    }
+    if (importers.length > 0) report.stubbed.push(mod);
+    report.stubImporters.push(...importers);
+  }
+
+  return report;
+}
+
+/**
+ * Static-import cycles between the chunks emitted into `serverDir`.
+ *
+ * Only static imports count: they are what the module linker evaluates before
+ * any code runs, and they are the only ones that can observe a binding in its
+ * temporal dead zone. A dynamic `import()` inside a function body is fine and
+ * must not be reported.
+ */
+export function findWorkerChunkImportCycles(serverDir: string): string[][] {
+  const files = listEmittedWorkerChunkFiles(serverDir);
 
   const edges = new Map<string, string[]>();
   for (const file of files) {
@@ -4194,8 +4405,10 @@ function createBrowserOnlyServerStubPlugin() {
   const STUB_ID = "\0agent-native-browser-only-server-stub";
   return {
     name: "agent-native-browser-only-server-stub",
-    // enforce: "pre" so we intercept before Nitro's node resolver bundles the
-    // real package. defu concatenates rollupConfig.plugins ahead of Nitro's own.
+    // enforce: "pre" is what puts this ahead of Nitro's node resolver, and it
+    // is the only thing that does. Array position does not: Nitro passes its
+    // own defaults as defu's FIRST argument and `rollupConfig` as its third, so
+    // anything from here is appended after them, not merged ahead of them.
     resolveId(id: string) {
       // Match the bare package name or any subpath (incl. `/index.css`).
       const pkg = id
@@ -4622,34 +4835,16 @@ export default bundle;
             },
           );
           // Rewrite imports in all files to point to the bundled module
-          function rewriteImports(dir: string) {
-            if (!fs.existsSync(dir)) return;
-            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-              const p = path.join(dir, entry.name);
-              if (entry.isDirectory()) {
-                rewriteImports(p);
-                continue;
-              }
-              if (!entry.name.endsWith(".mjs") && !entry.name.endsWith(".js"))
-                continue;
-              let code = fs.readFileSync(p, "utf-8");
-              const relPath = path
-                .relative(path.dirname(p), outFile)
-                .replace(/\\/g, "/");
-              const importPath = relPath.startsWith(".")
-                ? relPath
-                : "./" + relPath;
-              const re = new RegExp(
-                `from["']${mod.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`,
-                "g",
-              );
-              if (re.test(code)) {
-                code = code.replace(re, `from"${importPath}"`);
-                fs.writeFileSync(p, code);
-              }
-            }
+          for (const file of listEmittedWorkerChunkFiles(outputDir)) {
+            if (file === outFile) continue;
+            const code = fs.readFileSync(file, "utf-8");
+            const rewritten = rewriteEmittedChunkImportSpecifier(
+              code,
+              mod,
+              emittedChunkSpecifier(file, outFile),
+            );
+            if (rewritten !== code) fs.writeFileSync(file, rewritten);
           }
-          rewriteImports(outputDir);
           console.log(`[deploy] Bundled external: ${mod}`);
         } catch {
           console.warn(
@@ -4662,158 +4857,20 @@ export default bundle;
 
   // Cloudflare-specific post-build patches
   if (preset.startsWith("cloudflare")) {
-    const serverDir2 = nitro.options.output.serverDir;
-    const scanDirs = [serverDir2];
-    if (serverDir2) {
-      const chunksDir = path.join(serverDir2, "_chunks");
-      const libsDir = path.join(serverDir2, "_libs");
-      if (fs.existsSync(chunksDir)) scanDirs.push(chunksDir);
-      if (fs.existsSync(libsDir)) scanDirs.push(libsDir);
-    }
-
-    for (const scanDir of scanDirs) {
-      if (!scanDir || !fs.existsSync(scanDir)) continue;
-      for (const file of fs.readdirSync(scanDir)) {
-        if (!file.endsWith(".mjs") && !file.endsWith(".js")) continue;
-        const filePath = path.join(scanDir, file);
-        let code = fs.readFileSync(filePath, "utf-8");
-        let changed = false;
-
-        // 1. Rewrite bare Node.js imports to node: prefixed.
-        // CF Workers requires the node: prefix for built-in modules.
-        const NODE_BUILTINS = [
-          "fs",
-          "path",
-          "os",
-          "crypto",
-          "http",
-          "https",
-          "stream",
-          "url",
-          "util",
-          "events",
-          "buffer",
-          "console",
-          "querystring",
-          "zlib",
-          "net",
-          "tls",
-          "assert",
-          "timers",
-          "child_process",
-          "module",
-          "process",
-          "sqlite",
-          "worker_threads",
-          "string_decoder",
-          "diagnostics_channel",
-          "async_hooks",
-          "perf_hooks",
-          "inspector",
-          "vm",
-        ];
-        for (const mod of NODE_BUILTINS) {
-          // Match: from"fs" or from "fs" (but not from"node:fs")
-          const re = new RegExp(`from\\s*["']${mod}["']`, "g");
-          if (re.test(code)) {
-            code = code.replace(re, `from"node:${mod}"`);
-            changed = true;
-          }
-        }
-
-        // 2. Patch import.meta.url for createRequire().
-        // React Router's server build uses createRequire(import.meta.url)
-        // but import.meta.url is undefined on CF Workers.
-        if (code.includes("import.meta.url")) {
-          code = code.replace(/import\.meta\.url/g, '"file:///worker.mjs"');
-          changed = true;
-        }
-
-        // 3. Patch setInterval/setTimeout at global scope.
-        // CF Workers disallows timers in global scope.
-        if (code.includes("setInterval") && !code.includes("__timer_shim__")) {
-          const shim =
-            "/* __timer_shim__ */" +
-            "var __origSetInterval=globalThis.setInterval;" +
-            "globalThis.setInterval=function(){return{unref(){},ref(){},close(){}}};";
-          const restore =
-            ";(function(){if(typeof __origSetInterval!=='undefined')globalThis.setInterval=__origSetInterval})();";
-          code = shim + code + "\n" + restore;
-          changed = true;
-        }
-
-        if (changed) fs.writeFileSync(filePath, code);
-      }
-    }
-    // 3. Create stub modules in _libs/ for native deps that Nitro's rolldown
-    // bundler references but can't resolve on CF Workers, and rewrite
-    // bare imports to point to the stub files.
-    const libsDir2 = path.join(
-      serverDir2 || path.join(cwd, "dist", "_worker.js"),
-      "_libs",
+    const report = patchCloudflareWorkerOutput(
+      nitro.options.output.serverDir || path.join(cwd, "dist", "_worker.js"),
     );
-    if (fs.existsSync(libsDir2)) {
-      for (const mod of CLOUDFLARE_UNRESOLVED_NATIVE_STUBS) {
-        const libFiles = fs
-          .readdirSync(libsDir2)
-          .filter((f) => f.endsWith(".mjs"));
-        const referencingFiles: string[] = [];
-        for (const f of libFiles) {
-          const filePath = path.join(libsDir2, f);
-          const content = fs.readFileSync(filePath, "utf-8");
-          if (content.includes(`"${mod}"`) || content.includes(`'${mod}'`)) {
-            referencingFiles.push(filePath);
-          }
-        }
-        if (referencingFiles.length === 0) continue;
-
-        // Create a stub _libs/<mod>.mjs that exports empty defaults
-        const stubName = mod.replace(/[/@]/g, "__") + ".mjs";
-        const stubPath = path.join(libsDir2, stubName);
-        if (!fs.existsSync(stubPath)) {
-          fs.writeFileSync(stubPath, cloudflareUnresolvedNativeStubSource(mod));
-          console.log(`[deploy] Created stub for _libs/${stubName}`);
-        }
-
-        // Rewrite bare imports in _libs/ and _chunks/ to use the stub
-        const escaped = mod.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const importRe = new RegExp(`(from\\s*["'])${escaped}(["'])`, "g");
-        // Scan _libs/ files
-        for (const filePath of referencingFiles) {
-          let code = fs.readFileSync(filePath, "utf-8");
-          if (importRe.test(code)) {
-            code = code.replace(importRe, `$1./${stubName}$2`);
-            fs.writeFileSync(filePath, code);
-            console.log(
-              `[deploy] Rewrote ${mod} imports in _libs/${path.basename(filePath)}`,
-            );
-          }
-        }
-        // Also scan _chunks/ files (they import native deps too)
-        const chunksDir2 = path.join(
-          serverDir2 || path.join(cwd, "dist", "_worker.js"),
-          "_chunks",
-        );
-        if (fs.existsSync(chunksDir2)) {
-          for (const f of fs
-            .readdirSync(chunksDir2)
-            .filter((f) => f.endsWith(".mjs") || f.endsWith(".js"))) {
-            const filePath = path.join(chunksDir2, f);
-            let code = fs.readFileSync(filePath, "utf-8");
-            if (importRe.test(code)) {
-              // From _chunks/, the stub is at ../_libs/<stubName>
-              code = code.replace(importRe, `$1../_libs/${stubName}$2`);
-              fs.writeFileSync(filePath, code);
-              console.log(`[deploy] Rewrote ${mod} imports in _chunks/${f}`);
-            }
-          }
-        }
-      }
-    }
-
     console.log(
-      "[deploy] Patched bare Node imports, timer calls, and route finder for CF Workers",
+      `[deploy] Patched bare Node imports, import.meta.url and global-scope ` +
+        `timers in ${report.patched.length} of ${report.scanned.length} ` +
+        `emitted Worker chunk(s) for CF Workers`,
     );
+    if (report.stubbed.length > 0) {
+      console.log(
+        `[deploy] Stubbed unresolved module(s) ${report.stubbed.join(", ")} ` +
+          `for ${report.stubImporters.length} importing chunk(s)`,
+      );
+    }
   }
 
   // Last gate before the artifact ships: the cycle this catches passes install,

@@ -38,6 +38,9 @@ import {
   findInstalledResvgPackages,
   findWorkerChunkImportCycles,
   isServerlessNativePlatformPackage,
+  listEmittedWorkerChunkFiles,
+  patchCloudflareWorkerOutput,
+  rewriteEmittedChunkImportSpecifier,
   generateCloudflarePagesStaticShellFromManifest,
   generateCloudflareModuleWorkerEntry,
   generateProvidedPluginsNitroPluginSource,
@@ -197,6 +200,169 @@ describe("assertNoWorkerChunkImportCycles", () => {
     fs.writeFileSync(path.join(dir, "index.mjs"), "export const a=1;");
 
     expect(() => assertNoWorkerChunkImportCycles(dir)).not.toThrow();
+  });
+});
+
+describe("listEmittedWorkerChunkFiles", () => {
+  it("reaches a chunk Nitro nested under a scope directory", () => {
+    const dir = makeTempDir();
+    fs.mkdirSync(path.join(dir, "_libs", "@agent-native"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "index.mjs"), "export const a=1;");
+    fs.writeFileSync(
+      path.join(dir, "_libs", "@agent-native", "framework.mjs"),
+      "export const b=1;",
+    );
+    fs.writeFileSync(path.join(dir, "_libs", "notes.txt"), "ignored");
+
+    expect(
+      listEmittedWorkerChunkFiles(dir).map((f) =>
+        path.relative(dir, f).replace(/\\/g, "/"),
+      ),
+    ).toEqual(["_libs/@agent-native/framework.mjs", "index.mjs"]);
+  });
+});
+
+describe("patchCloudflareWorkerOutput", () => {
+  // Nitro names an externalised package chunk after the package, so a scoped
+  // one lands two levels down. A one-level readdir sees `@agent-native` as an
+  // entry, fails the `.mjs` test, and silently patches none of it.
+  function writeNestedOutput(dir: string, source: string): string {
+    const nested = path.join(dir, "_libs", "@agent-native");
+    fs.mkdirSync(nested, { recursive: true });
+    const file = path.join(nested, "framework.mjs");
+    fs.writeFileSync(file, source);
+    fs.writeFileSync(path.join(dir, "index.mjs"), "export const a=1;");
+    return file;
+  }
+
+  it("patches a nested chunk's bare Node builtins, import.meta.url and global timer", () => {
+    const dir = makeTempDir();
+    const file = writeNestedOutput(
+      dir,
+      [
+        'import{readFileSync}from"fs";',
+        'import{createRequire}from"module";',
+        "const require_=createRequire(import.meta.url);",
+        "setInterval(()=>{},6e4).unref?.();",
+        "export const read=readFileSync;",
+        "export const req=require_;",
+      ].join("\n"),
+    );
+
+    const report = patchCloudflareWorkerOutput(dir);
+    const patched = fs.readFileSync(file, "utf8");
+
+    expect(report.patched).toContain("_libs/@agent-native/framework.mjs");
+    expect(patched).toContain('from"node:fs"');
+    expect(patched).toContain('from"node:module"');
+    expect(patched).not.toMatch(/import\.meta\.url/);
+    expect(patched).toContain('"file:///worker.mjs"');
+    expect(patched).toContain("__timer_shim__");
+    expect(patched).toContain("globalThis.setInterval=function()");
+  });
+
+  it("repoints a nested chunk's unresolved import at a stub, at its own depth", () => {
+    const dir = makeTempDir();
+    // Core imports its optional peers lazily, so the specifier that reaches
+    // workerd is the dynamic form.
+    const file = writeNestedOutput(
+      dir,
+      'export const db=async()=>(await import("postgres")).default;',
+    );
+
+    const report = patchCloudflareWorkerOutput(dir);
+
+    expect(report.stubbed).toContain("postgres");
+    expect(report.stubImporters).toContain("_libs/@agent-native/framework.mjs");
+    // From `_libs/@agent-native/`, the stub in `_libs/` is one level up — the
+    // depths the old pass hardcoded would both have missed it.
+    expect(fs.readFileSync(file, "utf8")).toContain(
+      'import("../__unresolved__postgres.mjs")',
+    );
+    expect(
+      fs.existsSync(path.join(dir, "_libs", "__unresolved__postgres.mjs")),
+    ).toBe(true);
+  });
+
+  it("does not write its stub over a chunk Nitro emitted under the same name", () => {
+    const dir = makeTempDir();
+    writeNestedOutput(
+      dir,
+      'export const db=async()=>(await import("postgres")).default;',
+    );
+    const emitted = path.join(dir, "_libs", "postgres.mjs");
+    fs.writeFileSync(emitted, "export default function real(){return 1}");
+
+    patchCloudflareWorkerOutput(dir);
+
+    expect(fs.readFileSync(emitted, "utf8")).toContain("function real()");
+  });
+
+  it("keeps the generated stub throwing on use rather than answering empty", async () => {
+    const dir = makeTempDir();
+    writeNestedOutput(
+      dir,
+      'export const db=async()=>(await import("postgres")).default;',
+    );
+
+    patchCloudflareWorkerOutput(dir);
+    const stub = await import(
+      pathToFileURL(path.join(dir, "_libs", "__unresolved__postgres.mjs")).href
+    );
+
+    expect(() => stub.default("postgres://x")).toThrow(
+      /postgres is unavailable/,
+    );
+  });
+
+  it("reports patching nothing instead of logging success over an empty walk", () => {
+    const dir = makeTempDir();
+    fs.mkdirSync(path.join(dir, "_libs"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "index.mjs"), 'import"node:fs";');
+
+    const report = patchCloudflareWorkerOutput(dir);
+
+    expect(report.scanned).toEqual(["index.mjs"]);
+    expect(report.patched).toEqual([]);
+    expect(report.stubbed).toEqual([]);
+  });
+
+  it("fails loudly when the output it was pointed at holds no chunks", () => {
+    const dir = makeTempDir();
+
+    expect(() => patchCloudflareWorkerOutput(dir)).toThrow(/no \.mjs\/\.js/);
+  });
+});
+
+describe("rewriteEmittedChunkImportSpecifier", () => {
+  it("rewrites the static, side-effect and dynamic forms", () => {
+    const code = [
+      'import pg from"postgres";',
+      'export*from"postgres";',
+      'import"postgres";',
+      'const x=await import("postgres");',
+    ].join("\n");
+
+    expect(
+      rewriteEmittedChunkImportSpecifier(code, "postgres", "./stub.mjs"),
+    ).toBe(
+      [
+        'import pg from"./stub.mjs";',
+        'export*from"./stub.mjs";',
+        'import"./stub.mjs";',
+        'const x=await import("./stub.mjs");',
+      ].join("\n"),
+    );
+  });
+
+  it("leaves a subpath specifier and a bare string alone", () => {
+    // The pass this replaced decided which files referenced a module by
+    // searching for the quoted name, which matches both of these.
+    const code = 'import a from"postgres/other";const dialect="postgres";';
+
+    expect(
+      rewriteEmittedChunkImportSpecifier(code, "postgres", "./stub.mjs"),
+    ).toBe(code);
   });
 });
 
