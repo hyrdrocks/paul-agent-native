@@ -145,6 +145,150 @@ describe("db/client dialect detection", () => {
   });
 });
 
+describe("db/client dialect capabilities", () => {
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    Reflect.deleteProperty(globalThis as Record<string, unknown>, "__env__");
+    Reflect.deleteProperty(globalThis as Record<string, unknown>, "__cf_env");
+    vi.resetModules();
+  });
+
+  it("reports interactive transaction support for URL-configured dialects", async () => {
+    vi.stubEnv("DATABASE_URL", "postgres://user:pass@host:5432/db");
+    const { supportsInteractiveTransactions } = await import("./client.js");
+    expect(supportsInteractiveTransactions()).toBe(true);
+  });
+
+  it("reports interactive transaction support for a local SQLite file", async () => {
+    vi.stubEnv("DATABASE_URL", "file:./data/app.db");
+    const { supportsInteractiveTransactions } = await import("./client.js");
+    expect(supportsInteractiveTransactions()).toBe(true);
+  });
+
+  it("reports no interactive transaction support on D1", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    (globalThis as Record<string, unknown>).__env__ = {
+      DB: { prepare: vi.fn() },
+    };
+    const { getDialect, supportsInteractiveTransactions } =
+      await import("./client.js");
+
+    expect(getDialect()).toBe("d1");
+    // Named for the interactive form only: D1 still runs a fixed statement
+    // list atomically through batch().
+    expect(supportsInteractiveTransactions()).toBe(false);
+  });
+
+  it("carries a human-readable label on the dialect", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    (globalThis as Record<string, unknown>).__env__ = {
+      DB: { prepare: vi.fn() },
+    };
+    const { getDialectLabel } = await import("./client.js");
+    expect(getDialectLabel()).toBe("Cloudflare D1");
+  });
+
+  it("labels a URL-less local database as the SQLite file it is", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    const { getDialectLabel } = await import("./client.js");
+    expect(getDialectLabel()).toBe("SQLite (local file)");
+  });
+
+  it("separates a platform-bound dialect from one whose url came from elsewhere", async () => {
+    // Netlify's managed url is not on DATABASE_URL, so "no DATABASE_URL" and
+    // "configured by a binding" are different facts.
+    vi.stubEnv("DATABASE_URL", "");
+    vi.stubEnv("NETLIFY_DATABASE_URL", "postgres://netlify.example/db");
+    const { isPlatformBoundDialect } = await import("./client.js");
+    expect(isPlatformBoundDialect()).toBe(false);
+  });
+
+  it("reports a binding-configured dialect as platform-bound", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    (globalThis as Record<string, unknown>).__env__ = {
+      DB: { prepare: vi.fn() },
+    };
+    const { isPlatformBoundDialect } = await import("./client.js");
+    expect(isPlatformBoundDialect()).toBe(true);
+  });
+});
+
+describe("createPlatformBoundDbClient", () => {
+  const runtime = globalThis as Record<string, any>;
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    delete runtime.__cf_env;
+    delete runtime.__env__;
+    vi.resetModules();
+  });
+
+  it("returns nothing when the dialect is configured by a URL", async () => {
+    vi.stubEnv("DATABASE_URL", "file:./data/app.db");
+    const { createPlatformBoundDbClient } = await import("./client.js");
+    await expect(createPlatformBoundDbClient({})).resolves.toBeUndefined();
+  });
+
+  it("refuses to hand back a binding on a URL-configured dialect", async () => {
+    vi.stubEnv("DATABASE_URL", "file:./data/app.db");
+    const { platformBoundDbBinding } = await import("./client.js");
+    // Reaching for the binding here would report a product this process is
+    // not running on.
+    expect(() => platformBoundDbBinding()).toThrow(
+      /no platform binding to resolve/,
+    );
+  });
+
+  it("builds a client for a binding-configured dialect", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    runtime.__cf_env = { DB: { prepare: vi.fn(() => ({})) } };
+    const { createPlatformBoundDbClient } = await import("./client.js");
+
+    const client = await createPlatformBoundDbClient({});
+    expect(client?.drizzleProvider).toBe("sqlite");
+    expect(client?.db).toBeTruthy();
+  });
+
+  it("names the missing binding instead of failing inside a native stub", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    runtime.__cf_env = { DB: { prepare: vi.fn(() => ({})) } };
+    const { platformBoundDbBinding } = await import("./client.js");
+    const binding = platformBoundDbBinding() as { prepare?: unknown };
+    delete runtime.__cf_env;
+
+    expect(() => binding.prepare).toThrow(
+      /no D1 database is bound to `env.DB`/,
+    );
+  });
+
+  it("follows the binding of the invocation making the call", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    const first = { prepare: vi.fn(() => "first") };
+    const second = { prepare: vi.fn(() => "second") };
+    runtime.__cf_env = { DB: first };
+    const { platformBoundDbBinding } = await import("./client.js");
+
+    // Resolved once, as a cached client does when it is built.
+    const binding = platformBoundDbBinding() as { prepare: () => string };
+    expect(binding.prepare()).toBe("first");
+
+    runtime.__cf_env = { DB: second };
+    expect(binding.prepare()).toBe("second");
+    expect(first.prepare).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("db/client D1 execution", () => {
   it("uses D1 batch for atomic statements instead of interactive SQL transactions", async () => {
     const prepared: Array<{ sql: string; args: unknown[] }> = [];

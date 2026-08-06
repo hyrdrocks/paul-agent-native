@@ -110,7 +110,7 @@ export function createExtensionsHandler(
           setResponseStatus(event, 403);
           return { error: "Extension creation is disabled for this app" };
         }
-        await ensureExtensionsTables();
+        await ensureExtensionsTables(event);
         return dispatch(event, method, parts, userEmail);
       });
     } catch (err) {
@@ -509,7 +509,7 @@ async function handleExtensionDataList(
   collection: string,
   userEmail: string,
 ): Promise<unknown> {
-  await ensureExtensionsTables();
+  await ensureExtensionsTables(event);
   const access = await requireExtensionDataAccess(event, extensionId, "viewer");
   if (!access.ok) return access.response;
 
@@ -568,7 +568,7 @@ async function handleExtensionDataUpsert(
   collection: string,
   userEmail: string,
 ): Promise<unknown> {
-  await ensureExtensionsTables();
+  await ensureExtensionsTables(event);
   const access = await requireExtensionDataAccess(event, extensionId, "editor");
   if (!access.ok) return access.response;
 
@@ -644,7 +644,7 @@ async function handleExtensionDataDelete(
   itemId: string,
   userEmail: string,
 ): Promise<unknown> {
-  await ensureExtensionsTables();
+  await ensureExtensionsTables(event);
   const access = await requireExtensionDataAccess(event, extensionId, "editor");
   if (!access.ok) return access.response;
 

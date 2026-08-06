@@ -17,7 +17,7 @@ These files move from `sonhyrd/agent-native` to the trunk and take new numbers:
 
 | in `sonhyrd/agent-native` | here | state |
 | --- | --- | --- |
-| `0002-local-workers-runtime-counts-as-hosted` | `0003` | reserved, moves with its code |
+| `0002-local-workers-runtime-counts-as-hosted` | `0003` | moved |
 | `0003-cloudflare-queues-for-durable-background-runs` | `0004` | reserved, moves with its code |
 | `0004-one-cold-isolate-init-mechanism` | `0005` | moved |
 | `0005-cloudflare-lane-upstreams-vault-lane-does-not` | `0006` | moved |
@@ -25,9 +25,9 @@ These files move from `sonhyrd/agent-native` to the trunk and take new numbers:
 | `0007-fork-versions-are-upstream-versions-plus-a-prerelease-tag` | `0008` | moved |
 | `0008-only-the-trunk-allocates-adr-numbers` | `0009` | moved |
 
-`0003` and `0004` are held empty on purpose. They belong to the two Cloudflare
-ADRs that move in Phase 1 alongside the code they describe; allocating them to
-anything else would reintroduce the collision this ADR exists to stop.
+`0004` is held empty on purpose. It belongs to the Cloudflare queues ADR, which
+moves alongside the code it describes; allocating it to anything else would
+reintroduce the collision this ADR exists to stop.
 
 Three in-document cross-references shift with them: the queues ADR cites
 ADR 0002 (becomes 0003), and ADRs 0006 and 0007 cite each other.

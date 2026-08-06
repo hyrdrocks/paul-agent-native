@@ -19,7 +19,10 @@ import {
   assertSingleTemplateNetlifyBuildOutput,
   bundleYjsRuntimeForServerlessOutput,
   CLOUDFLARE_WORKER_ESBUILD_EXTERNALS,
+  CLOUDFLARE_D1_BINDING_NAME,
   CLOUDFLARE_MODULE_STUB_MODULES,
+  CLOUDFLARE_UNRESOLVED_NATIVE_STUBS,
+  cloudflareUnresolvedNativeStubSource,
   CLOUDFLARE_WORKER_NODE_BUILTIN_STUB_MODULES,
   CLOUDFLARE_WORKER_STUB_MODULES,
   CLOUDFLARE_WORKER_STUB_SUBPATH_MODULES,
@@ -44,6 +47,7 @@ import {
   NITRO_RUNTIME_IGNORE_PATTERNS,
   nitroNoExternalsForPreset,
   patchCloudflareModuleNitroEntry,
+  resolveCloudflareD1Binding,
   resolveNitroBundledYjsEntry,
   runNitroBuildPipeline,
   sanitizeServerlessFunctionPackageManifest,
@@ -156,6 +160,160 @@ describe("Cloudflare module preset stubs", () => {
     expect(plugin.load(sentryStub as string)).toContain("captureException");
     expect(plugin.resolveId("@sentry/node/internals")).toBeNull();
     expect(plugin.resolveId("@anthropic-ai/sdk")).toBeNull();
+  });
+});
+
+describe("Cloudflare module Worker D1 binding", () => {
+  it("emits no binding when the build environment names no database", () => {
+    expect(resolveCloudflareD1Binding({})).toBeNull();
+  });
+
+  it("binds the database core actually reads", () => {
+    expect(
+      resolveCloudflareD1Binding({
+        CLOUDFLARE_D1_DATABASE_NAME: "design-local",
+        CLOUDFLARE_D1_DATABASE_ID: "00000000-0000-0000-0000-000000000000",
+      }),
+    ).toEqual({
+      binding: CLOUDFLARE_D1_BINDING_NAME,
+      database_name: "design-local",
+      database_id: "00000000-0000-0000-0000-000000000000",
+    });
+  });
+
+  it("refuses a half-configured database instead of dropping the binding", () => {
+    // A dropped binding leaves the Worker on the SQLite dialect and failing
+    // inside the native stub, which names neither the database nor the config.
+    expect(() =>
+      resolveCloudflareD1Binding({
+        CLOUDFLARE_D1_DATABASE_NAME: "design-local",
+      }),
+    ).toThrow(/CLOUDFLARE_D1_DATABASE_ID/);
+    expect(() =>
+      resolveCloudflareD1Binding({ CLOUDFLARE_D1_DATABASE_ID: "abc" }),
+    ).toThrow(/CLOUDFLARE_D1_DATABASE_NAME/);
+  });
+
+  it("writes the binding into the generated Wrangler config", () => {
+    const serverDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(serverDir, "wrangler.json"),
+      JSON.stringify({
+        name: "design",
+        main: "index.mjs",
+        assets: { binding: "ASSETS" },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(serverDir, "index.mjs"),
+      'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
+    );
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_D1_DATABASE_NAME: "design-local",
+      CLOUDFLARE_D1_DATABASE_ID: "00000000-0000-0000-0000-000000000000",
+    });
+
+    expect(
+      JSON.parse(
+        fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"),
+      ),
+    ).toMatchObject({
+      main: "worker.mjs",
+      d1_databases: [
+        {
+          binding: "DB",
+          database_name: "design-local",
+          database_id: "00000000-0000-0000-0000-000000000000",
+        },
+      ],
+    });
+  });
+
+  it("replaces only its own binding and keeps hand-added ones", () => {
+    const serverDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(serverDir, "wrangler.json"),
+      JSON.stringify({
+        name: "design",
+        main: "index.mjs",
+        d1_databases: [
+          { binding: "DB", database_name: "stale", database_id: "stale-id" },
+          { binding: "ANALYTICS", database_name: "a", database_id: "a-id" },
+        ],
+      }),
+    );
+    fs.writeFileSync(
+      path.join(serverDir, "index.mjs"),
+      'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
+    );
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_D1_DATABASE_NAME: "design-local",
+      CLOUDFLARE_D1_DATABASE_ID: "fresh-id",
+    });
+
+    expect(
+      JSON.parse(fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"))
+        .d1_databases,
+    ).toEqual([
+      { binding: "ANALYTICS", database_name: "a", database_id: "a-id" },
+      {
+        binding: "DB",
+        database_name: "design-local",
+        database_id: "fresh-id",
+      },
+    ]);
+  });
+
+  it("emits no binding at all when the build environment names no database", () => {
+    const serverDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(serverDir, "wrangler.json"),
+      JSON.stringify({ name: "design", main: "index.mjs" }),
+    );
+    fs.writeFileSync(
+      path.join(serverDir, "index.mjs"),
+      'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
+    );
+
+    configureCloudflareModuleWorkerOutput(serverDir, {});
+
+    expect(
+      JSON.parse(
+        fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"),
+      ),
+    ).not.toHaveProperty("d1_databases");
+  });
+});
+
+describe("cloudflareUnresolvedNativeStubSource", () => {
+  it("throws on every access instead of answering as an idle capability", async () => {
+    const source = cloudflareUnresolvedNativeStubSource("better-sqlite3");
+    const module = await import(
+      `data:text/javascript,${encodeURIComponent(source)}`
+    );
+
+    expect(() => module.watch()).toThrow(
+      /better-sqlite3 is unavailable in Cloudflare Workers/,
+    );
+    expect(() => new module.default.Database()).toThrow(
+      /better-sqlite3 is unavailable in Cloudflare Workers/,
+    );
+    expect(() => module.default()).toThrow(
+      /better-sqlite3 is unavailable in Cloudflare Workers/,
+    );
+    expect(() => new module.default()).toThrow(
+      /better-sqlite3 is unavailable in Cloudflare Workers/,
+    );
+  });
+
+  it("covers every package the post-build rewrite can generate", () => {
+    for (const mod of CLOUDFLARE_UNRESOLVED_NATIVE_STUBS) {
+      expect(cloudflareUnresolvedNativeStubSource(mod)).toContain(
+        `${mod} is unavailable in Cloudflare Workers`,
+      );
+    }
   });
 });
 

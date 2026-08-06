@@ -475,6 +475,123 @@ export function isPostgres(): boolean {
   return getDialect() === "postgres";
 }
 
+// ---------------------------------------------------------------------------
+// Dialect capabilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the active dialect can hold a transaction open across round trips —
+ * `BEGIN`, then read, decide, write, `COMMIT`.
+ *
+ * Read the name literally. This is NOT "can this dialect write atomically":
+ * every supported dialect can, and the one that answers `false` here does so
+ * through a batched statement list submitted as a single implicit transaction.
+ * Only the *interactive* form is missing, because there is no session to hold
+ * a `BEGIN` open on. A caller that reads this as "no atomicity available" will
+ * reach for a weaker workaround — a non-transactional write loop — and lose a
+ * guarantee it could have kept. Branch on it to choose *which* atomic shape to
+ * use, never to decide whether atomicity is possible.
+ */
+export function supportsInteractiveTransactions(): boolean {
+  return getDialect() !== "d1";
+}
+
+/**
+ * The human-readable name of a dialect, for surfaces that show a user which
+ * database they are connected to. Lives with the dialect so a product name is
+ * not assembled inside an unrelated HTML builder.
+ */
+const DIALECT_LABELS: Record<Dialect, string> = {
+  sqlite: "SQLite (local file)",
+  postgres: "Postgres",
+  d1: "Cloudflare D1",
+};
+
+export function getDialectLabel(): string {
+  return DIALECT_LABELS[getDialect()];
+}
+
+/**
+ * Whether the active dialect is configured by a platform binding rather than by
+ * a connection URL. Distinct from "no URL is set": a URL-configured dialect can
+ * still resolve its URL from an env var a given caller does not read.
+ */
+export function isPlatformBoundDialect(): boolean {
+  return getDialect() === "d1";
+}
+
+/**
+ * The platform binding the active dialect reads, resolved per property access.
+ *
+ * The binding arrives on `globalThis.__cf_env` once per Worker invocation,
+ * while a client built over it is typically cached for the isolate's lifetime.
+ * Capturing the binding at build time would pin every later request to the
+ * first invocation's I/O context; this proxy defers the lookup to the call, so
+ * each request uses its own.
+ *
+ * Throws when nothing is bound rather than returning an inert object: a caller
+ * that fell through to the local-SQLite path would reach the fail-closed
+ * `better-sqlite3` stub and report "is not a constructor", which names neither
+ * the missing binding nor the dialect that asked for it.
+ */
+export function platformBoundDbBinding(): object {
+  if (!isPlatformBoundDialect()) {
+    // The message below would name a product this process is not on. Callers
+    // reach the binding through `createPlatformBoundDbClient`, which asks first.
+    throw new Error(
+      "[db] platformBoundDbBinding() was called on a dialect configured by a " +
+        "connection URL, which has no platform binding to resolve.",
+    );
+  }
+  const resolve = (): Record<string | symbol, unknown> => {
+    const binding = getCloudflareD1Binding();
+    if (!binding) {
+      throw new Error(
+        "[agent-native] Database dialect resolved to Cloudflare D1 but no D1 database is bound to `env.DB`. " +
+          'Add a `d1_databases` entry with binding "DB" to the Worker\'s Wrangler config, or set DATABASE_URL to use an external database.',
+      );
+    }
+    return binding as Record<string | symbol, unknown>;
+  };
+  return new Proxy(
+    {},
+    {
+      get(_target, property) {
+        const binding = resolve();
+        const value = binding[property];
+        return typeof value === "function" ? value.bind(binding) : value;
+      },
+    },
+  );
+}
+
+export interface PlatformBoundDbClient {
+  /** A Drizzle instance over the platform binding, bound to `schema`. */
+  db: ReturnType<typeof import("drizzle-orm/d1").drizzle>;
+  /** The SQL flavour a Drizzle adapter must be told this client speaks. */
+  drizzleProvider: "sqlite" | "pg";
+}
+
+/**
+ * A Drizzle client for dialects configured by a platform binding rather than a
+ * connection URL, or `undefined` when the active dialect is URL-configured and
+ * the caller should build its own client from that URL.
+ *
+ * `undefined` means "this dialect has no platform binding to resolve", which is
+ * a different answer from "the binding is missing" — that case throws on first
+ * use through `platformBoundDbBinding`.
+ */
+export async function createPlatformBoundDbClient(
+  schema: Record<string, unknown>,
+): Promise<PlatformBoundDbClient | undefined> {
+  if (!isPlatformBoundDialect()) return undefined;
+  const { drizzle } = await import("drizzle-orm/d1");
+  return {
+    db: drizzle(platformBoundDbBinding() as never, { schema }),
+    drizzleProvider: "sqlite",
+  };
+}
+
 function dialectForConfig(config: DbExecConfig): Dialect {
   const url = config.url ?? "";
   if (

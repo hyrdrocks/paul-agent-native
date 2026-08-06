@@ -28,6 +28,7 @@ import {
 import { TEMPLATES } from "../cli/templates-meta.js";
 import { getDbExec, isPostgres } from "../db/client.js";
 import {
+  createPlatformBoundDbClient,
   getDialect,
   getDatabaseUrl,
   getDatabaseAuthToken,
@@ -1256,6 +1257,20 @@ async function buildDatabaseConfig(
     return drizzleAdapter(db, {
       provider: "pg",
       schema: pgAuthSchema,
+    });
+  }
+
+  // A dialect configured by a platform binding rather than a url resolves its
+  // own client — auth asks the database layer for one instead of reaching for
+  // the host's binding itself. `undefined` means "url-configured", which the
+  // branches below handle; a bound dialect with nothing bound throws from the
+  // client rather than falling through to the fail-closed better-sqlite3 stub.
+  const platformClient = await createPlatformBoundDbClient(sqliteAuthSchema);
+  if (platformClient) {
+    const { drizzleAdapter } = await import("better-auth/adapters/drizzle");
+    return drizzleAdapter(platformClient.db, {
+      provider: platformClient.drizzleProvider,
+      schema: sqliteAuthSchema,
     });
   }
 

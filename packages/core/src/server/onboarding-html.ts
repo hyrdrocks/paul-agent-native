@@ -7,6 +7,7 @@
  * After first account exists, this page acts as a normal login page.
  */
 
+import { getDialectLabel, isPlatformBoundDialect } from "../db/client.js";
 import { getLocaleInitScript } from "../localization/server.js";
 import {
   DEFAULT_LOCALE,
@@ -43,8 +44,15 @@ function hasGoogleOAuth(): boolean {
   return hasGoogleSignInCredentials();
 }
 
-function getConnectionLabel(): string {
+export function getConnectionLabel(): string {
   const url = process.env.DATABASE_URL || "";
+  // A platform-bound dialect has no url at all, so an unset url alone does not
+  // mean the local SQLite file — on a Worker there is no such file to mean.
+  // That case takes the label from the dialect, which is the only thing that
+  // knows which product it is. Deliberately not `getDatabaseUrl()`: that also
+  // reads Netlify's and app-prefixed env vars, and widening this surface to
+  // them would relabel those deployments as a side effect of moving the label.
+  if (!url && isPlatformBoundDialect()) return getDialectLabel();
   if (!url) return "SQLite (local file)";
   if (url.startsWith("pglite:")) return "PGlite (local Postgres)";
   if (url.startsWith("postgres://") || url.startsWith("postgresql://")) {

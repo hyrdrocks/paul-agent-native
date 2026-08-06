@@ -1459,6 +1459,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -1546,6 +1549,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -1815,6 +1821,9 @@ describe("server/auth", () => {
         getBetterAuthSync: vi.fn(() => undefined),
       }));
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: vi.fn(async () => ({ rows: [] })) }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -1883,6 +1892,9 @@ describe("server/auth", () => {
         getBetterAuthSync: vi.fn(() => undefined),
       }));
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: vi.fn(async () => ({ rows: [] })) }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -1931,6 +1943,9 @@ describe("server/auth", () => {
         getBetterAuthSync: vi.fn(() => undefined),
       }));
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: vi.fn(async () => ({ rows: [] })) }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -2000,6 +2015,9 @@ describe("server/auth", () => {
         getBetterAuthSync: vi.fn(() => undefined),
       }));
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: vi.fn(async () => ({ rows: [] })) }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -2070,6 +2088,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => false,
@@ -2119,6 +2140,9 @@ describe("server/auth", () => {
       delete process.env.ACCESS_TOKENS;
 
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: vi.fn(async () => ({ rows: [] })) }),
         isPostgres: () => false,
         isLocalDatabase: () => false,
@@ -2178,6 +2202,9 @@ describe("server/auth", () => {
       delete process.env.ACCESS_TOKENS;
 
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: vi.fn(async () => ({ rows: [] })) }),
         isPostgres: () => false,
         isLocalDatabase: () => false,
@@ -2465,6 +2492,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         intType: () => "INTEGER",
@@ -2619,6 +2649,9 @@ describe("server/auth", () => {
         })),
       }));
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({
           execute: vi.fn(async () => ({ rows: [] })),
         }),
@@ -2645,6 +2678,9 @@ describe("server/auth", () => {
 
       const mockExecute = vi.fn().mockResolvedValue({ rows: [] });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -2670,6 +2706,9 @@ describe("server/auth", () => {
 
       const mockExecute = vi.fn().mockResolvedValue({ rows: [] });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -2695,6 +2734,9 @@ describe("server/auth", () => {
 
       const mockExecute = vi.fn().mockResolvedValue({ rows: [] });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -2724,6 +2766,9 @@ describe("server/auth", () => {
 
       const mockExecute = vi.fn().mockResolvedValue({ rows: [] });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -2786,6 +2831,9 @@ describe("server/auth", () => {
 
       const mockExecute = vi.fn().mockResolvedValue({ rows: [] });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -2827,6 +2875,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -2860,6 +2911,9 @@ describe("server/auth", () => {
       // No legacy session / revoke rows — every table lookup returns empty.
       const mockExecute = vi.fn().mockResolvedValue({ rows: [] });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -2911,6 +2965,9 @@ describe("server/auth", () => {
 
       const mockExecute = vi.fn().mockResolvedValue({ rows: [] });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -2956,6 +3013,9 @@ describe("server/auth", () => {
 
       const mockExecute = vi.fn().mockResolvedValue({ rows: [] });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -3010,6 +3070,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -3049,6 +3112,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -3102,6 +3168,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -3146,6 +3215,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => false,
@@ -3190,6 +3262,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -3256,6 +3331,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -3300,6 +3378,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => true,
@@ -3935,6 +4016,9 @@ describe("server/auth", () => {
 
       const mockExecute = vi.fn(async () => ({ rows: [] }));
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => false,
@@ -3966,6 +4050,9 @@ describe("server/auth", () => {
 
       const mockExecute = vi.fn(async () => ({ rows: [] }));
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => false,
@@ -4005,6 +4092,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => false,
@@ -4076,6 +4166,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => false,
@@ -4140,6 +4233,9 @@ describe("server/auth", () => {
         return { rows: [] };
       });
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => false,
@@ -4180,6 +4276,9 @@ describe("server/auth", () => {
 
       const mockExecute = vi.fn(async () => ({ rows: [] }));
       vi.doMock("../db/client.js", () => ({
+        getDialect: () => "sqlite",
+        isPlatformBoundDialect: () => false,
+        getDialectLabel: () => "SQLite (local file)",
         getDbExec: () => ({ execute: mockExecute }),
         isPostgres: () => false,
         isLocalDatabase: () => false,

@@ -41,6 +41,9 @@ vi.mock("../tracking/registry.js", () => ({
 }));
 
 vi.mock("./store.js", () => ({
+  // The handler initialises the store's schema on the way in, threading its own
+  // request event through; these tests are about routing, not DDL.
+  ensureObservabilityTables: vi.fn(async () => {}),
   getObservabilityOverview: (...args: unknown[]) =>
     mockGetObservabilityOverview(...args),
   getTraceSummaries: (...args: unknown[]) => mockGetTraceSummaries(...args),

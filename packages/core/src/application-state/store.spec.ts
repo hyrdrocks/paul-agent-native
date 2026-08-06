@@ -44,16 +44,18 @@ const emitAppStateChange = vi.fn();
 const emitAppStateDelete = vi.fn();
 const dbMockState = vi.hoisted(() => ({
   localDatabase: true,
-  dialect: "sqlite" as "sqlite" | "postgres" | "d1",
+  interactiveTransactions: true,
+  atomicBatch: true as boolean,
 }));
 
 vi.mock("../db/client.js", () => ({
-  getDbExec: () => ({ ...rawClient, atomicBatch }),
-  getDialect: () => dbMockState.dialect,
+  getDbExec: () =>
+    dbMockState.atomicBatch ? { ...rawClient, atomicBatch } : { ...rawClient },
   intType: () => "INTEGER",
   isConnectionError: (error: { code?: string }) => error?.code === "ECONNRESET",
   isLocalDatabase: () => dbMockState.localDatabase,
   isPostgres: () => false,
+  supportsInteractiveTransactions: () => dbMockState.interactiveTransactions,
 }));
 
 vi.mock("./emitter.js", () => ({
@@ -89,7 +91,8 @@ afterEach(() => {
   sqlite.close();
   vi.clearAllMocks();
   dbMockState.localDatabase = true;
-  dbMockState.dialect = "sqlite";
+  dbMockState.interactiveTransactions = true;
+  dbMockState.atomicBatch = true;
 });
 
 describe("application-state store", () => {
@@ -320,8 +323,8 @@ describe("application-state store", () => {
     expect(await appStateGet(SESSION, "proposal")).toBeNull();
   });
 
-  it("uses an atomic D1 batch and rolls back every mutation on a mismatch", async () => {
-    dbMockState.dialect = "d1";
+  it("uses one atomic batch and rolls back every mutation on a mismatch without interactive transactions", async () => {
+    dbMockState.interactiveTransactions = false;
     await appStatePut(SESSION, "pending", { repromptId: "r1" });
     await appStatePut(SESSION, "proposal", { proposalId: "p1" });
     atomicBatch.mockClear();
@@ -380,8 +383,8 @@ describe("application-state store", () => {
     expect(await appStateGet(SESSION, "proposal")).toBeNull();
   });
 
-  it("atomically applies mixed D1 update, insert, and delete operations", async () => {
-    dbMockState.dialect = "d1";
+  it("atomically applies mixed batched update, insert, and delete operations", async () => {
+    dbMockState.interactiveTransactions = false;
     await appStatePut(SESSION, "pending", { repromptId: "r1" });
     await appStatePut(SESSION, "prior", { proposalId: "p1" });
 
@@ -409,10 +412,10 @@ describe("application-state store", () => {
     expect(await appStateGet(SESSION, "prior")).toBeNull();
   });
 
-  it("propagates non-guard D1 batch failures", async () => {
-    dbMockState.dialect = "d1";
+  it("propagates non-guard batch failures", async () => {
+    dbMockState.interactiveTransactions = false;
     await appStatePut(SESSION, "pending", { repromptId: "r1" });
-    atomicBatch.mockRejectedValueOnce(new Error("D1 batch unavailable"));
+    atomicBatch.mockRejectedValueOnce(new Error("batch transport unavailable"));
 
     await expect(
       appStateCompareAndSetMany(SESSION, [
@@ -422,8 +425,46 @@ describe("application-state store", () => {
           nextValue: null,
         },
       ]),
-    ).rejects.toThrow("D1 batch unavailable");
+    ).rejects.toThrow("batch transport unavailable");
     expect(await appStateGet(SESSION, "pending")).toEqual({ repromptId: "r1" });
+  });
+
+  it("refuses to write when neither atomic shape is available", async () => {
+    // No interactive transaction and no batch means there is no way to apply
+    // the operations as a unit. Applying them one by one would look like a
+    // success and leave a half-written multi-key CAS behind.
+    dbMockState.interactiveTransactions = false;
+    dbMockState.atomicBatch = false;
+    await appStatePut(SESSION, "pending", { repromptId: "r1" });
+
+    await expect(
+      appStateCompareAndSetMany(SESSION, [
+        {
+          key: "pending",
+          expectedValue: { repromptId: "r1" },
+          nextValue: null,
+        },
+      ]),
+    ).rejects.toThrow(/requires atomic batch support/);
+    expect(await appStateGet(SESSION, "pending")).toEqual({ repromptId: "r1" });
+  });
+
+  it("uses the interactive transaction when the dialect supports one", async () => {
+    await appStatePut(SESSION, "pending", { repromptId: "r1" });
+    atomicBatch.mockClear();
+    rawClient.transaction.mockClear();
+
+    await expect(
+      appStateCompareAndSetMany(SESSION, [
+        {
+          key: "pending",
+          expectedValue: { repromptId: "r1" },
+          nextValue: { repromptId: "r2" },
+        },
+      ]),
+    ).resolves.toBe(true);
+    expect(rawClient.transaction).toHaveBeenCalledTimes(1);
+    expect(atomicBatch).not.toHaveBeenCalled();
   });
 
   it("rejects oversized hosted application_state values", async () => {

@@ -10,7 +10,7 @@
  * Runs once on startup after a short delay, then on a 24-hour interval. Timers
  * are unref'd so they never keep the process alive on their own.
  */
-import { deleteOldAuditEvents } from "./store.js";
+import { deleteOldAuditEvents, ensureAuditTables } from "./store.js";
 
 const DEFAULT_RETENTION_DAYS = 365;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
@@ -36,6 +36,12 @@ function resolveRetentionDays(): number {
 export async function runAuditCleanupOnce(): Promise<number | null> {
   const days = resolveRetentionDays();
   if (days === 0) return null;
+  // This job ticks on a timer, outside any request, so the init memo will not
+  // hand it a request-scoped promise and it runs the DDL itself — one redundant
+  // idempotent `CREATE TABLE IF NOT EXISTS` round trip per boot. That is the
+  // deliberate trade for never awaiting an init started by a request that has
+  // already ended; do not "optimize" it away by re-adding a startup init call.
+  await ensureAuditTables();
   const cutoff = Date.now() - days * ONE_DAY_MS;
   return deleteOldAuditEvents(cutoff);
 }
