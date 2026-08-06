@@ -11,26 +11,36 @@ collision structurally — a reserved number block per lane, or date-slug
 filenames. Both fix it by making the number carry less information, paid
 forever, to avoid a renumber done once.
 
+A number is assigned when a document lands in the trunk, in the order documents
+land. Slots are never reserved ahead of a move. Reserving was tried and failed
+within hours: two slots were held for the Cloudflare ADRs known at the time, and
+the host-adapter work merged two more that nobody had accounted for. A
+reservation is a prediction about work not yet done, and it fails in the one
+direction that hurts — silently, by being too small.
+
 ## Consequences
 
-These files move from `sonhyrd/agent-native` to the trunk and take new numbers:
+These documents live in `sonhyrd/agent-native` and take a trunk number when they
+move, alongside the code they describe:
 
-| in `sonhyrd/agent-native` | here | state |
-| --- | --- | --- |
-| `0002-local-workers-runtime-counts-as-hosted` | `0003` | reserved, moves with its code |
-| `0003-cloudflare-queues-for-durable-background-runs` | `0004` | reserved, moves with its code |
-| `0004-one-cold-isolate-init-mechanism` | `0005` | moved |
-| `0005-cloudflare-lane-upstreams-vault-lane-does-not` | `0006` | moved |
-| `0006-app-repos-own-their-template-source` | `0007` | moved |
-| `0007-fork-versions-are-upstream-versions-plus-a-prerelease-tag` | `0008` | moved |
-| `0008-only-the-trunk-allocates-adr-numbers` | `0009` | moved |
+| in `sonhyrd/agent-native` | moves with |
+| --- | --- |
+| `0002-local-workers-runtime-counts-as-hosted` | the hosted-runtime classification |
+| `0003-cloudflare-queues-for-durable-background-runs` | the Queues transport |
+| `0004-host-adapters-live-in-tree-behind-registries` | the host seam |
+| `0005-the-host-owns-fallback-storage-policy` | host-owned fallback storage |
 
-`0003` and `0004` are held empty on purpose. They belong to the two Cloudflare
-ADRs that move in Phase 1 alongside the code they describe; allocating them to
-anything else would reintroduce the collision this ADR exists to stop.
+The five process ADRs and the fork-distribution glossary are here, holding
+`0005`-`0009`. The copies still in `sonhyrd/agent-native` are superseded and are
+deleted in Phase 1.
 
-Three in-document cross-references shift with them: the queues ADR cites
-ADR 0002 (becomes 0003), and ADRs 0006 and 0007 cite each other.
+Two in-document cross-references shift on any move: the queues ADR cites
+ADR 0002, and the upstreaming and template-ownership ADRs cite each other.
+
+This trunk will end up with two glossaries — the fork-distribution vocabulary
+in `CONTEXT.md` here, and the framework host vocabulary that arrives with the
+host seam in Phase 1. They are separate bounded contexts and should not be
+merged into one list; this repo needs a context map when the second arrives.
 
 Source files stop citing ADR paths entirely. `agent/durable-background.ts`,
 `agent/durable-background.spec.ts` and `agent/background-queue.ts` each carry a
