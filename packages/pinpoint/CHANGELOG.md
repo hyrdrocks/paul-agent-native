@@ -1,6 +1,6 @@
 # @agent-native/pinpoint
 
-## 1.0.0-paul.0
+## 0.1.19-paul.0
 
 ### Patch Changes
 
