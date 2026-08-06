@@ -55,8 +55,11 @@ import {
 import { generateActionRegistryForProject } from "../vite/action-types-plugin.js";
 import {
   collectImmutableAssetPaths,
+  collectMutableAssetPaths,
+  hasAssetsDir,
   IMMUTABLE_ASSET_CACHE_CONTROL,
   IMMUTABLE_ASSET_CACHE_HEADERS,
+  IMMUTABLE_ASSET_ROUTE_GLOB,
   prefixAssetPath,
 } from "./immutable-assets.js";
 import {
@@ -978,17 +981,31 @@ function addImmutableAssetRouteRule(
   };
 }
 
+/**
+ * Carry the immutable policy on one glob per mount point, never one rule per
+ * asset: Nitro writes a `_headers` line per route rule and Cloudflare rejects
+ * that file past 100 rules, so an enumeration turns every asset the app adds
+ * into deploy risk. See IMMUTABLE_ASSET_ROUTE_GLOB for why the width is safe
+ * and what it costs.
+ */
 export function addImmutableAssetRouteRulesForClientBuild(
   routeRules: RouteRules,
   clientDir: string,
   appBasePath = "",
 ): void {
-  for (const assetPath of collectImmutableAssetPaths(clientDir)) {
-    addImmutableAssetRouteRule(routeRules, assetPath);
-    const mountedPath = prefixAssetPath(assetPath, appBasePath);
-    if (mountedPath !== assetPath) {
-      addImmutableAssetRouteRule(routeRules, mountedPath);
-    }
+  if (!hasAssetsDir(clientDir)) return;
+
+  addImmutableAssetRouteRule(routeRules, IMMUTABLE_ASSET_ROUTE_GLOB);
+  const mountedGlob = prefixAssetPath(IMMUTABLE_ASSET_ROUTE_GLOB, appBasePath);
+  if (mountedGlob !== IMMUTABLE_ASSET_ROUTE_GLOB) {
+    addImmutableAssetRouteRule(routeRules, mountedGlob);
+  }
+
+  const mutable = collectMutableAssetPaths(clientDir);
+  if (mutable.length > 0) {
+    console.warn(
+      `[deploy] ${mutable.length} file(s) under /assets/ carry no content hash and will be cached for a year as part of the ${IMMUTABLE_ASSET_ROUTE_GLOB} rule. Move any file you replace in place out of public/assets/: ${mutable.join(", ")}`,
+    );
   }
 }
 
