@@ -1,0 +1,80 @@
+// Reference wrangler config for hyrdrocks/paul-design-app.
+//
+// NOT a drop-in file. Nitro merges the app's own wrangler.jsonc into the
+// generated .output/server/wrangler.json and owns `main` and `assets` itself,
+// and the preset writes d1_databases, r2_buckets, queues, browser and limits
+// from build-time environment variables (see design-app.build.env.example).
+//
+// So the app repo's committed wrangler.jsonc should carry the hand-authored
+// half only — name, account, compatibility, vars, routes, observability. The
+// binding blocks below are shown so the expected result is checkable against
+// the generated file, and are marked accordingly.
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+
+  // Fixed, not a preference: core derives the background queue name from the
+  // Worker name. A different name produces into a queue that does not exist.
+  "name": "paul-design-app",
+
+  // "Pauls Job" on Workers Paid. The OAuth token can see two accounts, so
+  // wrangler cannot infer one and fails non-interactively without this.
+  // An account id is an identifier, not a credential.
+  "account_id": "6e11e8e7c871694bd4789ce8661fe326",
+
+  "compatibility_date": "2026-07-30",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "vars": {
+    // Public origin. Better Auth builds cookies and OAuth redirects from
+    // BETTER_AUTH_URL, so this must match the route below exactly.
+    // design.paulsjob.ai does NOT exist yet — the custom_domain route creates
+    // the DNS record on first deploy.
+    "APP_URL": "https://design.paulsjob.ai",
+    "BETTER_AUTH_URL": "https://design.paulsjob.ai",
+
+    // Public by construction: the R2 provider persists a URL, so the bucket is
+    // world-readable and the random object key is what guards the object.
+    "CLOUDFLARE_R2_PUBLIC_BASE_URL": "https://pub-547d1dbdb13249b492798093733b130b.r2.dev"
+  },
+
+  "routes": [{ "pattern": "design.paulsjob.ai", "custom_domain": true }],
+
+  // A *.workers.dev origin would not match BETTER_AUTH_URL, so auth cookies
+  // would break silently there.
+  "preview_urls": false,
+
+  "observability": { "enabled": true }
+
+  // ---------------------------------------------------------------------
+  // Emitted by the preset. Do not hand-author these in the app repo; they
+  // are recorded here so the generated wrangler.json can be checked.
+  //
+  // "d1_databases": [
+  //   { "binding": "DB",
+  //     "database_name": "paul-design-app",
+  //     "database_id": "256288ec-77ac-4e9d-ab1b-8d415e4ee997" }
+  // ],
+  // "r2_buckets": [
+  //   { "binding": "UPLOADS", "bucket_name": "paul-design-app-uploads" }
+  // ],
+  // "browser": { "binding": "BROWSER" },
+  // "queues": {
+  //   "producers": [
+  //     { "binding": "AGENT_NATIVE_BACKGROUND_QUEUE",
+  //       "queue": "paul-design-app-agent-background" }
+  //   ],
+  //   "consumers": [
+  //     { "queue": "paul-design-app-agent-background",
+  //       "max_batch_size": 1,
+  //       "max_batch_timeout": 0,
+  //       "max_retries": 3,
+  //       "dead_letter_queue": "paul-design-app-agent-background-dlq" }
+  //   ]
+  // },
+  // "limits": { "cpu_ms": 300000 }
+  //
+  // For the local `just cf` run, add "remote": true to the r2_buckets entry:
+  // with a local bucket the upload succeeds and the URL the app stores 404s,
+  // because that URL names the real r2.dev host.
+  // ---------------------------------------------------------------------
+}
