@@ -3,7 +3,7 @@
  * Pass in an image file and editing instructions.
  *
  * Usage:
- *   pnpm action edit-image --input public/generated/slide5-v3.png --prompt "Remove the background and make it transparent. Remove any logos." --output public/assets/generated/slide5-edited
+ *   pnpm action edit-image --input public/generated/slide5-v3.png --prompt "Remove the background and make it transparent. Remove any logos." --output public/generated/slide5-edited
  */
 
 import { resolveSecret } from "@agent-native/core/server";

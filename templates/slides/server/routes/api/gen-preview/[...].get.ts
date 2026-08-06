@@ -1,24 +1,23 @@
 import { createReadStream } from "fs";
-import { stat } from "fs/promises";
-import path from "path";
 
 import { streamFile } from "@agent-native/core/server";
 import { defineEventHandler, setResponseStatus } from "h3";
 
-const genPreviewDir = path.resolve(process.cwd(), "public/generated");
+import {
+  PUBLIC_GENERATED_DIR,
+  lookupPublicFile,
+} from "../../../lib/public-media";
 
 export default defineEventHandler(async (event) => {
   const filename = event.path.replace("/api/gen-preview/", "");
-  const filepath = path.resolve(genPreviewDir, filename);
-  if (!filepath.startsWith(genPreviewDir + path.sep)) {
+  const found = await lookupPublicFile(PUBLIC_GENERATED_DIR, filename);
+  if (found.status === "forbidden") {
     setResponseStatus(event, 403);
     return { error: "Forbidden" };
   }
-  try {
-    await stat(filepath);
-    return streamFile(createReadStream(filepath));
-  } catch {
+  if (found.status === "missing") {
     setResponseStatus(event, 404);
     return { error: "Not found" };
   }
+  return streamFile(createReadStream(found.filepath));
 });
