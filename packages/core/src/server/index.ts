@@ -10,9 +10,18 @@ export {
   type BackgroundDispatchTarget,
   backgroundDispatchPathOrThrow,
   dispatchPathTargetsNetlifyBackgroundFunction,
+  isInBackgroundInvocationScope,
+  reportUnclaimedQueueBackgroundRunOnce,
   resolveBackgroundDispatchTarget,
   resolveDurableBackgroundDispatchPath,
 } from "../agent/durable-background.js";
+export {
+  AGENT_BACKGROUND_QUEUE_BINDING,
+  agentBackgroundQueueName,
+  hasBoundBackgroundQueue,
+  OversizedBackgroundQueueMessageError,
+  sendBackgroundQueueMessage,
+} from "../agent/background-queue.js";
 
 export {
   readBody,
@@ -334,6 +343,8 @@ export {
   type H3AppShim,
 } from "./framework-request-handler.js";
 export {
+  describeBackgroundDispatchTarget,
+  fireBackgroundDispatch,
   fireInternalDispatch,
   resolveSelfDispatchBaseUrl,
   type FireInternalDispatchOptions,

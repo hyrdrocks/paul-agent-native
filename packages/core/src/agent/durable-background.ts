@@ -49,6 +49,7 @@ import {
   verifyInternalToken,
 } from "../integrations/internal-token.js";
 import { isCloudflareRuntime } from "../shared/runtime.js";
+import { hasBoundBackgroundQueue } from "./background-queue.js";
 
 /**
  * Framework route the background function actually runs — sibling to
@@ -140,7 +141,8 @@ function isNetlifyHostedRuntimeForDispatch(): boolean {
  * - `http` — POST to a host function url that carries its own long budget
  *   (today: the emitted Netlify background function).
  * - `queue` — hand the run to a host queue; the consumer carries the budget, so
- *   there is no path to POST to. Nothing resolves here yet.
+ *   there is no path to POST to (today: a Cloudflare Worker with the emitted
+ *   background queue bound).
  * - `inline-route` — the portable in-process framework route. Same isolate,
  *   same clamp: no long budget is implied.
  */
@@ -205,17 +207,92 @@ export function resolveBackgroundDispatchTarget(options?: {
       expectsBackgroundRuntime: true,
     };
   }
-  // No host transport answered, so the run goes to the in-process route. On a
-  // host whose durable gate is open that is a degrade, not a choice; the
-  // caller opt-out above returns before reaching here so a deliberate inline
-  // run is never announced as one.
-  reportInlineDurableBackgroundOnce();
+  // Cloudflare's equivalent of the Netlify function url. A consumer invocation
+  // carries a documented 15-minute wall budget; the binding's presence is the
+  // proof that a consumer exists to claim the message, exactly as the emitted
+  // function's default url is on Netlify.
+  if (hasBoundBackgroundQueue()) {
+    return { kind: "queue", expectsBackgroundRuntime: true };
+  }
+  reportMissingWorkersQueueTransportOnce();
   return {
     kind: "inline-route",
     path: fallbackPath,
     expectsBackgroundRuntime: false,
   };
 }
+
+export const WORKERS_QUEUE_TRANSPORT_MISSING_NOTICE_KEY =
+  "__AGENT_NATIVE_WORKERS_QUEUE_TRANSPORT_MISSING_NOTICE__";
+
+/**
+ * The durable gate is open on Workers but nothing resolves to the `queue`
+ * transport, so the run goes to the in-process route: a real inline run on the
+ * foreground clamp, not the durable budget the gate promised. That is exactly
+ * the shape this whole feature exists to stop being silent about — an app can
+ * otherwise lose the long budget for its entire lifetime while looking healthy.
+ * Announce it once per isolate.
+ */
+function reportMissingWorkersQueueTransportOnce(): void {
+  if (!isCloudflareRuntime()) return;
+  if (!isAgentChatDurableBackgroundEnabled()) return;
+  const scope = globalThis as Record<string, unknown>;
+  if (scope[WORKERS_QUEUE_TRANSPORT_MISSING_NOTICE_KEY] === true) return;
+  scope[WORKERS_QUEUE_TRANSPORT_MISSING_NOTICE_KEY] = true;
+  console.error(
+    "[agent-chat] durable background is enabled on the Cloudflare Workers runtime but no " +
+      "queue transport is bound, so this run is dispatched to the in-process route and " +
+      "executes inline under the foreground clamp — NOT on the durable background budget. " +
+      `Bind the background queue, or set ${AGENT_CHAT_DURABLE_BACKGROUND_ENV}=false to ask ` +
+      "for the inline streaming loop deliberately.",
+  );
+}
+
+export const WORKERS_QUEUE_UNCLAIMED_NOTICE_KEY =
+  "__AGENT_NATIVE_WORKERS_QUEUE_UNCLAIMED_NOTICE__";
+
+/**
+ * The queue accepted the message and no consumer ever claimed the run.
+ *
+ * This is NOT the same condition as a failed send, and must never be collapsed
+ * into it: a send that fails is a known state with a working fallback, while a
+ * send that succeeds into a void is an undiagnosable deploy defect — the
+ * consumer registration missing from the deployed Worker, or a consumer wired
+ * to a different queue than the producer. The circuit breaker still recovers
+ * the run inline (so the user gets a working turn), which is exactly why
+ * nothing else would ever surface this. Announce it once per isolate.
+ */
+export function reportUnclaimedQueueBackgroundRunOnce(detail: string): void {
+  const scope = globalThis as Record<string, unknown>;
+  if (scope[WORKERS_QUEUE_UNCLAIMED_NOTICE_KEY] === true) return;
+  scope[WORKERS_QUEUE_UNCLAIMED_NOTICE_KEY] = true;
+  console.error(
+    "[agent-chat] the durable background run was accepted by the Cloudflare queue but NO " +
+      "consumer claimed it within grace, so it was recovered inline under the foreground " +
+      "clamp — the long budget was lost. The producer binding works, so this is a consumer " +
+      "problem: check that the deployed Worker declares the queue consumer registration " +
+      `emitted by the build and that it names the same queue as the producer. ${detail}`,
+  );
+}
+
+/**
+ * Entry point the generated Cloudflare Worker consumer uses to enter the
+ * per-invocation background scope.
+ *
+ * The consumer is emitted next to Nitro's bundle by `deploy/build.ts` and is
+ * therefore OUTSIDE this module graph, yet it must enter the very same
+ * AsyncLocalStorage instance this module reads — a second instance would leave
+ * `isInBackgroundFunctionRuntime()` false inside the consumer, and the run
+ * would quietly take the foreground clamp it was handed to the queue to
+ * escape. Publishing the function on `globalThis` is what bridges the two
+ * graphs; the consumer refuses to run the message if it is missing.
+ */
+export const BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY =
+  "__AGENT_NATIVE_ENTER_BACKGROUND_INVOCATION_SCOPE__";
+
+(globalThis as Record<string, unknown>)[
+  BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY
+] = runInBackgroundInvocationScope;
 
 /**
  * Path of a target for the callers still typed on a plain string. A `queue`
@@ -245,35 +322,6 @@ export function resolveDurableBackgroundDispatchPath(
 ): string {
   return backgroundDispatchPathOrThrow(
     resolveBackgroundDispatchTarget({ fallbackPath }),
-  );
-}
-
-export const WORKERS_INLINE_DURABLE_BACKGROUND_NOTICE_KEY =
-  "__AGENT_NATIVE_WORKERS_INLINE_DURABLE_BACKGROUND_NOTICE__";
-
-/**
- * The durable gate is open on the Workers runtime but nothing here carries a
- * handoff, so the run goes to the in-process route: a real inline run on the
- * foreground clamp, not the durable budget the gate promised.
- *
- * The Netlify path already announces its own version of this. Workers cannot
- * reuse it — that notice keys off a dispatch path naming the emitted Netlify
- * function, which this host never targets — so without this the degrade is
- * completely silent and an app can lose the long budget for its whole lifetime
- * while looking healthy. Announce it once per isolate.
- */
-function reportInlineDurableBackgroundOnce(): void {
-  if (!isCloudflareRuntime()) return;
-  if (!isAgentChatDurableBackgroundEnabled()) return;
-  const scope = globalThis as Record<string, unknown>;
-  if (scope[WORKERS_INLINE_DURABLE_BACKGROUND_NOTICE_KEY] === true) return;
-  scope[WORKERS_INLINE_DURABLE_BACKGROUND_NOTICE_KEY] = true;
-  console.error(
-    "[agent-chat] durable background is enabled on the Cloudflare Workers runtime but no " +
-      "durable transport is available, so this run is dispatched to the in-process route and " +
-      "executes inline under the foreground clamp — NOT on the durable background budget. " +
-      `Set ${AGENT_CHAT_DURABLE_BACKGROUND_ENV}=false to ask for the inline streaming loop ` +
-      "deliberately.",
   );
 }
 
@@ -594,7 +642,7 @@ export function isAgentChatDurableBackgroundEnabled(options?: {
   // Workers gets the same default-on/explicit-opt-out shape Netlify has,
   // because on this runtime the gate is a fact about the host rather than a
   // per-app choice. Until a durable transport for it exists the run is still
-  // recovered inline — loudly, see `reportInlineDurableBackgroundOnce`.
+  // recovered inline — loudly, see `reportMissingWorkersQueueTransportOnce`.
   const workersDefaultOptIn =
     isCloudflareRuntime() && !isDurableBackgroundFlagExplicitlyDisabled();
   const workspaceAppOptIn =
