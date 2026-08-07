@@ -1,10 +1,6 @@
 import { z } from "zod";
 
 import { defineAction } from "../../action.js";
-// Registers this host's object storage provider and fallback-storage policy.
-// This action imports the registry directly rather than the package barrel, so
-// it must pull the adapters in itself or a Worker resolves neither.
-import "../../hosts/index.js";
 import { ssrfSafeFetch } from "../../extensions/url-safety.js";
 import { getRequestUserEmail } from "../../server/request-context.js";
 import {

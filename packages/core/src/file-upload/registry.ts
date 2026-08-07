@@ -1,5 +1,7 @@
+import { registerCloudflareFallbackStorage } from "../hosts/cloudflare/fallback-storage.js";
 import { resolveFallbackStorageDecision } from "../hosts/fallback-storage.js";
 import { builderFileUploadProvider } from "./builder.js";
+import { cloudflareR2FileUploadProvider } from "./cloudflare-r2.js";
 import {
   FileUploadProviderUnreadableError,
   FileUploadStorageNotConfiguredError,
@@ -29,10 +31,33 @@ const providers: Map<string, FileUploadProvider> =
 const warnedFallbackRef: { value: boolean } =
   (globals.__agentNativeFileUploadWarnedFallback ??= { value: false });
 
-// The baseline answers for every process no host adapter claims, so it must be
-// registered wherever `uploadFile` is reachable rather than wherever the host
-// barrel happened to be imported.
+// Registered HERE, by value, rather than through the `hosts/index.js` barrel.
+// The barrel is a side-effect-only import, and this package declares
+// `sideEffects` as an allow-list that does not name it — so a bundler drops it,
+// and the seam silently resolves as though no host claimed the process. That
+// failure is invisible until a payload lands in a database. Value imports
+// cannot be dropped.
+//
+// The edge runs registry -> host and never the reverse: an adapter that
+// imported this module back would be evaluated before its own provider map
+// exists.
 registerPortableFallbackStoragePolicy();
+registerCloudflareFallbackStorage();
+
+/**
+ * Built-in providers, consulted after every user-registered one and in this
+ * order. Not entries in `providers`: an app that registers its own provider
+ * has made a deliberate choice, and a builtin inserted ahead of it in map
+ * order would quietly win.
+ *
+ * R2 before Builder because R2 reports itself configured only when a bucket is
+ * actually bound to this Worker, which is as deliberate as connecting Builder
+ * and is the host's own store.
+ */
+const BUILTIN_PROVIDERS: FileUploadProvider[] = [
+  cloudflareR2FileUploadProvider,
+  builderFileUploadProvider,
+];
 
 /**
  * Register a file upload provider. Call from a server plugin or app
@@ -61,8 +86,8 @@ export function getActiveFileUploadProvider(): FileUploadProvider | null {
   for (const provider of providers.values()) {
     if (provider.isConfigured()) return provider;
   }
-  if (builderFileUploadProvider.isConfigured()) {
-    return builderFileUploadProvider;
+  for (const provider of BUILTIN_PROVIDERS) {
+    if (provider.isConfigured()) return provider;
   }
   return null;
 }
@@ -94,8 +119,8 @@ export async function resolveFileUploadProviderForRequest(): Promise<FileUploadP
       }
     }
   }
-  if (builderFileUploadProvider.isConfigured()) {
-    return { status: "provider", provider: builderFileUploadProvider };
+  for (const provider of BUILTIN_PROVIDERS) {
+    if (provider.isConfigured()) return { status: "provider", provider };
   }
   try {
     const { resolveHasBuilderPrivateKey } =

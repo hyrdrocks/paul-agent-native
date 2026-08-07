@@ -1,11 +1,3 @@
-// Host adapters register this host's object storage provider and its
-// fallback-storage policy at module load, the same way
-// `agent/durable-background` pulls them in for background transports. The
-// import lives HERE and not in `registry.js`: an adapter imports the registry
-// to register into it, so a registry that imported the barrel back would
-// evaluate the adapter before its own provider map exists.
-import "../hosts/index.js";
-
 export type {
   FileUploadInput,
   FileUploadProvider,

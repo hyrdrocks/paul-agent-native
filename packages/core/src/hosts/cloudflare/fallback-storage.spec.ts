@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Imported for its side effects as well as its exports: the package barrel is
-// what pulls the host adapters in, and "does importing the public surface
-// actually register them" is half of what this file pins.
+// Imported through the public package surface on purpose. This host's policy
+// used to be pulled in by a side-effect-only `import "../hosts/index.js"`, and
+// this package's `sideEffects` allow-list does not name that module — so a
+// bundler dropped it, and the deployed Worker resolved as though no host
+// claimed the process. Nothing failed; a payload just went to the wrong store.
+// Reaching the policy from here is what pins that it cannot be dropped again.
 import {
   FileUploadStorageNotConfiguredError,
   uploadFile,
