@@ -61,7 +61,6 @@ interface PuppeteerPageLike {
 interface PuppeteerBrowserLike {
   newPage(): Promise<PuppeteerPageLike>;
   close(): Promise<void>;
-  disconnect?(): Promise<void>;
 }
 
 interface CloudflarePuppeteerModule {
@@ -76,8 +75,23 @@ interface CloudflarePuppeteerModule {
  * unexpected shape is an error here rather than something to coerce.
  */
 function asPngBytes(value: unknown): Buffer {
-  if (value instanceof Uint8Array) return Buffer.from(value);
-  if (value instanceof ArrayBuffer) return Buffer.from(new Uint8Array(value));
+  const bytes =
+    value instanceof Uint8Array
+      ? Buffer.from(value)
+      : value instanceof ArrayBuffer
+        ? Buffer.from(new Uint8Array(value))
+        : null;
+  if (bytes) {
+    // Zero bytes is not a small image. It is the browser answering with
+    // nothing, and a caller that embeds it gets a broken <image> rather than
+    // an error.
+    if (bytes.byteLength === 0) {
+      throw new HostedBrowserCapabilityError(
+        "The hosted browser returned an empty screenshot — nothing was rendered.",
+      );
+    }
+    return bytes;
+  }
   throw new HostedBrowserCapabilityError(
     `The hosted browser returned a ${typeof value} from screenshot() instead of image bytes — refusing to pass it off as a PNG.`,
   );
@@ -136,14 +150,14 @@ class HostedPageContext {
     this.initScripts.push(script);
   }
 
-  async route(_pattern: string, handler: RouteHandler): Promise<void> {
+  async route(pattern: string, handler: RouteHandler): Promise<void> {
     // Every route this template registers is "**/*". A narrower pattern would
     // need real glob matching, and quietly applying a "**/*" handler to it
     // would either block requests the caller meant to allow or, far worse,
     // allow ones it meant to block.
-    if (_pattern !== "**/*") {
+    if (pattern !== "**/*") {
       throw new HostedBrowserCapabilityError(
-        `The hosted browser adapter only supports a catch-all route, not "${_pattern}".`,
+        `The hosted browser adapter only supports a catch-all route, not "${pattern}".`,
       );
     }
     this.routeHandler = handler;
@@ -242,12 +256,11 @@ export async function connectHostedBrowser(
   binding: unknown,
 ): Promise<PlaywrightBrowser> {
   // A literal specifier with NO `@vite-ignore`, unlike `importPlaywright`'s
-  // deliberately opaque one. That comment tells the bundler not to resolve the
-  // import, and a Worker has no module resolution at runtime — measured on a
-  // real build, the emitted chunk kept `import("@cloudflare/puppeteer")`
-  // verbatim and every hosted render would have died on it. Playwright is
-  // opaque because it is optional and genuinely absent here; this package must
-  // be IN the bundle.
+  // deliberately opaque one. That comment stops the bundler resolving the
+  // import, and a Worker has no module resolution at runtime — so an opaque
+  // specifier here leaves the emitted chunk asking for a module that will
+  // never be found. Playwright may be opaque because it is optional and
+  // genuinely absent on this host; this package must be IN the bundle.
   const puppeteer = (await import("@cloudflare/puppeteer")) as unknown as {
     default?: CloudflarePuppeteerModule;
     launch?: CloudflarePuppeteerModule["launch"];

@@ -34,6 +34,7 @@ export interface BrowserBindingLike {
 }
 
 export type CloudflareBrowserBindingState =
+  | { state: "unreadable" }
   | { state: "absent" }
   | { state: "malformed" }
   | { state: "ready"; binding: BrowserBindingLike };
@@ -48,7 +49,11 @@ function readCloudflareEnv(): Record<string, unknown> | null {
 
 export function describeCloudflareBrowserBinding(): CloudflareBrowserBindingState {
   const env = readCloudflareEnv();
-  if (!env) return { state: "absent" };
+  // Not "absent". This host was already identified, so no readable env means
+  // the platform env has not been published on the global yet — a different
+  // fault with a different repair, and telling that operator to set a build
+  // variable sends them to check one they already set.
+  if (!env) return { state: "unreadable" };
   const binding = env[CLOUDFLARE_BROWSER_BINDING_NAME];
   if (binding == null) return { state: "absent" };
   if (
@@ -60,11 +65,19 @@ export function describeCloudflareBrowserBinding(): CloudflareBrowserBindingStat
   return { state: "ready", binding: binding as BrowserBindingLike };
 }
 
-/** The setup step for a binding in this state, or null when it is usable. */
+/**
+ * The setup step for a binding that is not usable.
+ *
+ * `ready` is not in the parameter type on purpose. A function that can answer
+ * "no step" is one whose callers reach for `?? ""`, and a refusal carrying an
+ * empty setup step is a refusal nobody can act on.
+ */
 export function cloudflareBrowserSetupStep(
-  state: CloudflareBrowserBindingState["state"],
-): string | null {
-  if (state === "ready") return null;
+  state: Exclude<CloudflareBrowserBindingState["state"], "ready">,
+): string {
+  if (state === "unreadable") {
+    return `This Worker's platform env could not be read, so whether ${CLOUDFLARE_BROWSER_BINDING_NAME} is bound is unknown. The generated Worker entry publishes it on globalThis before the first request; a caller reaching this seam outside that entry sees nothing.`;
+  }
   if (state === "malformed") {
     return `The ${CLOUDFLARE_BROWSER_BINDING_NAME} binding exists but is not a Browser Rendering binding (it has no fetch()). Something else is bound under that name — check the generated wrangler.json, not ${CLOUDFLARE_BROWSER_RENDERING_ENV}.`;
   }

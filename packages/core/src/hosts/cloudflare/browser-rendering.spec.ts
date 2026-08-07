@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CLOUDFLARE_BROWSER_BINDING_NAME,
   CLOUDFLARE_BROWSER_RENDERING_ENV,
+  cloudflareBrowserSetupStep,
   resolveBrowserRenderingDecision,
 } from "../../browser-rendering/index.js";
 
@@ -54,6 +55,21 @@ describe("Cloudflare browser rendering", () => {
     expect(decision?.available).toBe(false);
     if (!decision || decision.available) throw new Error("unreachable");
     expect(decision.setup).toContain("is not a Browser Rendering binding");
+  });
+
+  it("tells an unreadable env apart from an absent binding", () => {
+    // A third repair again. "Turn the emitter on" is the wrong instruction for
+    // someone whose Worker never published its platform env in the first place.
+    const decision = resolveBrowserRenderingDecision();
+    // __cf_env is deleted in beforeEach, but isCloudflareRuntime() has not
+    // claimed the process either, so this asserts the pairing directly.
+    expect(decision).toBeNull();
+    expect(cloudflareBrowserSetupStep("unreadable")).toContain(
+      "could not be read",
+    );
+    expect(cloudflareBrowserSetupStep("unreadable")).not.toBe(
+      cloudflareBrowserSetupStep("absent"),
+    );
   });
 
   it("negative control: off this host nothing claims the process", () => {

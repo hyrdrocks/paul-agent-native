@@ -45,7 +45,7 @@ export function registerCloudflareBrowserRendering(): void {
         provider: PROVIDER_ID,
         reason:
           "This app runs on Cloudflare Workers, which has no Chromium binary — rendering goes through the Browser Rendering binding or not at all.",
-        setup: cloudflareBrowserSetupStep(described.state) ?? "",
+        setup: cloudflareBrowserSetupStep(described.state),
       };
     },
   });

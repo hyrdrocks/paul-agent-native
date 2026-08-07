@@ -456,8 +456,9 @@ export default defineAction({
     "the diagnostics are actionable immediately; the screenshot URL is for " +
     "human review in chat today and becomes agent-visible once tool-result " +
     "images ship. Requires a headless Chromium binary; in hosted/serverless " +
-    "deploys where one isn't available, returns `{ ok: false, reason }` " +
-    "instead of throwing — fall back to run-design-audit in that case.",
+    "deploys where one isn't available, returns `{ ok: false, reason, setup }` " +
+    "instead of throwing — `setup` names the configuration that would make " +
+    "rendering work here. Fall back to run-design-audit in that case.",
   schema: z.object({
     designId: z
       .string()
@@ -676,10 +677,11 @@ export default defineAction({
             );
           }
 
-          // Deliberately un-caught. A storage refusal here used to become
+          // Deliberately un-caught. A storage refusal must not become
           // `url: ""` on an otherwise ok:true result — an artifact that reads
-          // as a success everywhere except one boolean. It now leaves as the
-          // typed failure `uploadFile` raises, and the action reports it.
+          // as a success everywhere except one boolean nobody checks. The
+          // `null` below is the single remaining case: no provider AND this
+          // host permits keeping the bytes elsewhere, which is a local run.
           const uploaded = await uploadFile({
             data: png,
             mimeType: "image/png",
