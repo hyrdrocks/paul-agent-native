@@ -1,6 +1,6 @@
 ---
 title: "फ़ाइल अपलोड"
-description: "फ़ाइल अपलोड स्टोरेज कॉन्फ़िगर करें - डेव, Builder.io या उत्पादन के लिए कस्टम प्रदाताओं के लिए SQL फ़ॉलबैक।"
+description: "फ़ाइल अपलोड स्टोरेज कॉन्फ़िगर करें — Builder.io, Cloudflare R2 या कस्टम प्रदाता; केवल-विकास SQL फ़ॉलबैक की अनुमति है या नहीं, यह होस्ट तय करता है।"
 ---
 
 # फ़ाइल अपलोड
@@ -15,7 +15,7 @@ description: "फ़ाइल अपलोड स्टोरेज कॉन्
 
 1. **उपयोगकर्ता-पंजीकृत प्रदाता** — `registerFileUploadProvider()` के माध्यम से पंजीकृत कस्टम प्रदाता
 2. **Builder.io प्रदाता** - अंतर्निहित, Builder.io कनेक्ट होने पर स्वचालित रूप से सक्रिय हो जाता है
-3. **SQL फ़ॉलबैक** — डेटाबेस में फ़ाइलों को बेस64 के रूप में संग्रहीत करता है (डेव के लिए ठीक है, उत्पादन के लिए नहीं)
+3. **SQL फ़ॉलबैक** — डेटाबेस में फ़ाइलों को बेस64 के रूप में संग्रहीत करता है, केवल वहीं जहाँ होस्ट इसकी अनुमति देता है (स्थानीय विकास; Workers पर, स्थायी डेटाबेस के साथ, या उत्पादन में कभी नहीं)
 
 <Diagram id="doc-block-1j4i20h" title={"प्रदाता समाधान आदेश"} summary={"uploadFile() क्रम में पहले कॉन्फ़िगर किए गए प्रदाता को चुनता है। SQL फ़ॉलबैक हमेशा मौजूद रहता है इसलिए अपलोड शून्य सेटअप के साथ काम करते हैं।"}>
 
@@ -100,6 +100,26 @@ Dispatches to the first configured provider in resolution order. Check the activ
 
 बाकी हर जगह अपलोड बंद रूप में विफल होता है। Cloudflare Workers पर, स्थायी `DATABASE_URL` के साथ, या `NODE_ENV=production` के साथ, `uploadFile()` एक `FileUploadStorageNotConfiguredError` फेंकता है जिसका `.setup` बताता है कि क्या कॉन्फ़िगर करना है। यह कभी ऐसा मान नहीं लौटाता जिसे कॉल करने वाला संग्रहीत फ़ाइल समझ ले।
 
+कोई होस्ट एक नीति पंजीकृत करके अपनी नीति घोषित करता है:
+
+```ts
+import { registerFallbackStoragePolicy } from "@agent-native/core/hosts";
+
+registerFallbackStoragePolicy({
+  id: "my-host",
+  priority: 30,
+  decide() {
+    if (!runningOnMyHost()) return null; // यह होस्ट नहीं
+    return {
+      permitted: false,
+      policy: "my-host",
+      reason: "This app runs on a host with no store for a file body.",
+      setup: "Bind an object store and set MY_HOST_BUCKET.",
+    };
+  },
+});
+```
+
 ## Builder.io होस्टिंग {#builder-hosting}
 
 जब आपका ऐप Builder.io से कनेक्ट होता है, तो फ़ाइल अपलोड स्वचालित रूप से Builder की एसेट होस्टिंग पर रूट हो जाते हैं। फ़ाइलों को CDN से बिना किसी कॉन्फ़िगरेशन की आवश्यकता के परोसा जाता है। यह अनुशंसित उत्पादन सेटअप है.
@@ -178,3 +198,10 @@ if (result) {
   // बाकी हर जगह इसके बजाय FileUploadStorageNotConfiguredError फेंका जाता है।
 }
 ```
+
+`uploadFile()` ठीक एक स्थिति में `null` लौटाता है — कोई प्रदाता कॉन्फ़िगर नहीं है और होस्ट फ़ॉलबैक की अनुमति देता है। बाकी दो स्थितियाँ टाइप किए गए थ्रो हैं, इसलिए उन्हें कभी संग्रहीत फ़ाइल समझा नहीं जा सकता:
+
+| फेंका गया | अर्थ | मरम्मत |
+| --- | --- | --- |
+| `FileUploadStorageNotConfiguredError` | कोई स्टोर नहीं, और यह होस्ट फ़ॉलबैक से इनकार करता है। | `.setup` पढ़ें। |
+| `FileUploadProviderUnreadableError` | स्टोर कॉन्फ़िगर है या नहीं, यह पढ़ा नहीं जा सका। | क्रेडेंशियल स्टोर ठीक करें; यह सेटअप की गलती नहीं है। |

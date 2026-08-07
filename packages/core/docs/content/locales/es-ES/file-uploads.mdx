@@ -1,6 +1,6 @@
 ---
 title: "Carga de archivos"
-description: "Configurar el almacenamiento de carga de archivos: respaldo SQL para desarrolladores, Builder.io o proveedores personalizados para producción."
+description: "Configurar el almacenamiento de carga de archivos: Builder.io, Cloudflare R2 o proveedores personalizados; el host decide si se permite siquiera un respaldo SQL solo para desarrollo."
 ---
 
 # Carga de archivos
@@ -15,7 +15,7 @@ El orden de resolución del proveedor es:
 
 1. **Proveedores registrados por el usuario**: proveedores personalizados registrados a través de `registerFileUploadProvider()`
 2. **Proveedor Builder.io**: integrado, se activa automáticamente cuando se conecta Builder.io
-3. **SQL reserva**: almacena archivos como base64 en la base de datos (está bien para desarrollo, no para producción)
+3. **SQL reserva**: almacena archivos como base64 en la base de datos, solo donde el host lo permite (desarrollo local; nunca en Workers, con una base de datos persistente ni en producción)
 
 <Diagram id="doc-block-12sluna" title={"Orden de resolución del proveedor"} summary={"uploadFile() elige el primer proveedor configurado en orden. El respaldo SQL siempre existe, por lo que las cargas funcionan sin configuración."}>
 
@@ -100,6 +100,26 @@ Cuando no hay ningún proveedor configurado, si la carga puede almacenarse en ot
 
 En cualquier otro sitio la subida falla de forma cerrada. En Cloudflare Workers, contra un `DATABASE_URL` persistente o con `NODE_ENV=production`, `uploadFile()` lanza `FileUploadStorageNotConfiguredError` con un campo `.setup` que nombra qué configurar. Nunca devuelve un valor que quien llama pueda confundir con un archivo almacenado.
 
+Un host declara su propia política registrando una:
+
+```ts
+import { registerFallbackStoragePolicy } from "@agent-native/core/hosts";
+
+registerFallbackStoragePolicy({
+  id: "my-host",
+  priority: 30,
+  decide() {
+    if (!runningOnMyHost()) return null; // no es este host
+    return {
+      permitted: false,
+      policy: "my-host",
+      reason: "This app runs on a host with no store for a file body.",
+      setup: "Bind an object store and set MY_HOST_BUCKET.",
+    };
+  },
+});
+```
+
 ## Alojamiento Builder.io {#builder-hosting}
 
 Cuando su aplicación está conectada a Builder.io, las cargas de archivos se enrutan automáticamente al alojamiento de activos de Builder. Los archivos se sirven desde un CDN sin necesidad de configuración. Esta es la configuración de producción recomendada.
@@ -178,3 +198,10 @@ if (result) {
   // En cualquier otro sitio esto lanza FileUploadStorageNotConfiguredError.
 }
 ```
+
+`uploadFile()` devuelve `null` en exactamente una condición: no hay proveedor configurado y el host permite un respaldo. Las otras dos condiciones son lanzamientos tipados, así que nunca pueden confundirse con un archivo almacenado:
+
+| Lanzado | Significa | Reparación |
+| --- | --- | --- |
+| `FileUploadStorageNotConfiguredError` | No hay almacén, y este host rechaza un respaldo. | Lee `.setup`. |
+| `FileUploadProviderUnreadableError` | No se pudo leer si hay un almacén configurado. | Arregla el almacén de credenciales; no es un error de configuración. |

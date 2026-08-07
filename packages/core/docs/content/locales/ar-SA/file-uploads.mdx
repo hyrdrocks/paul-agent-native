@@ -1,6 +1,6 @@
 ---
 title: "تحميل الملفات"
-description: "قم بتكوين مساحة تخزين تحميل الملفات — احتياطي SQL للمطورين، أو Builder.io أو موفري الخدمة المخصصين للإنتاج."
+description: "قم بتكوين مساحة تخزين تحميل الملفات — Builder.io أو Cloudflare R2 أو موفرون مخصصون؛ والمضيف هو من يقرر ما إذا كان الاحتياطي SQL المخصص للتطوير مسموحًا به أصلًا."
 ---
 
 # تحميلات الملفات
@@ -15,7 +15,7 @@ description: "قم بتكوين مساحة تخزين تحميل الملفات 
 
 1. **الموفرون المسجلون بواسطة المستخدم** — مقدمو الخدمة المخصصون المسجلون عبر `registerFileUploadProvider()`
 2. **موفر Builder.io** — مدمج، يتم تنشيطه تلقائيًا عند اتصال Builder.io
-3. **الاحتياطي SQL** — يخزن الملفات بتنسيق base64 في قاعدة البيانات (مناسب للتطوير، وليس للإنتاج)
+3. **الاحتياطي SQL** — يخزن الملفات بتنسيق base64 في قاعدة البيانات، فقط حيث يسمح المضيف بذلك (التطوير المحلي؛ ولا يحدث أبدًا على Workers أو مع قاعدة بيانات دائمة أو في الإنتاج)
 
 <Diagram id="doc-block-1sclr3c" title={"ترتيب حل الموفر"} summary={"uploadFile() يختار الموفر الأول الذي تم تكوينه بالترتيب. الخيار الاحتياطي SQL موجود دائمًا، لذا تعمل التحميلات بدون أي إعداد."}>
 
@@ -100,6 +100,26 @@ Dispatches to the first configured provider in resolution order. Check the activ
 
 في كل مكان آخر يفشل الرفع فشلًا مغلقًا. على Cloudflare Workers، أو مع `DATABASE_URL` دائم، أو مع `NODE_ENV=production`، يرمي `uploadFile()` الخطأ `FileUploadStorageNotConfiguredError` مع الحقل `.setup` الذي يسمّي ما يجب تكوينه. لا يعيد أبدًا قيمة يمكن للمستدعي أن يخلط بينها وبين ملف مخزَّن.
 
+يعلن المضيف عن سياسته الخاصة عن طريق تسجيلها:
+
+```ts
+import { registerFallbackStoragePolicy } from "@agent-native/core/hosts";
+
+registerFallbackStoragePolicy({
+  id: "my-host",
+  priority: 30,
+  decide() {
+    if (!runningOnMyHost()) return null; // ليس هذا المضيف
+    return {
+      permitted: false,
+      policy: "my-host",
+      reason: "This app runs on a host with no store for a file body.",
+      setup: "Bind an object store and set MY_HOST_BUCKET.",
+    };
+  },
+});
+```
+
 ## استضافة Builder.io {#builder-hosting}
 
 عندما يكون تطبيقك متصلاً بـ Builder.io، يتم توجيه تحميلات الملفات تلقائيًا إلى استضافة أصول Builder. يتم تقديم الملفات من CDN دون الحاجة إلى تكوين. هذا هو إعداد الإنتاج الموصى به.
@@ -178,3 +198,10 @@ if (result) {
   // في غير ذلك يُرمى FileUploadStorageNotConfiguredError بدلًا من هذا.
 }
 ```
+
+يعيد `uploadFile()` القيمة `null` في حالة واحدة بالضبط — لا يوجد موفر مُكوَّن والمضيف يسمح بالبديل. الحالتان الأخريان تُرمَيان كأخطاء مُصنَّفة، فلا يمكن الخلط بينهما وبين ملف مخزَّن:
+
+| المُرمى | المعنى | الإصلاح |
+| --- | --- | --- |
+| `FileUploadStorageNotConfiguredError` | لا يوجد مخزن، وهذا المضيف يرفض البديل. | اقرأ `.setup`. |
+| `FileUploadProviderUnreadableError` | تعذّرت قراءة ما إذا كان المخزن مُكوَّنًا. | أصلح مخزن بيانات الاعتماد؛ هذه ليست مشكلة إعداد. |
