@@ -1,6 +1,6 @@
 ---
 title: "Uploads de arquivos"
-description: "Configurar armazenamento de upload de arquivo — substituto SQL para dev, Builder.io ou provedores personalizados para produção."
+description: "Configurar armazenamento de upload de arquivo — Builder.io, Cloudflare R2 ou provedores personalizados; quem decide se um substituto SQL só de desenvolvimento é permitido é o host."
 ---
 
 # Uploads de arquivos
@@ -15,7 +15,7 @@ A ordem de resolução do provedor é:
 
 1. **Provedores registrados pelo usuário** — provedores personalizados registrados via `registerFileUploadProvider()`
 2. **Provedor Builder.io** — integrado, ativado automaticamente quando Builder.io é conectado
-3. **SQL substituto** — armazena arquivos como base64 no banco de dados (ótimo para desenvolvimento, não para produção)
+3. **SQL substituto** — armazena arquivos como base64 no banco de dados, apenas onde o host permite (desenvolvimento local; nunca no Workers, com um banco de dados persistente ou em produção)
 
 <Diagram id="doc-block-1t5oj8a" title={"Ordem de resolução do provedor"} summary={"uploadFile() escolhe o primeiro provedor configurado na ordem. O substituto SQL sempre existe, então os uploads funcionam sem configuração."}>
 
@@ -96,9 +96,29 @@ Dispatches to the first configured provider in resolution order. Check the activ
 
 ## Padrão: substituto SQL {#sql-fallback}
 
-Quando nenhum provedor está configurado, os arquivos são armazenados como dados base64 no banco de dados SQL por meio do sistema de recursos. Isso funciona imediatamente para desenvolvimento local, mas não é recomendado para produção: arquivos grandes sobrecarregam o banco de dados e não há CDN.
+Quando nenhum provedor está configurado, quem decide se a carga pode ser armazenada em outro lugar é o **host**, não o código que chama. Uma execução local contra um banco de dados local guarda o arquivo como base64 no SQL pelo sistema de recursos e registra um aviso único: é uma conveniência de desenvolvimento, não um modo de produção.
 
-Um aviso único é registrado quando o substituto é usado.
+Em qualquer outro lugar o upload falha de forma fechada. No Cloudflare Workers, contra um `DATABASE_URL` persistente ou com `NODE_ENV=production`, `uploadFile()` lança `FileUploadStorageNotConfiguredError` com um campo `.setup` que nomeia o que configurar. Ele nunca devolve um valor que quem chama possa confundir com um arquivo armazenado.
+
+Um host declara sua própria política registrando uma:
+
+```ts
+import { registerFallbackStoragePolicy } from "@agent-native/core/hosts";
+
+registerFallbackStoragePolicy({
+  id: "my-host",
+  priority: 30,
+  decide() {
+    if (!runningOnMyHost()) return null; // não é este host
+    return {
+      permitted: false,
+      policy: "my-host",
+      reason: "This app runs on a host with no store for a file body.",
+      setup: "Bind an object store and set MY_HOST_BUCKET.",
+    };
+  },
+});
+```
 
 ## Hospedagem Builder.io {#builder-hosting}
 
@@ -174,6 +194,14 @@ const result = await uploadFile({
 if (result) {
   // Provider handled it — result.url is the public URL
 } else {
-  // No provider configured — handle fallback SQL yourself, or skip
+  // Nenhum provedor configurado E este host permite um substituto local.
+  // Em qualquer outro lugar isto lança FileUploadStorageNotConfiguredError.
 }
 ```
+
+`uploadFile()` devolve `null` para exatamente uma condição — nenhum provedor configurado e o host permite um substituto. As outras duas condições são lançamentos tipados, então nunca podem ser confundidas com um arquivo armazenado:
+
+| Lançado | Significa | Reparo |
+| --- | --- | --- |
+| `FileUploadStorageNotConfiguredError` | Sem armazenamento, e este host recusa um substituto. | Leia `.setup`. |
+| `FileUploadProviderUnreadableError` | Não foi possível ler se há armazenamento configurado. | Conserte o armazenamento de credenciais; não é um erro de configuração. |

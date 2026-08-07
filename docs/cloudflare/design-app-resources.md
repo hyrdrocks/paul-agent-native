@@ -41,18 +41,22 @@ in the same organisation (spec #5, Out of Scope).
 Every binding name is a framework constant, not app configuration. Renaming any
 of them yields a binding nothing reads.
 
-**This table names the bindings the resources were provisioned for, not the ones
-the release emits.** Measured on the first real deploy of `paul-design-app`
-(#12): the generated `wrangler.json` carries `DB` and `ASSETS` and nothing else.
-`packages/core`'s deploy step emits `d1_databases` and no other binding, whatever
-build variables are set — there is no R2, queue or Browser Rendering emitter in
-it, and no `resolveCloudflareR2Binding` or
-`configureCloudflareModuleBackgroundQueue` named below exists in it either. So
-`CLOUDFLARE_R2_BUCKET_NAME` is inert on both sides today, uploads and durable
-background runs are not wired, and the local-versus-remote R2 divergence below
-cannot arise yet because neither target binds R2 at all. Set the variables
-anyway, as Build-time configuration says: they must not be able to drift apart
-before the emitters land.
+**Two of these are emitted as of R4; one is still not.** Measured on the first
+real deploy of `paul-design-app` (#12) the generated `wrangler.json` carried `DB`
+and `ASSETS` and nothing else. R3 (#14) added the queue emitter and R4 (#15)
+added `resolveCloudflareR2Binding` and the `r2_buckets` emitter, so a build with
+`CLOUDFLARE_R2_BUCKET_NAME` set now binds `UPLOADS`. Verified on the deploy:
+`env.UPLOADS (paul-design-app-uploads)  R2 Bucket`. The variable is no longer
+inert, and the local-versus-remote R2 divergence below is live — see the
+`justfile` note under Local run.
+
+There is still **no `BROWSER` emitter**; that is R5.
+
+The R2 emitter is conditional, like D1 and unlike the queue: with
+`CLOUDFLARE_R2_BUCKET_NAME` unset the generated config carries no `r2_buckets`
+key at all, the deploy succeeds, and uploads fail closed at runtime with setup
+guidance. That absent-binding deploy is what #15's AC3 negative control ran
+against.
 
 | Binding | Kind | Resource | Name is fixed by |
 | --- | --- | --- | --- |
@@ -117,7 +121,12 @@ meant to reach D1.
 `resolveCloudflareR2Binding()` is looser: absent means "no object storage", the
 `UPLOADS` binding is simply not emitted, and uploads fail closed at runtime
 rather than reaching SQL. So a build that forgets `CLOUDFLARE_R2_BUCKET_NAME`
-deploys clean and breaks the first upload.
+deploys clean and breaks the first upload — with a typed refusal naming the
+variable, not silently.
+
+`CLOUDFLARE_R2_PUBLIC_BASE_URL` is resolved at **runtime**, not build time, and
+is now on `APP_PROVIDED_DEPLOY_CREDENTIAL_KEYS` so `resolveSecret` reads it on an
+invocation with no request user. It is committed in `wrangler.jsonc` `vars`.
 
 The queue (producer, consumer, DLQ, `cpu_ms: 300000`) and the `BROWSER` binding
 need no variables — the preset writes them from the Worker name.
@@ -190,16 +199,16 @@ for this app:
   — a real `wrangler dev` on workerd against the generated `wrangler.json`, not
   `pnpm dev` on Node and SQLite. `pnpm dev` remains available and is a genuinely
   different runtime; it is not a proof of anything on this list.
-- `just cf`'s build must gain `CLOUDFLARE_R2_BUCKET_NAME=paul-design-app-uploads`.
-  The Design template's current `justfile` sets only the two D1 variables, so a
-  local build today emits **no `UPLOADS` binding** and the upload path fails
-  closed locally while working deployed. That is exactly the silent divergence
-  this criterion exists to prevent.
+- ~~`just cf`'s build must gain `CLOUDFLARE_R2_BUCKET_NAME=…`.~~ Closed: the app
+  repo's `justfile` sets it, and as of #15 a local build emits `UPLOADS` from it.
+  The `justfile` also **fails the build** when that binding is missing, so the
+  silent local-versus-deployed divergence cannot come back quietly.
 - The local D1 id stays the placeholder in the `justfile`. Miniflare never
   contacts Cloudflare for it, and pointing local runs at the real D1 id would
   not use the real database anyway.
 - Bind R2 in **remote** mode locally (`"remote": true` on the `r2_buckets`
-  entry). Verified below: with a local R2, an upload succeeds and the URL the
+  entry). The app repo's `justfile` now rewrites the generated config to do this
+  after every build. Verified below: with a local R2, an upload succeeds and the URL the
   app persists 404s, because that URL names the real r2.dev host and the object
   went to a miniflare directory. A stored-but-dangling URL is precisely the
   "looks like success" failure this codebase forbids. Remote mode makes the

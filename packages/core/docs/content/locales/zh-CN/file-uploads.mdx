@@ -1,6 +1,6 @@
 ---
 title: "文件上传"
-description: "配置文件上传存储 - 用于开发的 SQL 后备、Builder.io 或用于生产的自定义提供程序。"
+description: "配置文件上传存储 — Builder.io、Cloudflare R2 或自定义提供程序；是否允许仅用于开发的 SQL 兜底，由宿主决定。"
 ---
 
 # 文件上传
@@ -15,7 +15,7 @@ description: "配置文件上传存储 - 用于开发的 SQL 后备、Builder.io
 
 1. **用户注册的提供程序** — 通过 `registerFileUploadProvider()` 注册的自定义提供程序
 2. **Builder.io 提供程序** — 内置，连接 Builder.io 时自动激活
-3. **SQL 后备** - 将文件作为 base64 存储在数据库中（适合开发，不适用于生产）
+3. **SQL 后备** - 仅在宿主允许的环境下，将文件作为 base64 存储在数据库中（本地开发；在 Workers 上、使用持久化数据库或在生产环境中绝不会）
 
 <Diagram id="doc-block-4gomr8" title={"提供商决议顺序"} summary={"uploadFile() 按顺序选择第一个配置的提供程序。 SQL 后备始终存在，因此上传可以零设置进行。"}>
 
@@ -96,9 +96,29 @@ Dispatches to the first configured provider in resolution order. Check the activ
 
 ## 默认：SQL 后备 {#sql-fallback}
 
-当没有配置提供者时，文件通过资源系统以base64数据存储在SQL数据库中。这对于本地开发来说是开箱即用的，但不建议用于生产——大文件会使数据库膨胀，而且没有 CDN。
+当没有配置提供者时，是否允许把负载存到别处由**宿主**决定，而不是由调用方代码决定。针对本地数据库的本地运行会通过资源系统把文件以 base64 存入 SQL，并记录一次性警告——这是开发便利，不是生产模式。
 
-使用后备时会记录一次性警告。
+在其他任何环境下，上传都会失败关闭。在 Cloudflare Workers 上、针对持久化的 `DATABASE_URL`，或在 `NODE_ENV=production` 下，`uploadFile()` 会抛出 `FileUploadStorageNotConfiguredError`，其 `.setup` 字段指明需要配置什么。它绝不会返回一个可能被调用方误认为“文件已存储”的值。
+
+宿主通过注册一条策略来声明自己的策略：
+
+```ts
+import { registerFallbackStoragePolicy } from "@agent-native/core/hosts";
+
+registerFallbackStoragePolicy({
+  id: "my-host",
+  priority: 30,
+  decide() {
+    if (!runningOnMyHost()) return null; // 不是该宿主
+    return {
+      permitted: false,
+      policy: "my-host",
+      reason: "This app runs on a host with no store for a file body.",
+      setup: "Bind an object store and set MY_HOST_BUCKET.",
+    };
+  },
+});
+```
 
 ## Builder.io 托管 {#builder-hosting}
 
@@ -174,6 +194,14 @@ const result = await uploadFile({
 if (result) {
   // Provider handled it — result.url is the public URL
 } else {
-  // No provider configured — handle SQL 兜底 yourself, or skip
+  // 没有配置提供者，且该宿主允许本地兜底。
+  // 在其他环境下，这里会改为抛出 FileUploadStorageNotConfiguredError。
 }
 ```
+
+`uploadFile()` 只在一种情况下返回 `null` —— 没有配置提供者，且宿主允许兜底。另外两种情况是带类型的抛出，因此绝不会被误认为“文件已存储”：
+
+| 抛出 | 含义 | 修复 |
+| --- | --- | --- |
+| `FileUploadStorageNotConfiguredError` | 没有存储，且该宿主拒绝兜底。 | 阅读 `.setup`。 |
+| `FileUploadProviderUnreadableError` | 无法读出是否配置了存储。 | 修复凭据存储；这不是配置错误。 |

@@ -38,6 +38,7 @@ import {
   BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY,
   isDurableBackgroundFlagExplicitlyDisabled,
 } from "../agent/durable-background.js";
+import { CLOUDFLARE_R2_BINDING_NAME } from "../file-upload/cloudflare-r2.js";
 import {
   INTEGRATION_RECOVERY_RUNTIME_MARKER,
   INTEGRATION_RETRY_SWEEP_PATH,
@@ -445,6 +446,37 @@ export function resolveCloudflareD1Binding(
 }
 
 /**
+ * Re-exported beside `CLOUDFLARE_D1_BINDING_NAME` so both binding names a
+ * generated Worker config carries are reachable from one place. It is DEFINED
+ * next to the provider that reads it — a constant that lives apart from its
+ * only reader is how a rename produces a binding nothing reads.
+ */
+export { CLOUDFLARE_R2_BINDING_NAME };
+
+export interface CloudflareR2BindingConfig {
+  binding: string;
+  bucket_name: string;
+}
+
+/**
+ * Resolve the Worker's R2 binding from the build environment.
+ *
+ * Absent means "this Worker has no object storage", and no binding is emitted
+ * — the upload path then fails closed at runtime with setup guidance rather
+ * than reaching SQL. Conditional on purpose: an unconditional binding makes a
+ * bucket a prerequisite for every deploy, including apps that never upload a
+ * file, and they find out from a `wrangler deploy` failure rather than from
+ * anything they configured.
+ */
+export function resolveCloudflareR2Binding(
+  env: NodeJS.ProcessEnv = process.env,
+): CloudflareR2BindingConfig | null {
+  const bucketName = env.CLOUDFLARE_R2_BUCKET_NAME?.trim();
+  if (!bucketName) return null;
+  return { binding: CLOUDFLARE_R2_BINDING_NAME, bucket_name: bucketName };
+}
+
+/**
  * Raised CPU ceiling for the generated Worker: 300,000 ms (5 minutes) is the
  * documented maximum on Workers Paid, against a 30,000 ms default. A long agent
  * turn spends most of its wall clock waiting on model I/O, which does not count
@@ -580,6 +612,16 @@ export function configureCloudflareModuleWorkerOutput(
     config.d1_databases = [
       ...existing.filter((entry) => entry?.binding !== d1Binding.binding),
       d1Binding,
+    ];
+  }
+  const r2Binding = resolveCloudflareR2Binding(env);
+  if (r2Binding) {
+    const existing = Array.isArray(config.r2_buckets)
+      ? (config.r2_buckets as CloudflareR2BindingConfig[])
+      : [];
+    config.r2_buckets = [
+      ...existing.filter((entry) => entry?.binding !== r2Binding.binding),
+      r2Binding,
     ];
   }
   configureCloudflareModuleBackgroundQueue(config);

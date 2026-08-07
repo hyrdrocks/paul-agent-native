@@ -60,8 +60,10 @@ import {
 import { ssrfSafeFetch } from "../extensions/url-safety.js";
 import {
   uploadFile,
-  getActiveFileUploadProviderForRequest,
   listFileUploadProviders,
+  resolveFileUploadProviderForRequest,
+  describeFileUploadRefusal,
+  FileUploadProviderUnreadableError,
 } from "../file-upload/index.js";
 import { handleMcpConnect } from "../mcp/connect-route.js";
 import {
@@ -3648,7 +3650,22 @@ export function createCoreRoutesPlugin(
           const session = await getSession(event).catch(() => null);
           const userEmail = session?.email;
           const resolveStatus = async () => {
-            const active = await getActiveFileUploadProviderForRequest();
+            const resolution = await resolveFileUploadProviderForRequest();
+            if (resolution.status === "unreadable") {
+              // We could not read the configuration, so we do not know whether
+              // storage is configured. Reporting `configured: false` here is
+              // what turns a database blip into "you never set this up", and
+              // sends the operator to fix the wrong thing.
+              setResponseStatus(event, 503);
+              return {
+                error: new FileUploadProviderUnreadableError(
+                  resolution.failures,
+                ).message,
+                storageStatusUnknown: true,
+              };
+            }
+            const active =
+              resolution.status === "provider" ? resolution.provider : null;
             let builderConfigured = !!process.env.BUILDER_PRIVATE_KEY;
             try {
               const { resolveBuilderPrivateKey } =
@@ -3743,16 +3760,28 @@ export function createCoreRoutesPlugin(
             return { error: "Unauthorized" };
           }
           const userEmail = session.email;
-          const result = await runWithRequestContext(
-            { userEmail, orgId: session.orgId },
-            () =>
-              uploadFile({
-                data: filePart.data,
-                filename: filePart.filename,
-                mimeType: filePart.type,
-                ownerEmail: userEmail,
-              }),
-          );
+          let result: Awaited<ReturnType<typeof uploadFile>>;
+          try {
+            result = await runWithRequestContext(
+              { userEmail, orgId: session.orgId },
+              () =>
+                uploadFile({
+                  data: filePart.data,
+                  filename: filePart.filename,
+                  mimeType: filePart.type,
+                  ownerEmail: userEmail,
+                }),
+            );
+          } catch (err) {
+            // The host refused the fallback, or we could not tell whether a
+            // store exists. Either way the payload is NOT stored anywhere, and
+            // the response says so and names the setup step — a 201 with a
+            // fabricated url is the failure this path exists to remove.
+            const refusal = describeFileUploadRefusal(err);
+            if (!refusal) throw err;
+            setResponseStatus(event, 503);
+            return refusal;
+          }
 
           if (result) {
             setResponseStatus(event, 201);

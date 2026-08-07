@@ -3,8 +3,13 @@
  *
  * Templates call `uploadFile()` to upload a file and get back a URL.
  * The framework dispatches to whichever provider is registered (Builder.io
- * built-in, or a user-supplied one). If no provider is active, it falls back
- * to the SQL resources store — fine for dev, not recommended for production.
+ * built-in, the Cloudflare R2 provider on a Worker, or a user-supplied one).
+ *
+ * When none is active, whether the caller may store the payload somewhere else
+ * is answered by the HOST, not here and not by the caller — see
+ * `hosts/fallback-storage`. A host that refuses gets a typed
+ * `FileUploadStorageNotConfiguredError` naming the setup step; only a local run
+ * against a local database gets the capped SQL fallback.
  */
 
 export interface FileUploadInput {

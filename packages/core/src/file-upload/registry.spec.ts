@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  registerFallbackStoragePolicy,
+  unregisterFallbackStoragePolicy,
+} from "../hosts/fallback-storage.js";
 import { builderFileUploadProvider } from "./builder.js";
+import {
+  FileUploadProviderUnreadableError,
+  FileUploadStorageNotConfiguredError,
+} from "./errors.js";
 import {
   getActiveFileUploadProvider,
   getActiveFileUploadProviderForRequest,
@@ -45,6 +53,10 @@ describe("file-upload registry", () => {
     }
     process.env = { ...originalEnv };
     delete process.env.BUILDER_PRIVATE_KEY;
+    // The portable baseline policy refuses the fallback on either of these, so
+    // clear both: these cases are about the registry, not about the baseline.
+    delete process.env.DATABASE_URL;
+    process.env.NODE_ENV = "test";
     vi.clearAllMocks();
   });
 
@@ -187,24 +199,39 @@ describe("file-upload registry", () => {
       uploadSpy.mockRestore();
     });
 
-    it("returns null (SQL fallback signal) when no creds resolve", async () => {
+    it("returns null when no creds resolve and this host permits a fallback", async () => {
       resolveBuilderPrivateKeyMock.mockResolvedValue(null);
       const result = await uploadFile({ data: new Uint8Array([1]) });
       expect(result).toBeNull();
     });
 
-    it("falls back to null when credential resolution throws (DB unavailable)", async () => {
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    it("throws rather than reporting 'unconfigured' when the credential store is unreadable", async () => {
+      // Negative control for the coercion this release removes: a database
+      // blip used to return the same null a missing provider does, and every
+      // caller answered that null by writing the payload into SQL.
       resolveBuilderPrivateKeyMock.mockRejectedValue(new Error("db down"));
 
-      const result = await uploadFile({ data: new Uint8Array([1]) });
-
-      expect(result).toBeNull();
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining("Builder credential check failed"),
-        expect.stringContaining("db down"),
+      await expect(uploadFile({ data: new Uint8Array([1]) })).rejects.toThrow(
+        FileUploadProviderUnreadableError,
       );
-      warn.mockRestore();
+      await expect(uploadFile({ data: new Uint8Array([1]) })).rejects.toThrow(
+        /db down/,
+      );
+    });
+
+    it("throws rather than reporting 'unconfigured' when a scoped provider check is unreadable", async () => {
+      resolveBuilderPrivateKeyMock.mockResolvedValue(null);
+      resolveHasBuilderPrivateKeyMock.mockResolvedValue(false);
+      registerFileUploadProvider({
+        ...makeProvider("s3", false),
+        isConfiguredForRequest: vi.fn(async () => {
+          throw new Error("secrets table missing");
+        }),
+      });
+
+      await expect(uploadFile({ data: new Uint8Array([1]) })).rejects.toThrow(
+        /secrets table missing/,
+      );
     });
 
     it("does NOT swallow a real upload failure as a fallback", async () => {
@@ -219,6 +246,52 @@ describe("file-upload registry", () => {
         /network blip/,
       );
       uploadSpy.mockRestore();
+    });
+  });
+
+  describe("host-owned fallback storage policy", () => {
+    const refusing = {
+      id: "test-host",
+      priority: 1,
+      decide: () => ({
+        permitted: false as const,
+        policy: "test-host",
+        reason: "This app runs on a host with no store for a file body.",
+        setup: "Bind an object store as UPLOADS.",
+      }),
+    };
+
+    afterEach(() => {
+      unregisterFallbackStoragePolicy(refusing.id);
+    });
+
+    it("fails closed with setup guidance where the host refuses a fallback", async () => {
+      resolveBuilderPrivateKeyMock.mockResolvedValue(null);
+      registerFallbackStoragePolicy(refusing);
+
+      const call = uploadFile({ data: new Uint8Array([1]) });
+      await expect(call).rejects.toThrow(FileUploadStorageNotConfiguredError);
+      await expect(uploadFile({ data: new Uint8Array([1]) })).rejects.toThrow(
+        /Bind an object store as UPLOADS/,
+      );
+    });
+
+    it("negative control: the same call returns null once the host permits it", async () => {
+      // Same providers, same credentials, same input — only the host's policy
+      // differs. That is what proves the decision moved off the call site.
+      resolveBuilderPrivateKeyMock.mockResolvedValue(null);
+      await expect(
+        uploadFile({ data: new Uint8Array([1]) }),
+      ).resolves.toBeNull();
+    });
+
+    it("does not consult the policy when a provider is configured", async () => {
+      registerFallbackStoragePolicy(refusing);
+      registerFileUploadProvider(makeProvider("s3", true));
+
+      await expect(
+        uploadFile({ data: new Uint8Array([1]) }),
+      ).resolves.toMatchObject({ provider: "s3" });
     });
   });
 });

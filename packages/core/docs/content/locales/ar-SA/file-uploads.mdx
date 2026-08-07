@@ -1,6 +1,6 @@
 ---
 title: "تحميل الملفات"
-description: "قم بتكوين مساحة تخزين تحميل الملفات — احتياطي SQL للمطورين، أو Builder.io أو موفري الخدمة المخصصين للإنتاج."
+description: "قم بتكوين مساحة تخزين تحميل الملفات — Builder.io أو Cloudflare R2 أو موفرون مخصصون؛ والمضيف هو من يقرر ما إذا كان الاحتياطي SQL المخصص للتطوير مسموحًا به أصلًا."
 ---
 
 # تحميلات الملفات
@@ -15,7 +15,7 @@ description: "قم بتكوين مساحة تخزين تحميل الملفات 
 
 1. **الموفرون المسجلون بواسطة المستخدم** — مقدمو الخدمة المخصصون المسجلون عبر `registerFileUploadProvider()`
 2. **موفر Builder.io** — مدمج، يتم تنشيطه تلقائيًا عند اتصال Builder.io
-3. **الاحتياطي SQL** — يخزن الملفات بتنسيق base64 في قاعدة البيانات (مناسب للتطوير، وليس للإنتاج)
+3. **الاحتياطي SQL** — يخزن الملفات بتنسيق base64 في قاعدة البيانات، فقط حيث يسمح المضيف بذلك (التطوير المحلي؛ ولا يحدث أبدًا على Workers أو مع قاعدة بيانات دائمة أو في الإنتاج)
 
 <Diagram id="doc-block-1sclr3c" title={"ترتيب حل الموفر"} summary={"uploadFile() يختار الموفر الأول الذي تم تكوينه بالترتيب. الخيار الاحتياطي SQL موجود دائمًا، لذا تعمل التحميلات بدون أي إعداد."}>
 
@@ -96,9 +96,29 @@ Dispatches to the first configured provider in resolution order. Check the activ
 
 ## الافتراضي: SQL الاحتياطي {#sql-fallback}
 
-عند عدم تكوين أي موفر، يتم تخزين الملفات كبيانات base64 في قاعدة بيانات SQL عبر نظام الموارد. يعمل هذا بشكل خارج الصندوق للتطوير المحلي ولكن لا يوصى به للإنتاج - فالملفات الكبيرة تؤدي إلى تضخم قاعدة البيانات ولا يوجد CDN.
+عند عدم تكوين أي موفر، فإن ما إذا كان يُسمح بتخزين الحمولة في مكان آخر هو قرار **المضيف**، وليس قرار الكود المستدعي. التشغيل المحلي مقابل قاعدة بيانات محلية يخزّن الملف بصيغة base64 في SQL عبر نظام الموارد ويسجّل تحذيرًا لمرة واحدة — وهذا تسهيل للتطوير، وليس وضع إنتاج.
 
-يتم تسجيل تحذير لمرة واحدة عند استخدام الإجراء الاحتياطي.
+في كل مكان آخر يفشل الرفع فشلًا مغلقًا. على Cloudflare Workers، أو مع `DATABASE_URL` دائم، أو مع `NODE_ENV=production`، يرمي `uploadFile()` الخطأ `FileUploadStorageNotConfiguredError` مع الحقل `.setup` الذي يسمّي ما يجب تكوينه. لا يعيد أبدًا قيمة يمكن للمستدعي أن يخلط بينها وبين ملف مخزَّن.
+
+يعلن المضيف عن سياسته الخاصة عن طريق تسجيلها:
+
+```ts
+import { registerFallbackStoragePolicy } from "@agent-native/core/hosts";
+
+registerFallbackStoragePolicy({
+  id: "my-host",
+  priority: 30,
+  decide() {
+    if (!runningOnMyHost()) return null; // ليس هذا المضيف
+    return {
+      permitted: false,
+      policy: "my-host",
+      reason: "This app runs on a host with no store for a file body.",
+      setup: "Bind an object store and set MY_HOST_BUCKET.",
+    };
+  },
+});
+```
 
 ## استضافة Builder.io {#builder-hosting}
 
@@ -174,6 +194,14 @@ const result = await uploadFile({
 if (result) {
   // Provider handled it — result.url is the public URL
 } else {
-  // No provider configured — handle احتياطي SQL yourself, or skip
+  // لا يوجد موفر مُكوَّن، وهذا المضيف يسمح بالبديل المحلي.
+  // في غير ذلك يُرمى FileUploadStorageNotConfiguredError بدلًا من هذا.
 }
 ```
+
+يعيد `uploadFile()` القيمة `null` في حالة واحدة بالضبط — لا يوجد موفر مُكوَّن والمضيف يسمح بالبديل. الحالتان الأخريان تُرمَيان كأخطاء مُصنَّفة، فلا يمكن الخلط بينهما وبين ملف مخزَّن:
+
+| المُرمى | المعنى | الإصلاح |
+| --- | --- | --- |
+| `FileUploadStorageNotConfiguredError` | لا يوجد مخزن، وهذا المضيف يرفض البديل. | اقرأ `.setup`. |
+| `FileUploadProviderUnreadableError` | تعذّرت قراءة ما إذا كان المخزن مُكوَّنًا. | أصلح مخزن بيانات الاعتماد؛ هذه ليست مشكلة إعداد. |

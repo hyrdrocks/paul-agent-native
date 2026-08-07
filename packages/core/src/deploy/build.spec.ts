@@ -21,6 +21,7 @@ import {
   bundleYjsRuntimeForServerlessOutput,
   CLOUDFLARE_WORKER_ESBUILD_EXTERNALS,
   CLOUDFLARE_D1_BINDING_NAME,
+  CLOUDFLARE_R2_BINDING_NAME,
   CLOUDFLARE_MODULE_STUB_MODULES,
   CLOUDFLARE_UNRESOLVED_NATIVE_STUBS,
   cloudflareUnresolvedNativeStubSource,
@@ -54,6 +55,7 @@ import {
   nitroNoExternalsForPreset,
   patchCloudflareModuleNitroEntry,
   resolveCloudflareD1Binding,
+  resolveCloudflareR2Binding,
   resolveNitroBundledYjsEntry,
   runNitroBuildPipeline,
   sanitizeServerlessFunctionPackageManifest,
@@ -728,6 +730,85 @@ describe("Cloudflare module Worker D1 binding", () => {
         fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"),
       ),
     ).not.toHaveProperty("d1_databases");
+  });
+});
+
+describe("Cloudflare module Worker R2 binding", () => {
+  function makeWorkerDir(config: Record<string, unknown>): string {
+    const serverDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(serverDir, "wrangler.json"),
+      JSON.stringify({ name: "design", main: "index.mjs", ...config }),
+    );
+    fs.writeFileSync(
+      path.join(serverDir, "index.mjs"),
+      'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
+    );
+    return serverDir;
+  }
+
+  function readConfig(serverDir: string): Record<string, unknown> {
+    return JSON.parse(
+      fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"),
+    );
+  }
+
+  it("emits no binding when the build environment names no bucket", () => {
+    expect(resolveCloudflareR2Binding({})).toBeNull();
+    expect(
+      resolveCloudflareR2Binding({ CLOUDFLARE_R2_BUCKET_NAME: "  " }),
+    ).toBeNull();
+  });
+
+  it("binds the bucket the upload provider actually reads", () => {
+    expect(
+      resolveCloudflareR2Binding({ CLOUDFLARE_R2_BUCKET_NAME: "app-uploads" }),
+    ).toEqual({
+      binding: CLOUDFLARE_R2_BINDING_NAME,
+      bucket_name: "app-uploads",
+    });
+  });
+
+  it("writes the binding into the generated Wrangler config", () => {
+    const serverDir = makeWorkerDir({});
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_R2_BUCKET_NAME: "app-uploads",
+    });
+
+    expect(readConfig(serverDir)).toMatchObject({
+      r2_buckets: [{ binding: "UPLOADS", bucket_name: "app-uploads" }],
+    });
+  });
+
+  it("deploys clean with no r2_buckets key at all when unconfigured", () => {
+    // An unconditional binding would make a bucket a prerequisite for every
+    // Cloudflare deploy, discovered from a `wrangler deploy` failure rather
+    // than from anything the app configured. Uploads fail closed at runtime
+    // with setup guidance instead — see the file-upload registry.
+    const serverDir = makeWorkerDir({});
+
+    configureCloudflareModuleWorkerOutput(serverDir, {});
+
+    expect(readConfig(serverDir)).not.toHaveProperty("r2_buckets");
+  });
+
+  it("replaces only its own binding and keeps hand-added ones", () => {
+    const serverDir = makeWorkerDir({
+      r2_buckets: [
+        { binding: "UPLOADS", bucket_name: "stale" },
+        { binding: "ARCHIVE", bucket_name: "archive" },
+      ],
+    });
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_R2_BUCKET_NAME: "app-uploads",
+    });
+
+    expect(readConfig(serverDir).r2_buckets).toEqual([
+      { binding: "ARCHIVE", bucket_name: "archive" },
+      { binding: "UPLOADS", bucket_name: "app-uploads" },
+    ]);
   });
 });
 

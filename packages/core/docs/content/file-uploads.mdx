@@ -1,6 +1,6 @@
 ---
 title: "File Uploads"
-description: "Configure file upload storage — SQL fallback for dev, Builder.io or custom providers for production."
+description: "Configure file upload storage — Builder.io, Cloudflare R2, or custom providers; the host decides whether a dev-only SQL fallback is allowed at all."
 ---
 
 # File Uploads
@@ -15,9 +15,9 @@ The provider resolution order is:
 
 1. **User-registered providers** — custom providers registered via `registerFileUploadProvider()`
 2. **Builder.io provider** — built-in, activates automatically when Builder.io is connected
-3. **SQL fallback** — stores files as base64 in the database (fine for dev, not for production)
+3. **SQL fallback** — stores files as base64 in the database, only where the host permits it (local dev; never on Workers, a persistent database, or in production)
 
-<Diagram id="doc-block-hq5uvx" title="Provider resolution order" summary="uploadFile() picks the first configured provider in order. The SQL fallback always exists so uploads work with zero setup.">
+<Diagram id="doc-block-hq5uvx" title="Provider resolution order" summary="uploadFile() picks the first configured provider in order. Whether the last step exists at all is the host's decision, not the caller's.">
 
 ```html
 <div class="diagram-upload">
@@ -48,7 +48,8 @@ The provider resolution order is:
       <span class="diagram-pill warn">3</span>
       <div class="diagram-node">
         SQL fallback<br /><small class="diagram-muted"
-          >base64 in DB — dev only</small
+          >base64 in DB — only where the host permits it; elsewhere this step
+          is a typed failure naming the setup</small
         >
       </div>
     </div>
@@ -96,9 +97,29 @@ Dispatches to the first configured provider in resolution order. Check the activ
 
 ## Default: SQL Fallback {#sql-fallback}
 
-When no provider is configured, files are stored as base64 data in the SQL database via the resources system. This works out of the box for local development but is not recommended for production — large files bloat the database and there's no CDN.
+When no provider is configured, whether the payload may be stored anywhere else is decided by the **Host**, not by the calling code. A local run against a local database stores the file as base64 in SQL via the resources system, and logs a one-time warning — that is a development convenience, not a production mode.
 
-A one-time warning is logged when the fallback is used.
+Everywhere else the upload **fails closed**. On Cloudflare Workers, against a persistent `DATABASE_URL`, or with `NODE_ENV=production`, `uploadFile()` throws `FileUploadStorageNotConfiguredError` with a `.setup` string naming what to configure. It never returns a value the caller can mistake for a stored file, because that is how a base64 blob reaches a production database while every layer above reports a clean upload.
+
+A host declares its own policy by registering one:
+
+```ts
+import { registerFallbackStoragePolicy } from "@agent-native/core/hosts";
+
+registerFallbackStoragePolicy({
+  id: "my-host",
+  priority: 30,
+  decide() {
+    if (!runningOnMyHost()) return null; // not this host
+    return {
+      permitted: false,
+      policy: "my-host",
+      reason: "This app runs on a host with no store for a file body.",
+      setup: "Bind an object store and set MY_HOST_BUCKET.",
+    };
+  },
+});
+```
 
 ## Builder.io Hosting {#builder-hosting}
 
@@ -183,9 +204,17 @@ const result = await uploadFile({
 if (result) {
   // Provider handled it — result.url is the public URL
 } else {
-  // No provider configured — handle SQL fallback yourself, or skip
+  // No provider configured AND this host permits a local fallback.
+  // Everywhere else this throws FileUploadStorageNotConfiguredError instead.
 }
 ```
+
+`uploadFile()` returns `null` for exactly one condition — no provider is configured and the host permits a fallback. Two other conditions are typed throws, so they can never be confused with a stored file:
+
+| Thrown | Means | Repair |
+| --- | --- | --- |
+| `FileUploadStorageNotConfiguredError` | No store, and this host refuses a fallback. | Read `.setup`. |
+| `FileUploadProviderUnreadableError` | Whether a store is configured could not be read. | Fix the credential store; this is not a setup mistake. |
 
 ## Resumable / Streaming Uploads {#resumable}
 

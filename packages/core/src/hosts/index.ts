@@ -16,3 +16,12 @@
 
 export { registerCloudflareHost } from "./cloudflare/index.js";
 export { registerNetlifyHost } from "./netlify/index.js";
+export {
+  listFallbackStoragePolicies,
+  registerFallbackStoragePolicy,
+  resolveFallbackStorageDecision,
+  unregisterFallbackStoragePolicy,
+  type FallbackStorageDecision,
+  type FallbackStoragePolicy,
+  type FallbackStorageRefusal,
+} from "./fallback-storage.js";
