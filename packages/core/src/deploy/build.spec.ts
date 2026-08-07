@@ -21,6 +21,7 @@ import {
   bundleYjsRuntimeForServerlessOutput,
   CLOUDFLARE_WORKER_ESBUILD_EXTERNALS,
   CLOUDFLARE_D1_BINDING_NAME,
+  CLOUDFLARE_BROWSER_BINDING_NAME,
   CLOUDFLARE_R2_BINDING_NAME,
   CLOUDFLARE_MODULE_STUB_MODULES,
   CLOUDFLARE_UNRESOLVED_NATIVE_STUBS,
@@ -54,6 +55,7 @@ import {
   NITRO_RUNTIME_IGNORE_PATTERNS,
   nitroNoExternalsForPreset,
   patchCloudflareModuleNitroEntry,
+  resolveCloudflareBrowserBinding,
   resolveCloudflareD1Binding,
   resolveCloudflareR2Binding,
   resolveNitroBundledYjsEntry,
@@ -809,6 +811,103 @@ describe("Cloudflare module Worker R2 binding", () => {
       { binding: "ARCHIVE", bucket_name: "archive" },
       { binding: "UPLOADS", bucket_name: "app-uploads" },
     ]);
+  });
+});
+
+describe("Cloudflare module Worker Browser Rendering binding", () => {
+  function makeWorkerDir(config: Record<string, unknown>): string {
+    const serverDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(serverDir, "wrangler.json"),
+      JSON.stringify({ name: "design", main: "index.mjs", ...config }),
+    );
+    fs.writeFileSync(
+      path.join(serverDir, "index.mjs"),
+      'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
+    );
+    return serverDir;
+  }
+
+  function readConfig(serverDir: string): Record<string, unknown> {
+    return JSON.parse(
+      fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"),
+    );
+  }
+
+  it("emits no binding when the build environment does not ask for one", () => {
+    expect(resolveCloudflareBrowserBinding({})).toBeNull();
+    expect(
+      resolveCloudflareBrowserBinding({ CLOUDFLARE_BROWSER_RENDERING: "" }),
+    ).toBeNull();
+    expect(
+      resolveCloudflareBrowserBinding({ CLOUDFLARE_BROWSER_RENDERING: "0" }),
+    ).toBeNull();
+    expect(
+      resolveCloudflareBrowserBinding({
+        CLOUDFLARE_BROWSER_RENDERING: "false",
+      }),
+    ).toBeNull();
+  });
+
+  it("binds the name the render path actually reads", () => {
+    expect(
+      resolveCloudflareBrowserBinding({ CLOUDFLARE_BROWSER_RENDERING: "1" }),
+    ).toEqual({ binding: CLOUDFLARE_BROWSER_BINDING_NAME });
+    expect(
+      resolveCloudflareBrowserBinding({
+        CLOUDFLARE_BROWSER_RENDERING: " True ",
+      }),
+    ).toEqual({ binding: "BROWSER" });
+  });
+
+  it("throws on a value it cannot read as either answer", () => {
+    // Truthiness would make this "on" and a strict === "1" would make it
+    // "off"; both are a deploy that does not match what its operator wrote.
+    expect(() =>
+      resolveCloudflareBrowserBinding({
+        CLOUDFLARE_BROWSER_RENDERING: "maybe",
+      }),
+    ).toThrow(/CLOUDFLARE_BROWSER_RENDERING="maybe"/);
+  });
+
+  it("writes the binding into the generated Wrangler config", () => {
+    const serverDir = makeWorkerDir({});
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BROWSER_RENDERING: "1",
+    });
+
+    expect(readConfig(serverDir)).toMatchObject({
+      browser: { binding: "BROWSER" },
+    });
+  });
+
+  it("deploys clean with no browser key at all when unconfigured", () => {
+    // Browser Rendering is an entitlement rather than a resource, which makes
+    // it MORE of a deploy prerequisite, not less: wrangler rejects a binding
+    // the account cannot have. An unconditional emit would fail the deploy of
+    // every app that never renders anything. Rendering fails closed at
+    // runtime with setup guidance instead.
+    const serverDir = makeWorkerDir({});
+
+    configureCloudflareModuleWorkerOutput(serverDir, {});
+
+    expect(readConfig(serverDir)).not.toHaveProperty("browser");
+  });
+
+  it("keeps other keys an app hand-added under browser", () => {
+    const serverDir = makeWorkerDir({
+      browser: { binding: "STALE", experimental_remote: true },
+    });
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BROWSER_RENDERING: "on",
+    });
+
+    expect(readConfig(serverDir).browser).toEqual({
+      binding: "BROWSER",
+      experimental_remote: true,
+    });
   });
 });
 

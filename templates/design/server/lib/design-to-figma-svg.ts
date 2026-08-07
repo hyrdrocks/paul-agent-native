@@ -41,7 +41,7 @@ import {
 } from "@agent-native/core/extensions/url-safety";
 
 import { parseCssColorExtended } from "../../shared/color-utils.js";
-import { importPlaywright, launchChromium } from "./playwright-runtime.js";
+import { launchRenderBrowser } from "./playwright-runtime.js";
 
 export const MAX_EMBEDDED_IMAGE_BYTES = 8 * 1024 * 1024;
 const EMBEDDED_IMAGE_MIME_TYPES = new Set([
@@ -1542,8 +1542,11 @@ export function isMissingRootSelectorError(
 /**
  * Renders `html` in headless Chromium, walks the live DOM to build a
  * `FigmaSvgNode` scene, and serializes it into a genuinely vector SVG
- * document via `buildFigmaSvgDocument`. Throws when no Chromium binary is
- * available — callers should catch and fall back (mirrors
+ * document via `buildFigmaSvgDocument`. Renders through whatever this host
+ * provides — a local Chromium, or the Host's browser binding; see
+ * `launchRenderBrowser`. Throws when no browser is reachable, either because
+ * no binary is installed or because the host has nothing bound — callers
+ * should catch and surface the refusal rather than return a document (mirrors
  * `take-design-screenshot.ts`'s `chromiumUnavailableReason` pattern). Throws
  * `FigmaSvgRootSelectorNotFoundError` when `rootSelector` matches nothing —
  * callers should catch that specific error and fail soft (see
@@ -1552,8 +1555,7 @@ export function isMissingRootSelectorError(
 export async function renderDesignToFigmaSvg(
   options: RenderFigmaSvgOptions,
 ): Promise<{ svg: string; report: FigmaSvgExportReport }> {
-  const playwright = await importPlaywright();
-  const browser = await launchChromium(playwright.chromium);
+  const browser = await launchRenderBrowser();
   try {
     const context = await browser.newContext({
       viewport: { width: options.width, height: options.height },

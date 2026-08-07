@@ -38,6 +38,10 @@ import {
   BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY,
   isDurableBackgroundFlagExplicitlyDisabled,
 } from "../agent/durable-background.js";
+import {
+  CLOUDFLARE_BROWSER_BINDING_NAME,
+  CLOUDFLARE_BROWSER_RENDERING_ENV,
+} from "../browser-rendering/cloudflare-browser.js";
 import { CLOUDFLARE_R2_BINDING_NAME } from "../file-upload/cloudflare-r2.js";
 import {
   INTEGRATION_RECOVERY_RUNTIME_MARKER,
@@ -477,6 +481,58 @@ export function resolveCloudflareR2Binding(
 }
 
 /**
+ * Re-exported beside the D1 and R2 binding names, and DEFINED next to the code
+ * that reads it (`browser-rendering/cloudflare-browser.ts`) for the same reason
+ * — a constant that lives apart from its only reader is how a rename produces a
+ * binding nothing reads.
+ */
+export { CLOUDFLARE_BROWSER_BINDING_NAME, CLOUDFLARE_BROWSER_RENDERING_ENV };
+
+export interface CloudflareBrowserBindingConfig {
+  binding: string;
+}
+
+const BROWSER_RENDERING_ON = new Set(["1", "true", "yes", "on"]);
+const BROWSER_RENDERING_OFF = new Set(["", "0", "false", "no", "off"]);
+
+/**
+ * Resolve the Worker's Browser Rendering binding from the build environment.
+ *
+ * Conditional, like D1 and R2 and unlike the background queue. Browser
+ * Rendering is an account entitlement rather than a resource, but that makes it
+ * MORE of a deploy prerequisite, not less: `wrangler deploy` rejects a binding
+ * the account is not entitled to, so emitting it unconditionally would make
+ * every app that never renders anything fail its deploy — and find out from
+ * wrangler rather than from anything it configured.
+ *
+ * With no resource to name, the variable declares intent rather than pointing
+ * at something. What stops it being a switch nobody ever flips is the other
+ * half of this seam: on a Worker with no binding the render path refuses by
+ * name, quoting this variable and `BROWSER`. An app that wanted rendering and
+ * forgot the variable is told so the first time it renders, in the words it
+ * needs — not left with an empty artifact.
+ *
+ * An unrecognised value throws rather than being read as either answer.
+ * `CLOUDFLARE_BROWSER_RENDERING=maybe` silently meaning "on" (JS truthiness) or
+ * "off" (a strict `=== "1"`) are both a deploy that does not match what its
+ * operator wrote down.
+ */
+export function resolveCloudflareBrowserBinding(
+  env: NodeJS.ProcessEnv = process.env,
+): CloudflareBrowserBindingConfig | null {
+  const raw = env[CLOUDFLARE_BROWSER_RENDERING_ENV];
+  if (raw === undefined) return null;
+  const value = raw.trim().toLowerCase();
+  if (BROWSER_RENDERING_OFF.has(value)) return null;
+  if (!BROWSER_RENDERING_ON.has(value)) {
+    throw new Error(
+      `[deploy] ${CLOUDFLARE_BROWSER_RENDERING_ENV}="${raw}" is not a recognised value — use 1/true/yes/on to bind ${CLOUDFLARE_BROWSER_BINDING_NAME}, or 0/false/no/off to leave it unbound`,
+    );
+  }
+  return { binding: CLOUDFLARE_BROWSER_BINDING_NAME };
+}
+
+/**
  * Raised CPU ceiling for the generated Worker: 300,000 ms (5 minutes) is the
  * documented maximum on Workers Paid, against a 30,000 ms default. A long agent
  * turn spends most of its wall clock waiting on model I/O, which does not count
@@ -623,6 +679,14 @@ export function configureCloudflareModuleWorkerOutput(
       ...existing.filter((entry) => entry?.binding !== r2Binding.binding),
       r2Binding,
     ];
+  }
+  const browserBinding = resolveCloudflareBrowserBinding(env);
+  if (browserBinding) {
+    const existing =
+      typeof config.browser === "object" && config.browser !== null
+        ? (config.browser as Record<string, unknown>)
+        : {};
+    config.browser = { ...existing, binding: browserBinding.binding };
   }
   configureCloudflareModuleBackgroundQueue(config);
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
