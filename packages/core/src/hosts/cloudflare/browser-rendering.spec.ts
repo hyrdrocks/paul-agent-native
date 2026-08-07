@@ -9,18 +9,27 @@ import {
   CLOUDFLARE_BROWSER_BINDING_NAME,
   CLOUDFLARE_BROWSER_RENDERING_ENV,
   cloudflareBrowserSetupStep,
+  describeCloudflareBrowserBinding,
   resolveBrowserRenderingDecision,
 } from "../../browser-rendering/index.js";
 
-const scope = globalThis as { __cf_env?: Record<string, unknown> };
+const scope = globalThis as {
+  __cf_env?: Record<string, unknown>;
+  __env__?: Record<string, unknown>;
+};
 
 describe("Cloudflare browser rendering", () => {
+  // Both globals: the reader falls back from one to the other, so leaving the
+  // second set makes an "unreadable" case read as "absent" under a full run and
+  // pass alone.
   beforeEach(() => {
     delete scope.__cf_env;
+    delete scope.__env__;
   });
 
   afterEach(() => {
     delete scope.__cf_env;
+    delete scope.__env__;
   });
 
   it("resolves the bound binding when this Worker has one", () => {
@@ -60,10 +69,10 @@ describe("Cloudflare browser rendering", () => {
   it("tells an unreadable env apart from an absent binding", () => {
     // A third repair again. "Turn the emitter on" is the wrong instruction for
     // someone whose Worker never published its platform env in the first place.
-    const decision = resolveBrowserRenderingDecision();
-    // __cf_env is deleted in beforeEach, but isCloudflareRuntime() has not
-    // claimed the process either, so this asserts the pairing directly.
-    expect(decision).toBeNull();
+    // Asserted on the reader rather than on the decision, because whether a
+    // host claims the process is a different question and the two must not be
+    // answered by the same value.
+    expect(describeCloudflareBrowserBinding()).toEqual({ state: "unreadable" });
     expect(cloudflareBrowserSetupStep("unreadable")).toContain(
       "could not be read",
     );
