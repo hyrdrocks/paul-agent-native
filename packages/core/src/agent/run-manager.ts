@@ -11,6 +11,10 @@ import {
 } from "./engine/error-detail.js";
 import { EngineError } from "./engine/types.js";
 import {
+  RUN_HEARTBEAT_INTERVAL_MS,
+  resolveRunProducerState,
+} from "./run-producer-state.js";
+import {
   insertRun,
   insertRunEvent,
   updateRunStatusIfRunning,
@@ -40,6 +44,14 @@ import {
 } from "./run-store.js";
 import { isContinuationTerminalReason } from "./types.js";
 import type { AgentChatEvent, RunEvent, RunStatus } from "./types.js";
+
+export {
+  RUN_HEARTBEAT_INTERVAL_MS,
+  RUN_PRODUCER_SILENT_MS,
+  resolveRunProducerState,
+  type RunProducerSnapshot,
+  type RunProducerState,
+} from "./run-producer-state.js";
 
 export interface ActiveRun {
   runId: string;
@@ -294,53 +306,6 @@ export const DEFAULT_ERRORED_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
  * from resurrecting ancient turns when the user reopens an old thread.
  */
 export const TERMINAL_RUN_RECONNECT_WINDOW_MS = 10 * 60 * 1000;
-
-/**
- * Cadence of a run's own heartbeat/abort/backstop timer. Also the cadence at
- * which the run stamps `lastProducerTickAt`, so producer liveness and the
- * durable heartbeat can never drift apart.
- */
-export const RUN_HEARTBEAT_INTERVAL_MS = 1_500;
-
-/**
- * How long a non-terminal in-memory run may go without a tick before this
- * isolate stops answering for it.
- *
- * Ten ticks, matching `RUN_STALE_MS`'s ten-interval margin over the same
- * timer: the in-memory view and the durable reaper must not be able to
- * disagree about whether a producer is still there.
- */
-export const RUN_PRODUCER_SILENT_MS = 10 * RUN_HEARTBEAT_INTERVAL_MS;
-
-/**
- * The three states an in-memory run entry can be in, kept distinct on purpose.
- *
- * `terminal` and `in-flight` are what the registry has always modelled.
- * `producer-lost` is the third: the entry is still marked running, but the
- * request context that was executing it has gone away, so nothing will ever
- * advance it again. Collapsing it into either neighbour is a bug of a specific
- * shape — folded into `in-flight` the registry reports liveness it does not
- * have, folded into `terminal` it reports an outcome that never happened.
- */
-export type RunProducerState = "terminal" | "in-flight" | "producer-lost";
-
-/**
- * Classify an in-memory run entry.
- *
- * Readers on OTHER requests must call this before answering from `activeRuns`.
- * A `producer-lost` run is not this isolate's to describe: the durable record
- * is the only thing still being written for it, so callers defer to SQL rather
- * than reporting from a buffer that stopped moving.
- */
-export function resolveRunProducerState(
-  run: Pick<ActiveRun, "status" | "lastProducerTickAt">,
-  now: number = Date.now(),
-): RunProducerState {
-  if (run.status !== "running") return "terminal";
-  return now - run.lastProducerTickAt > RUN_PRODUCER_SILENT_MS
-    ? "producer-lost"
-    : "in-flight";
-}
 
 /** Fast poll cadence while a SQL-backed SSE subscription is actively receiving rows. */
 export const SQL_SUBSCRIPTION_ACTIVE_POLL_MS = 125;
@@ -1142,7 +1107,7 @@ export function startRun(
     }
     checkSqlAbort();
     checkNoProgressBackstop();
-  }, 1500);
+  }, RUN_HEARTBEAT_INTERVAL_MS);
   const softTimeoutMs = resolveRunSoftTimeoutMs(options?.softTimeoutMs, {
     useHostedDefault: options?.useHostedSoftTimeoutDefault === true,
     backgroundFunction: options?.backgroundFunction === true,

@@ -318,6 +318,7 @@
     "./agent/harness": "./dist/agent/harness/index.js",
     "./agent/json-schema-validator": "./dist/agent/json-schema-validator.js",
     "./agent/durable-background": "./dist/agent/durable-background.js",
+    "./agent/run-registry": "./dist/agent/run-producer-state.js",
     "./hosts": "./dist/hosts/index.js",
     "./browser-rendering": "./dist/browser-rendering/index.js",
     "./eval": "./dist/eval/index.js",
