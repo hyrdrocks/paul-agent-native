@@ -44,6 +44,32 @@ beforeEach(async () => {
     import("../../db/migrations.js"),
   ]);
   await runMigrations(dispatchMigrations, { table: "dispatch_migrations" })({});
+
+  // Approving and denying a vault request is org-admin work: `approveRequest`
+  // and `denyRequest` call `assertCanManageVault`, which reads `org_members`.
+  // Without a role row every actor here is a plain member and the store
+  // refuses before any audit row is written.
+  const { getDbExec } = await import("@agent-native/core/db");
+  const exec = getDbExec();
+  await exec.execute({
+    sql: `CREATE TABLE IF NOT EXISTS org_members (
+      id TEXT PRIMARY KEY,
+      org_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      role TEXT NOT NULL,
+      joined_at INTEGER NOT NULL
+    )`,
+    args: [],
+  });
+  for (const [id, memberOrgId, email] of [
+    ["vault-audit-owner", orgId, ownerEmail],
+    ["vault-audit-reviewer", reviewerOrgId, reviewerEmail],
+  ] as const) {
+    await exec.execute({
+      sql: "INSERT INTO org_members (id, org_id, email, role, joined_at) VALUES (?, ?, ?, ?, ?)",
+      args: [id, memberOrgId, email, "owner", 1_700_000_000_000],
+    });
+  }
 });
 
 afterEach(async () => {

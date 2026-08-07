@@ -1192,11 +1192,9 @@ export default function VaultRoute() {
           )}
         </TabsContent>
 
-        {canManageVault ? (
-          <TabsContent value="audit" className="mt-4">
-            <VaultAuditTab />
-          </TabsContent>
-        ) : null}
+        <TabsContent value="audit" className="mt-4">
+          <VaultAuditTab />
+        </TabsContent>
       </Tabs>
     </DispatchShell>
   );

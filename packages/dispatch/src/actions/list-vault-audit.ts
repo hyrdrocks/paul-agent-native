@@ -5,7 +5,7 @@ import { listVaultAuditEvents } from "../server/lib/vault-audit.js";
 
 export default defineAction({
   description:
-    "View vault activity — secret access, grants, syncs, and requests — from the framework action audit log, including refused attempts. Admin only. Filter by action name, outcome, actor, and time; page with limit and offset.",
+    "View vault activity — secret access, grants, syncs, and requests — from the framework action audit log, including refused attempts. Filter by action name, outcome, actor, and time; page with limit and offset.",
   schema: z.object({
     action: z
       .string()

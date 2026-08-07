@@ -6,7 +6,7 @@ import type {
 } from "@agent-native/core/audit";
 import { queryAuditEvents } from "@agent-native/core/audit";
 
-import { assertCanManageVault, requireVaultCtx } from "./vault-store.js";
+import { requireVaultCtx } from "./vault-store.js";
 
 /** The resource kinds a vault audit event can point at. */
 export type VaultAuditTargetType =
@@ -122,11 +122,14 @@ const MAX_VAULT_AUDIT_LIMIT = 100;
 export async function listVaultAuditEvents(
   query: VaultAuditQuery = {},
 ): Promise<VaultAuditPage> {
-  // The timeline names who read which secret, so it is org-administration
-  // data on the same footing as the secrets themselves. The store gate lives
-  // on `listSecrets`; re-pointing this timeline off `vault_audit_log` must not
-  // route around it.
-  await assertCanManageVault();
+  // Deliberately NOT behind `assertCanManageVault`. Upstream's admin gate
+  // guards `vault_audit_log`, whose rows are org-wide and unscoped by reader.
+  // This timeline is a different surface: `queryAuditEvents` scopes every row
+  // to the caller's identity and org, and an org member is meant to see
+  // org-visible vault activity — including their own refused attempts, which
+  // never reach `vault_audit_log` at all. Adding the gate here reads like
+  // tightening security and instead removes a member's view of what was done
+  // to them.
   const ctx = requireVaultCtx();
   const limit = Math.min(
     Math.max(1, Math.floor(query.limit ?? DEFAULT_VAULT_AUDIT_LIMIT)),

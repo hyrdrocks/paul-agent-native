@@ -714,3 +714,43 @@ describe("runDbHealthProbe", () => {
     expect(result.db).toBe(false);
   });
 });
+
+describe("createCoreRoutesPlugin speculation-rules mount", () => {
+  afterEach(() => {
+    delete (globalThis as any).__cf_env;
+    vi.unstubAllEnvs();
+  });
+
+  function createNitroApp() {
+    return {
+      h3: { "~middleware": [] as Array<{ route?: string }> },
+      hooks: { hook: () => {}, callHook: () => {} },
+    };
+  }
+
+  function mountedRoutes(nitroApp: any): string[] {
+    return [
+      ...((nitroApp._agentNativeFrameworkMountPaths as Set<string>) ?? []),
+    ];
+  }
+
+  it("mounts speculation-rules before init runs, on Workers", async () => {
+    // `framework-request-handler` short-circuits this path to "ready" without
+    // waiting for anything, on the stated invariant that core-routes has
+    // already mounted it. On Workers the rest of this plugin's body is deferred
+    // into the first request (`trackPluginInit` returns early there), so a
+    // mount that lives inside that body does not exist when the short-circuit
+    // fires — and the one fetch that must not wait 404s instead. Registering an
+    // h3 handler is not I/O, so the mount is safe at isolate scope where
+    // workerd refuses I/O outright; this pins it there.
+    (globalThis as any).__cf_env = {};
+    const { createCoreRoutesPlugin } = await import("./core-routes-plugin.js");
+    const nitroApp = createNitroApp();
+
+    (createCoreRoutesPlugin() as any)(nitroApp);
+
+    expect(mountedRoutes(nitroApp)).toContain(
+      "/_agent-native/speculation-rules.json",
+    );
+  });
+});
