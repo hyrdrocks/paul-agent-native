@@ -1555,7 +1555,10 @@ type StaleRunRecoveryOutcome =
   | { outcome: "not_redispatchable" }
   | { outcome: "newer_run_exists" }
   | { outcome: "budget_exhausted" }
-  | { outcome: "repeated_no_progress" };
+  | { outcome: "repeated_no_progress" }
+  // A recovery that THREW is not a recovery that declined: the turn is just as
+  // dead either way, but only this one says the reason is unknown.
+  | { outcome: "recovery_failed"; error: string };
 
 /**
  * Mirrors `production-agent.ts`'s `generateRunId` — duplicated (not
@@ -1786,16 +1789,12 @@ function attemptStaleRunRecoveryDispatch(successorRunId: string): void {
  * never rolls back the reap itself: the reap is the critical path, recovery
  * is strictly additive.
  *
- * The reap UPDATE is the ONLY thing that decides whether a successor may be
- * created, and it runs first on every dialect. D1 has no interactive
- * transactions (`supportsInteractiveTransactions`, db/client.ts), and while
- * the no-transaction path instead inserted the successor first — unconditional,
- * because nothing had decided yet — every `/runs/active` poll against a live,
- * heartbeating background run minted one more successor for its turn, until
- * the 25-run ledger cap stopped it. On that dialect the atomicity this
- * ordering gives up is one sub-second window the client already tolerates by
- * design (`awaitBackgroundErrorRecoverySuccessor`, agent-chat-adapter.ts);
- * the ordering it gives up cost 25 rows and 25 queue messages per failed turn.
+ * The reap UPDATE is the ONLY thing that may authorise a successor, and it
+ * runs first on every dialect — a recovery is for a run this call actually
+ * terminalised, never for one that is still alive. D1 has no interactive
+ * transactions (`supportsInteractiveTransactions`, db/client.ts) and so runs
+ * the two writes unwrapped: an isolate that dies between them leaves the turn
+ * reaped with no successor, which is a lost recovery, not a lost run.
  */
 async function reapSingleStaleRun(
   runId: string,
@@ -1851,7 +1850,12 @@ async function reapSingleStaleRun(
     if ((rowsAffected ?? 0) === 0) return { reaped: false, outcome: null };
     return {
       reaped: true,
-      outcome: await attemptStaleRunRecovery(tx, runId).catch(() => null),
+      outcome: await attemptStaleRunRecovery(tx, runId).catch(
+        (error: unknown): StaleRunRecoveryOutcome => ({
+          outcome: "recovery_failed",
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      ),
     };
   };
   const { reaped, outcome } = client.transaction
@@ -1862,7 +1866,9 @@ async function reapSingleStaleRun(
     const detail =
       outcome.outcome === "recovered"
         ? `recovered successorRunId=${outcome.successorRunId}`
-        : `declined reason=${outcome.outcome}`;
+        : outcome.outcome === "recovery_failed"
+          ? `failed reason=recovery_failed ${outcome.error}`
+          : `declined reason=${outcome.outcome}`;
     await recordRunDiagnostic(
       runId,
       RUN_DIAG_STAGE.staleRunRecoveryAttempted,

@@ -420,11 +420,8 @@ describe("FIX 3 — stale-run reaper server-owned recovery (reapIfStale)", () =>
   });
 
   it("creates NO successor for a live, heartbeating background run when the DbExec has no transaction() primitive", async () => {
-    // #32: on D1 (no interactive transactions) the reaper used to insert the
-    // recovery successor BEFORE — and independently of — the conditional reap
-    // UPDATE, so a run that was not stale at all still got one. Recovery is
-    // for a run the reaper actually terminalised; a live producer must be
-    // left alone on every dialect.
+    // Recovery belongs to a run the reaper actually terminalised. A live
+    // producer must be left alone on every dialect, transactions or not.
     currentClient = makeRawClient(false);
     const { runId, thread, turn } = ids();
     await insertRun(runId, thread, turn, {
@@ -438,11 +435,33 @@ describe("FIX 3 — stale-run reaper server-owned recovery (reapIfStale)", () =>
     expect(rowsForTurn(turn)).toHaveLength(1);
   });
 
+  it("creates NO successor for an already-terminal run when the DbExec has no transaction() primitive", async () => {
+    // The turn this ticket was filed for: the parent had already failed
+    // (`error:http_401`) and kept producing successors anyway. A terminal row
+    // cannot be reaped — the reap UPDATE's `status = 'running'` sees to that —
+    // so nothing may treat it as still needing recovery.
+    currentClient = makeRawClient(false);
+    const { runId, thread, turn } = ids();
+    await insertRun(runId, thread, turn, {
+      dispatchMode: "background",
+      dispatchPayload: JSON.stringify({ message: "probe", threadId: thread }),
+    });
+    await claimBackgroundRun(runId);
+    sqlite
+      .prepare(
+        `UPDATE agent_runs SET status = 'errored', error_code = 'http_401', terminal_reason = 'error:http_401', completed_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), runId);
+    setStaleLiveness(runId, Date.now() - STALE_PAST_MS);
+
+    expect(await reapIfStale(runId)).toBe(false);
+    expect(rowsForTurn(turn)).toHaveLength(1);
+  });
+
   it("does not grow the turn's run ledger while a client polls a live background run (no transaction() primitive)", async () => {
-    // The measured #32 shape: one claimed run, then a successor per
-    // `/runs/active` poll — each poll calls `reapIfStale` on the thread's
-    // newest row, so every insert moved the target to the row it had just
-    // created and the chain only stopped at the 25-run budget.
+    // One claimed run, then one successor per `/runs/active` poll: each poll
+    // reaps the thread's NEWEST row, so every insert moved the target onto the
+    // row it had just created and only the 25-run budget stopped the chain.
     currentClient = makeRawClient(false);
     const { runId, thread, turn } = ids();
     await insertRun(runId, thread, turn, {
