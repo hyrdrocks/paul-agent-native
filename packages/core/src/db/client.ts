@@ -10,6 +10,7 @@
  */
 import path from "path";
 
+import { isCloudflareRuntime } from "../shared/runtime.js";
 import {
   beginDatabaseOperation,
   recordDatabaseRetry,
@@ -1703,12 +1704,11 @@ async function createDbExecInternal(
     }
 
     const { default: postgres } = await import("postgres");
-    const isWorkers =
-      "__cf_env" in globalThis ||
-      (typeof navigator !== "undefined" &&
-        navigator.userAgent === "Cloudflare-Workers");
-
-    if (isWorkers) {
+    // Detected in exactly one place. The copy that used to live here omitted
+    // the `__env__` branch, so on a Workers deploy that sets only that global
+    // this fell through to the pooled Node path and shared a connection across
+    // requests — which Workers forbids.
+    if (isCloudflareRuntime()) {
       // Workers: fresh connection per query — I/O can't be shared across requests
       return {
         async execute(sql) {

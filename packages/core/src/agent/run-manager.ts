@@ -62,6 +62,20 @@ export interface ActiveRun {
     { type: "auto_continue" }
   >;
   startedAt: number;
+  /**
+   * When the run's own periodic timer last fired, stamped from inside that
+   * timer's callback.
+   *
+   * This map is isolate-global but a run's EXECUTION belongs to the request
+   * context that started it: on Workers, when that request goes away workerd
+   * cancels its continuations and timers, and the entry is left here reading
+   * `status: "running"` forever. A number stamped by the timer is the only
+   * thing in the entry that stops being true when that happens — and unlike
+   * the run's promises it can be read from another request context, which is
+   * the same reason `server/cross-request-init.ts` polls a flag instead of
+   * awaiting a foreign promise.
+   */
+  lastProducerTickAt: number;
 }
 
 export interface StartedRun extends ActiveRun {
@@ -280,6 +294,53 @@ export const DEFAULT_ERRORED_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
  * from resurrecting ancient turns when the user reopens an old thread.
  */
 export const TERMINAL_RUN_RECONNECT_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * Cadence of a run's own heartbeat/abort/backstop timer. Also the cadence at
+ * which the run stamps `lastProducerTickAt`, so producer liveness and the
+ * durable heartbeat can never drift apart.
+ */
+export const RUN_HEARTBEAT_INTERVAL_MS = 1_500;
+
+/**
+ * How long a non-terminal in-memory run may go without a tick before this
+ * isolate stops answering for it.
+ *
+ * Ten ticks, matching `RUN_STALE_MS`'s ten-interval margin over the same
+ * timer: the in-memory view and the durable reaper must not be able to
+ * disagree about whether a producer is still there.
+ */
+export const RUN_PRODUCER_SILENT_MS = 10 * RUN_HEARTBEAT_INTERVAL_MS;
+
+/**
+ * The three states an in-memory run entry can be in, kept distinct on purpose.
+ *
+ * `terminal` and `in-flight` are what the registry has always modelled.
+ * `producer-lost` is the third: the entry is still marked running, but the
+ * request context that was executing it has gone away, so nothing will ever
+ * advance it again. Collapsing it into either neighbour is a bug of a specific
+ * shape — folded into `in-flight` the registry reports liveness it does not
+ * have, folded into `terminal` it reports an outcome that never happened.
+ */
+export type RunProducerState = "terminal" | "in-flight" | "producer-lost";
+
+/**
+ * Classify an in-memory run entry.
+ *
+ * Readers on OTHER requests must call this before answering from `activeRuns`.
+ * A `producer-lost` run is not this isolate's to describe: the durable record
+ * is the only thing still being written for it, so callers defer to SQL rather
+ * than reporting from a buffer that stopped moving.
+ */
+export function resolveRunProducerState(
+  run: Pick<ActiveRun, "status" | "lastProducerTickAt">,
+  now: number = Date.now(),
+): RunProducerState {
+  if (run.status !== "running") return "terminal";
+  return now - run.lastProducerTickAt > RUN_PRODUCER_SILENT_MS
+    ? "producer-lost"
+    : "in-flight";
+}
 
 /** Fast poll cadence while a SQL-backed SSE subscription is actively receiving rows. */
 export const SQL_SUBSCRIPTION_ACTIVE_POLL_MS = 125;
@@ -722,6 +783,7 @@ export function startRun(
     subscribers: new Set(),
     abort,
     startedAt: Date.now(),
+    lastProducerTickAt: Date.now(),
     finalized,
   };
 
@@ -1046,6 +1108,11 @@ export function startRun(
   // still run every tick (they don't touch the DB on the hot path).
   let heartbeatInFlight = false;
   const heartbeatTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    // Stamped before the DB write, not after it: this records that the
+    // producing context is still executing, which stays true through a
+    // database outage. Deriving it from a successful write instead would make
+    // a slow pooler look identical to a cancelled request.
+    run.lastProducerTickAt = Date.now();
     if (!heartbeatInFlight) {
       heartbeatInFlight = true;
       updateRunHeartbeat(runId)
@@ -1560,7 +1627,14 @@ export function subscribeToRun(
   fromSeq: number,
 ): ReadableStream<Uint8Array> | null {
   const run = activeRuns.get(runId);
-  if (run) {
+  // A producer-lost entry has a buffer that will never grow and a terminal
+  // event that will never be sent, so an in-memory subscriber waits forever on
+  // a run nothing is executing. Route it to the durable path instead, which
+  // observes whatever actually becomes of the row (the stale reaper's terminal
+  // write, or a successor claiming the turn). Deliberately NOT a synthesized
+  // terminal event here: this isolate knows the producer is gone, which is not
+  // the same as knowing how the run ended.
+  if (run && resolveRunProducerState(run) !== "producer-lost") {
     return subscribeInMemory(run, fromSeq);
   }
   // Not in local memory — try SQL (cross-isolate path)
@@ -2024,7 +2098,18 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
   // that still have events in memory. This allows sub-agent tabs to replay
   // the full conversation from completed runs via SSE.
   const memRun = getActiveRunForThread(threadId);
-  if (memRun && (memRun.status === "running" || memRun.events.length > 0)) {
+  // Every answer this branch gives rests on "in-memory means this isolate is
+  // the producer" — most visibly `heartbeatAt: Date.now()`, which is not read
+  // from anywhere, it is asserted. For a producer-lost entry that assertion
+  // manufactures a heartbeat fresher than the durable one and disarms both the
+  // client's stuck-detector and the reaper that was about to terminalize the
+  // row. Fall through to SQL, which is still being written for this run.
+  const memProducerState = memRun ? resolveRunProducerState(memRun) : null;
+  if (
+    memRun &&
+    memProducerState !== "producer-lost" &&
+    (memRun.status === "running" || memRun.events.length > 0)
+  ) {
     const sqlSnapshot = await fetchRunThreadSnapshot(memRun.runId, threadId);
 
     // FIX 1 (durable-background incident): a terminal in-memory run (chunk
