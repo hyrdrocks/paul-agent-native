@@ -844,6 +844,26 @@ describe("resource handlers", () => {
       );
     });
 
+    it("does not redirect a text resource whose body happens to be a url", async () => {
+      // A url-shaped body is still a body. Redirecting would serve someone
+      // else's page in place of the file the caller asked for.
+      mockResourceGet.mockResolvedValue({
+        id: "link",
+        path: "/link.txt",
+        owner: "test@test.com",
+        mimeType: "text/plain",
+        content: "https://example.test/page",
+      });
+
+      const result = await handleGetResource({
+        _params: { id: "link" },
+        _query: { raw: "" },
+      });
+
+      expect(lastStatus).not.toBe(302);
+      expect(result).toBeInstanceOf(Response);
+    });
+
     it("redirects a raw read to the object rather than base64-decoding a url", async () => {
       // Decoding a URL as base64 returns bytes that are not the file, served
       // under the file's own content type — a corrupt image that looks served.

@@ -3,10 +3,7 @@ import { z } from "zod";
 import { defineAction } from "../../action.js";
 import { ssrfSafeFetch } from "../../extensions/url-safety.js";
 import { getRequestUserEmail } from "../../server/request-context.js";
-import {
-  FileUploadProviderUnreadableError,
-  FileUploadStorageNotConfiguredError,
-} from "../errors.js";
+import { describeFileUploadRefusal } from "../errors.js";
 import { uploadFile } from "../registry.js";
 
 const MAX_REMOTE_FETCH_BYTES = 25 * 1024 * 1024;
@@ -205,13 +202,9 @@ export default defineAction({
       // Report the store's own setup step rather than the generic connect-
       // Builder line: on a host with no fallback the missing piece is a
       // bucket, and naming Builder there sends the agent somewhere useless.
-      if (err instanceof FileUploadStorageNotConfiguredError) {
-        return { error: err.message, configured: false, setup: err.setup };
-      }
-      if (err instanceof FileUploadProviderUnreadableError) {
-        return { error: err.message, storageStatusUnknown: true };
-      }
-      throw err;
+      const refusal = describeFileUploadRefusal(err);
+      if (!refusal) throw err;
+      return { ...refusal, configured: false };
     }
 
     if (!result) {

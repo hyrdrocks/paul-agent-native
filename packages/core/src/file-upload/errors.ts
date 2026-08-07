@@ -66,3 +66,33 @@ export class FileUploadProviderUnreadableError extends Error {
     this.failures = failures;
   }
 }
+
+/** One refusal, in the terms every surface reports it with. */
+export interface FileUploadRefusal {
+  /** Message to show. Already names the setup step where there is one. */
+  error: string;
+  /** The concrete configuration that makes object storage usable, when known. */
+  setup?: string;
+  /** True when we could not find out whether a store is configured. */
+  storageStatusUnknown?: true;
+}
+
+/**
+ * Translate a thrown refusal into the shape a surface reports, or `null` when
+ * this is not a refusal and must keep propagating.
+ *
+ * One function rather than the same `instanceof` cascade at every surface: a
+ * fourth refusal type would otherwise have to be added in four places, and the
+ * one that got missed would report the payload as stored.
+ */
+export function describeFileUploadRefusal(
+  err: unknown,
+): FileUploadRefusal | null {
+  if (err instanceof FileUploadStorageNotConfiguredError) {
+    return { error: err.message, setup: err.setup };
+  }
+  if (err instanceof FileUploadProviderUnreadableError) {
+    return { error: err.message, storageStatusUnknown: true };
+  }
+  return null;
+}

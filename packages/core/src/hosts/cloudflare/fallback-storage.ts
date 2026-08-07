@@ -7,7 +7,10 @@
  * permits no fallback at all, and names the binding that is missing instead.
  */
 
-import { CLOUDFLARE_R2_BINDING_NAME } from "../../file-upload/cloudflare-r2.js";
+import {
+  cloudflareR2SetupStep,
+  describeCloudflareR2Binding,
+} from "../../file-upload/cloudflare-r2.js";
 import { isCloudflareRuntime } from "../../shared/runtime.js";
 import { registerFallbackStoragePolicy } from "../fallback-storage.js";
 
@@ -26,12 +29,16 @@ export function registerCloudflareFallbackStorage(): void {
     priority: CLOUDFLARE_FALLBACK_STORAGE_PRIORITY,
     decide() {
       if (!isCloudflareRuntime()) return null;
+      // The setup step names what is actually wrong. A binding that exists but
+      // is not a bucket is not a missing binding, and telling that operator to
+      // bind one sends them to check a variable they already set.
+      const { state } = describeCloudflareR2Binding();
       return {
         permitted: false,
         policy: POLICY_ID,
         reason:
           "This app runs on Cloudflare Workers, where the database is D1 and a file payload is never stored in it.",
-        setup: `Bind an R2 bucket as ${CLOUDFLARE_R2_BINDING_NAME}: build with CLOUDFLARE_R2_BUCKET_NAME set to the bucket's name, and set CLOUDFLARE_R2_PUBLIC_BASE_URL to its public origin.`,
+        setup: cloudflareR2SetupStep(state) ?? "",
       };
     },
   });

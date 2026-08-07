@@ -16,8 +16,10 @@ export {
   type FileUploadProviderResolution,
 } from "./registry.js";
 export {
+  describeFileUploadRefusal,
   FileUploadProviderUnreadableError,
   FileUploadStorageNotConfiguredError,
+  type FileUploadRefusal,
   type FileUploadProviderLookupFailure,
 } from "./errors.js";
 export {

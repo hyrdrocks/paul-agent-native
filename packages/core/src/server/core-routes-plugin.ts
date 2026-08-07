@@ -62,8 +62,8 @@ import {
   uploadFile,
   listFileUploadProviders,
   resolveFileUploadProviderForRequest,
+  describeFileUploadRefusal,
   FileUploadProviderUnreadableError,
-  FileUploadStorageNotConfiguredError,
 } from "../file-upload/index.js";
 import { handleMcpConnect } from "../mcp/connect-route.js";
 import {
@@ -3777,15 +3777,10 @@ export function createCoreRoutesPlugin(
             // store exists. Either way the payload is NOT stored anywhere, and
             // the response says so and names the setup step — a 201 with a
             // fabricated url is the failure this path exists to remove.
-            if (err instanceof FileUploadStorageNotConfiguredError) {
-              setResponseStatus(event, 503);
-              return { error: err.message, setup: err.setup };
-            }
-            if (err instanceof FileUploadProviderUnreadableError) {
-              setResponseStatus(event, 503);
-              return { error: err.message, storageStatusUnknown: true };
-            }
-            throw err;
+            const refusal = describeFileUploadRefusal(err);
+            if (!refusal) throw err;
+            setResponseStatus(event, 503);
+            return refusal;
           }
 
           if (result) {

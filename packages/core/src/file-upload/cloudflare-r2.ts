@@ -60,33 +60,53 @@ function readCloudflareEnv(): Record<string, unknown> | null {
 }
 
 /**
- * The bound bucket, or null when nothing is bound. Null is "absent", not
- * "unusable": a binding that exists but cannot `put` is a configuration error
- * and resolves to null here too — but it is reported, because a named binding
- * that cannot store is not the same fact as no binding at all.
+ * What this Worker actually has, as three distinct facts.
+ *
+ * `absent` and `malformed` must not collapse into one value: they send an
+ * operator to opposite repairs. "Bind a bucket" is useless advice to someone
+ * who bound one and got the binding wrong — they read it, check their build
+ * variables, find them set, and have nowhere left to look.
  */
-export function resolveCloudflareR2Bucket(): R2BucketLike | null {
+export type CloudflareR2BindingState =
+  | { state: "absent" }
+  | { state: "malformed" }
+  | { state: "ready"; bucket: R2BucketLike };
+
+export function describeCloudflareR2Binding(): CloudflareR2BindingState {
   const env = readCloudflareEnv();
-  if (!env) return null;
+  if (!env) return { state: "absent" };
   const binding = env[CLOUDFLARE_R2_BINDING_NAME];
-  if (binding == null) return null;
+  if (binding == null) return { state: "absent" };
   if (
     typeof binding !== "object" ||
     typeof (binding as R2BucketLike).put !== "function"
   ) {
-    console.error(
-      `[agent-native] the ${CLOUDFLARE_R2_BINDING_NAME} binding exists but is not an R2 bucket ` +
-        "(no put()) — object storage is unavailable on this Worker.",
-    );
-    return null;
+    return { state: "malformed" };
   }
-  return binding as R2BucketLike;
+  return { state: "ready", bucket: binding as R2BucketLike };
+}
+
+/** The bound bucket, or null when this Worker has no usable one. */
+export function resolveCloudflareR2Bucket(): R2BucketLike | null {
+  const described = describeCloudflareR2Binding();
+  return described.state === "ready" ? described.bucket : null;
 }
 
 /** True when this Worker can actually write an object. */
 export function hasBoundCloudflareR2Bucket(): boolean {
   if (!isCloudflareRuntime()) return false;
   return resolveCloudflareR2Bucket() !== null;
+}
+
+/** The setup step for a binding in this state, or null when it is usable. */
+export function cloudflareR2SetupStep(
+  state: CloudflareR2BindingState["state"],
+): string | null {
+  if (state === "ready") return null;
+  if (state === "malformed") {
+    return `The ${CLOUDFLARE_R2_BINDING_NAME} binding exists but is not an R2 bucket (it has no put()). Something else is bound under that name — check the generated wrangler.json, not CLOUDFLARE_R2_BUCKET_NAME.`;
+  }
+  return `Bind an R2 bucket as ${CLOUDFLARE_R2_BINDING_NAME}: build with CLOUDFLARE_R2_BUCKET_NAME set to the bucket's name, and set ${CLOUDFLARE_R2_PUBLIC_BASE_URL_KEY} to its public origin.`;
 }
 
 function extensionOf(filename: string | undefined): string {
@@ -133,13 +153,16 @@ export const cloudflareR2FileUploadProvider: FileUploadProvider = {
   name: "Cloudflare R2",
   isConfigured: hasBoundCloudflareR2Bucket,
   async upload(input: FileUploadInput): Promise<FileUploadResult> {
-    const bucket = resolveCloudflareR2Bucket();
-    if (!bucket) {
+    const described = describeCloudflareR2Binding();
+    if (described.state !== "ready") {
       notConfigured(
-        "Object storage is not available on this Worker.",
-        `Bind an R2 bucket as ${CLOUDFLARE_R2_BINDING_NAME} by building with CLOUDFLARE_R2_BUCKET_NAME set to the bucket's name.`,
+        described.state === "malformed"
+          ? "Object storage is bound on this Worker but the binding is not an R2 bucket."
+          : "Object storage is not available on this Worker.",
+        cloudflareR2SetupStep(described.state) ?? "",
       );
     }
+    const bucket = described.bucket;
 
     // Resolved BEFORE the put. An object written under a URL that resolves to
     // nothing is a dangling upload every layer above reports as a success —

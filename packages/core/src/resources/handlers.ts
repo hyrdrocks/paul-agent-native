@@ -7,11 +7,7 @@ import {
 } from "h3";
 import { createError } from "h3";
 
-import {
-  uploadFile,
-  FileUploadProviderUnreadableError,
-  FileUploadStorageNotConfiguredError,
-} from "../file-upload/index.js";
+import { describeFileUploadRefusal, uploadFile } from "../file-upload/index.js";
 import { getOrgContext } from "../org/context.js";
 import { getSession } from "../server/auth.js";
 import {
@@ -433,6 +429,15 @@ async function enrichTreeNodes(nodes: TreeNode[]): Promise<void> {
  * type alone gets a handle wrong both ways — blanked where it is the whole
  * answer, and base64-decoded into garbage where the bytes were wanted.
  */
+function isBinaryResourceMimeType(mimeType: string): boolean {
+  return (
+    mimeType.startsWith("image/") ||
+    mimeType.startsWith("audio/") ||
+    mimeType.startsWith("video/") ||
+    mimeType === "application/octet-stream"
+  );
+}
+
 function isStorageHandle(content: unknown): content is string {
   return typeof content === "string" && /^https?:\/\//.test(content);
 }
@@ -464,7 +469,14 @@ export async function handleGetResource(event: any) {
   const wantsRaw = query.raw !== undefined;
   const wantsDownload = query.download === "1";
 
-  if ((wantsRaw || wantsDownload) && isStorageHandle(resource.content)) {
+  // Gated on the binary kinds, not on the content alone: a text/plain resource
+  // whose body IS a url is a body, and redirecting to it would serve someone
+  // else's page in place of the file the caller asked for.
+  const holdsHandle =
+    isBinaryResourceMimeType(resource.mimeType) &&
+    isStorageHandle(resource.content);
+
+  if ((wantsRaw || wantsDownload) && holdsHandle) {
     // The bytes are in object storage, not in this row. Redirecting is the
     // only honest answer: base64-decoding a URL would return bytes that are
     // not the file, under the file's own content type.
@@ -499,16 +511,11 @@ export async function handleGetResource(event: any) {
   // For binary resources (images, audio, video), omit the content field from
   // the JSON response — it can be megabytes of base64. The client fetches
   // the actual bytes via ?raw when it needs to display them.
-  const isBinary =
-    resource.mimeType.startsWith("image/") ||
-    resource.mimeType.startsWith("audio/") ||
-    resource.mimeType.startsWith("video/") ||
-    resource.mimeType === "application/octet-stream";
-
+  //
   // A handle is not a body: it is short, it is what the caller needs to fetch
   // the bytes, and blanking it hides the very thing that proves the payload is
   // not in SQL.
-  if (isBinary && !isStorageHandle(resource.content)) {
+  if (isBinaryResourceMimeType(resource.mimeType) && !holdsHandle) {
     const { content: _content, ...meta } = resource;
     return { ...meta, content: "" };
   }
@@ -781,19 +788,10 @@ export async function handleUploadResource(event: any) {
     } catch (err) {
       // The row must never hold the body, so a refused upload is a refused
       // resource — not a resource whose `content` is the file.
-      if (err instanceof FileUploadStorageNotConfiguredError) {
-        setResponseStatus(event, 503);
-        return {
-          error: err.message,
-          setup: err.setup,
-          storageSetupRequired: true,
-        };
-      }
-      if (err instanceof FileUploadProviderUnreadableError) {
-        setResponseStatus(event, 503);
-        return { error: err.message, storageStatusUnknown: true };
-      }
-      throw err;
+      const refusal = describeFileUploadRefusal(err);
+      if (!refusal) throw err;
+      setResponseStatus(event, 503);
+      return { ...refusal, storageSetupRequired: true };
     }
     if (uploaded) {
       const resource = await resourcePut(owner, path, uploaded.url, mimeType);

@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildCloudflareR2ObjectKey,
+  cloudflareR2SetupStep,
+  describeCloudflareR2Binding,
   cloudflareR2FileUploadProvider,
   CLOUDFLARE_R2_BINDING_NAME,
   hasBoundCloudflareR2Bucket,
@@ -55,15 +57,32 @@ describe("cloudflare r2 file upload provider", () => {
       expect(hasBoundCloudflareR2Bucket()).toBe(true);
     });
 
-    it("reports a binding that is not a bucket rather than treating it as one", () => {
-      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    it("tells a malformed binding apart from an absent one", () => {
+      // The two send an operator to opposite repairs. "Bind a bucket" is
+      // useless advice to someone who bound one and got the binding wrong.
+      expect(describeCloudflareR2Binding()).toEqual({ state: "absent" });
+
+      bindBucket({ notABucket: true });
+      expect(describeCloudflareR2Binding()).toEqual({ state: "malformed" });
+      expect(resolveCloudflareR2Bucket()).toBeNull();
+
+      expect(cloudflareR2SetupStep("absent")).toContain(
+        "CLOUDFLARE_R2_BUCKET_NAME",
+      );
+      expect(cloudflareR2SetupStep("malformed")).toContain(
+        "is not an R2 bucket",
+      );
+      expect(cloudflareR2SetupStep("malformed")).not.toBe(
+        cloudflareR2SetupStep("absent"),
+      );
+    });
+
+    it("refuses an upload naming the malformed binding, not a missing one", async () => {
       bindBucket({ notABucket: true });
 
-      expect(resolveCloudflareR2Bucket()).toBeNull();
-      expect(error).toHaveBeenCalledWith(
-        expect.stringContaining("is not an R2 bucket"),
-      );
-      error.mockRestore();
+      await expect(
+        cloudflareR2FileUploadProvider.upload({ data: new Uint8Array([1]) }),
+      ).rejects.toThrow(/is not an R2 bucket/);
     });
   });
 
