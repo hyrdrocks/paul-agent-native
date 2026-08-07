@@ -1555,7 +1555,10 @@ type StaleRunRecoveryOutcome =
   | { outcome: "not_redispatchable" }
   | { outcome: "newer_run_exists" }
   | { outcome: "budget_exhausted" }
-  | { outcome: "repeated_no_progress" };
+  | { outcome: "repeated_no_progress" }
+  // A recovery that THREW is not a recovery that declined: the turn is just as
+  // dead either way, but only this one says the reason is unknown.
+  | { outcome: "recovery_failed"; error: string };
 
 /**
  * Mirrors `production-agent.ts`'s `generateRunId` — duplicated (not
@@ -1604,10 +1607,10 @@ function staleRecoveryDispatchPayload(payload: string): string {
  *     connected client to recover it via its own `auto_continue` re-POST.
  *   - its `dispatch_payload` is still present (an in-process automation run
  *     never had one and is declined as `not_redispatchable`, not as a loss)
- *     — without it there is nothing
- *     to rehydrate the successor's request body from. Read HERE, before the
- *     caller's terminal write (which NULLs `dispatch_payload` on every other
- *     path), so it survives long enough to carry over.
+ *     — without it there is nothing to rehydrate the successor's request body
+ *     from. The caller's reap UPDATE deliberately leaves `dispatch_payload`
+ *     alone (unlike every other terminal write, which NULLs it), which is what
+ *     lets this read run after the reap has already decided.
  *   - no newer run already exists for the same turn — avoids stacking a
  *     second successor onto a turn a previous recovery (or a normal
  *     `chainServerDrivenContinuation`) already continued. Combined with the
@@ -1779,13 +1782,19 @@ function attemptStaleRunRecoveryDispatch(successorRunId: string): void {
  * time exactly as the prior bulk UPDATE did, so a heartbeat that lands
  * between the snapshot SELECT and this call naturally excludes the row).
  *
- * FIX 3: wraps the reap-to-errored write together with the recovery-
- * successor insert (`attemptStaleRunRecovery`) in ONE transaction so a
- * client polling `/runs/active` mid-recovery can never observe "errored, no
- * successor" — both writes commit together or not at all. A recovery
- * failure (thrown inside the transaction callback) is caught locally and
+ * FIX 3: the reap-to-errored write and the recovery-successor insert
+ * (`attemptStaleRunRecovery`) run together, in a transaction where the
+ * dialect has one, so a client polling `/runs/active` mid-recovery does not
+ * observe "errored, no successor". A recovery failure is caught locally and
  * never rolls back the reap itself: the reap is the critical path, recovery
  * is strictly additive.
+ *
+ * The reap UPDATE is the ONLY thing that may authorise a successor, and it
+ * runs first on every dialect — a recovery is for a run this call actually
+ * terminalised, never for one that is still alive. D1 has no interactive
+ * transactions (`supportsInteractiveTransactions`, db/client.ts) and so runs
+ * the two writes unwrapped: an isolate that dies between them leaves the turn
+ * reaped with no successor, which is a lost recovery, not a lost run.
  */
 async function reapSingleStaleRun(
   runId: string,
@@ -1828,43 +1837,38 @@ async function reapSingleStaleRun(
   ];
 
   const client = getDbExec();
-  let reaped = false;
-  let outcome: StaleRunRecoveryOutcome | null = null;
-  if (client.transaction) {
-    await client.transaction(async (tx) => {
-      const { rowsAffected } = await tx.execute({
-        sql: updateSql,
-        args: updateArgs,
-      });
-      reaped = (rowsAffected ?? 0) > 0;
-      if (reaped) {
-        outcome = await attemptStaleRunRecovery(tx, runId).catch(() => null);
-      }
-    });
-  } else {
-    // No transaction primitive on this DbExec (every current implementation
-    // provides one — see db/client.ts — so this is a defensive fallback,
-    // not an expected path). Ordering the recovery design explicitly
-    // tolerates: insert the successor FIRST, then flip the old row terminal
-    // — a still-"running" old row plus an unclaimed successor is a safe
-    // intermediate state; the reverse (errored with no successor briefly
-    // visible) is not. Narrow, accepted gap versus the transactional path:
-    // two concurrent reapers racing this exact fallback on the exact same
-    // run could each pass the "no newer run" check before either inserts,
-    // producing two successors for one turn.
-    outcome = await attemptStaleRunRecovery(client, runId).catch(() => null);
-    const { rowsAffected } = await client.execute({
+  const reapThenRecover = async (
+    tx: DbExec,
+  ): Promise<{
+    reaped: boolean;
+    outcome: StaleRunRecoveryOutcome | null;
+  }> => {
+    const { rowsAffected } = await tx.execute({
       sql: updateSql,
       args: updateArgs,
     });
-    reaped = (rowsAffected ?? 0) > 0;
-  }
+    if ((rowsAffected ?? 0) === 0) return { reaped: false, outcome: null };
+    return {
+      reaped: true,
+      outcome: await attemptStaleRunRecovery(tx, runId).catch(
+        (error: unknown): StaleRunRecoveryOutcome => ({
+          outcome: "recovery_failed",
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      ),
+    };
+  };
+  const { reaped, outcome } = client.transaction
+    ? await client.transaction(reapThenRecover)
+    : await reapThenRecover(client);
 
   if (reaped && outcome && outcome.outcome !== "not_background") {
     const detail =
       outcome.outcome === "recovered"
         ? `recovered successorRunId=${outcome.successorRunId}`
-        : `declined reason=${outcome.outcome}`;
+        : outcome.outcome === "recovery_failed"
+          ? `failed reason=recovery_failed ${outcome.error}`
+          : `declined reason=${outcome.outcome}`;
     await recordRunDiagnostic(
       runId,
       RUN_DIAG_STAGE.staleRunRecoveryAttempted,
