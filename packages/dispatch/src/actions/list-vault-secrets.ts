@@ -6,7 +6,7 @@ import { listSecrets } from "../server/lib/vault-store.js";
 
 export default defineAction({
   description:
-    "List the secrets stored in the workspace vault: names, credential keys, and a masked last-4 preview. Never returns secret values — one id at a time goes through `reveal-vault-secret`, which is audited.",
+    "List the secrets stored in the workspace vault: names, credential keys, and a masked last-4 preview. Admin only. Never returns secret values — one id at a time goes through `reveal-vault-secret`, which is audited.",
   schema: z.object({}),
   http: { method: "GET" },
   run: async () => {

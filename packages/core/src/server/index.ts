@@ -4,12 +4,18 @@ export {
   type EnvKeyConfig,
 } from "./create-server.js";
 export {
+  startIntervalJob,
+  type IntervalJobOptions,
+  type IntervalJobHandle,
+} from "./interval-job.js";
+export {
   AGENT_BACKGROUND_PROCESSOR_FIELD,
   AGENT_BACKGROUND_PROCESSOR_ROUTE,
   AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD,
   type BackgroundDispatchTarget,
   backgroundDispatchPathOrThrow,
   dispatchPathTargetsNetlifyBackgroundFunction,
+  isInBackgroundFunctionRuntime,
   isInBackgroundInvocationScope,
   reportUnclaimedQueueBackgroundRunOnce,
   resolveBackgroundDispatchTarget,
@@ -145,9 +151,12 @@ export {
   actionsToEngineTools,
   executeAgentToolCall,
   getOwnerActiveApiKey,
+  getOwnerApiKeyForEngine,
+  resolveOwnerEngineApiKey,
   runAgentLoop,
   type AgentToolCallExecutionResult,
   type ExecuteAgentToolCallOptions,
+  type ResolvedOwnerApiKey,
 } from "../agent/production-agent.js";
 export {
   mountRealtimeVoiceRoutes,
@@ -573,11 +582,31 @@ export {
 export {
   sendEmail,
   isEmailConfigured,
+  getEmailReadiness,
   getEmailProvider,
   type EmailAttachment,
+  type EmailReadiness,
   type EmailProvider,
   type SendEmailArgs,
 } from "./email.js";
+export {
+  defineTransactionalEmail,
+  listTransactionalEmails,
+  getTransactionalEmail,
+  renderTransactionalEmailPreview,
+  type TransactionalEmailDefinition,
+  type RegisteredTransactionalEmail,
+} from "../email-catalog/registry.js";
+export {
+  notifyActivity,
+  runActivityNotification,
+  resolveActivityRecipients,
+  type ActivityDeliveryFailure,
+  type ActivityNotificationResult,
+  type ActivityNotificationStatus,
+  type NotifyActivityInput,
+  type ResolveActivityRecipientsInput,
+} from "./activity-notifications.js";
 export {
   renderEmail,
   emailStrong,

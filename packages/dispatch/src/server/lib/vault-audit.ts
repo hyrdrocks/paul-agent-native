@@ -6,7 +6,7 @@ import type {
 } from "@agent-native/core/audit";
 import { queryAuditEvents } from "@agent-native/core/audit";
 
-import { requireVaultCtx } from "./vault-store.js";
+import { assertCanManageVault, requireVaultCtx } from "./vault-store.js";
 
 /** The resource kinds a vault audit event can point at. */
 export type VaultAuditTargetType =
@@ -122,6 +122,11 @@ const MAX_VAULT_AUDIT_LIMIT = 100;
 export async function listVaultAuditEvents(
   query: VaultAuditQuery = {},
 ): Promise<VaultAuditPage> {
+  // The timeline names who read which secret, so it is org-administration
+  // data on the same footing as the secrets themselves. The store gate lives
+  // on `listSecrets`; re-pointing this timeline off `vault_audit_log` must not
+  // route around it.
+  await assertCanManageVault();
   const ctx = requireVaultCtx();
   const limit = Math.min(
     Math.max(1, Math.floor(query.limit ?? DEFAULT_VAULT_AUDIT_LIMIT)),

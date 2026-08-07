@@ -91,7 +91,14 @@ export async function dispatchPostFinalizeJob(args: {
       body,
     });
   const assertAccepted = async (response: Response) => {
-    if (response.ok) return;
+    if (response.ok) {
+      console.log("[post-finalize] dispatch accepted", {
+        recordingId: args.recordingId,
+        kind: args.kind,
+        status: response.status,
+      });
+      return;
+    }
     const detail = (await response.text().catch(() => "")).trim().slice(0, 300);
     throw new Error(
       `Post-finalize ${args.kind} worker returned HTTP ${response.status}${
@@ -103,6 +110,12 @@ export async function dispatchPostFinalizeJob(args: {
   // receiver calls back into it. That is why the url is resolved from the
   // processor route rather than substituted for a missing dispatch path.
   const workerUrl = resolveWorkerUrl(target.path ?? processorRoute);
+  console.log("[post-finalize] dispatching", {
+    recordingId: args.recordingId,
+    kind: args.kind,
+    workerUrl,
+    usesDurableBackground,
+  });
   const dispatch =
     target.path == null
       ? deliverBackgroundHandoff(target, {

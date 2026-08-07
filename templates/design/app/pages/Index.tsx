@@ -71,6 +71,8 @@ import {
   writePendingGeneration,
 } from "@/lib/pending-generation";
 
+import { withLocalRuntimes } from "../components/design/design-canvas/local-runtime";
+
 type ProjectType = "prototype" | "other";
 interface Design {
   id: string;
@@ -942,7 +944,9 @@ export default function Index() {
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
                           <DropdownMenuItem
-                            onClick={() => startRename(design)}
+                            onClick={() =>
+                              setTimeout(() => startRename(design))
+                            }
                             className="cursor-pointer"
                           >
                             <IconPencil className="w-3.5 h-3.5 me-2" />
@@ -968,7 +972,9 @@ export default function Index() {
                             )}
                           </DropdownMenuItem>
                           <DropdownMenuItem
-                            onClick={() => setDeleteId(design.id)}
+                            onClick={() =>
+                              setTimeout(() => setDeleteId(design.id))
+                            }
                             className="text-red-400 focus:text-red-400 cursor-pointer"
                           >
                             <IconTrash className="w-3.5 h-3.5 me-2" />
@@ -1176,7 +1182,7 @@ function DesignThumbnail({ html }: { html: string | null }) {
     >
       <iframe
         {...{ [SESSION_REPLAY_IFRAME_ATTRIBUTE]: "" }}
-        srcDoc={injectSessionReplayIframeBootstrap(html)}
+        srcDoc={injectSessionReplayIframeBootstrap(withLocalRuntimes(html))}
         sandbox="allow-scripts"
         loading="lazy"
         tabIndex={-1}

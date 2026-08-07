@@ -27,6 +27,7 @@ import {
   importBuilderCmsEntriesAsDatabaseItems,
   insertSecondarySource,
   mapBuilderCmsEntriesToLocalItems,
+  replaceMockSourceRows,
   replaceSourceMetadata,
   resolveDatabaseForSourceMutation,
   seedMockSourceFields,
@@ -397,6 +398,7 @@ export default defineAction({
 
       const secondaryId = await insertSecondarySource({
         database,
+        expectedPrimarySourceId: existingSource.id,
         sourceType,
         sourceName,
         sourceTable,
@@ -490,6 +492,7 @@ export default defineAction({
         additionalRead.state === "live" ? additionalRead.entries : [];
       const additionalSourceId = await insertSecondarySource({
         database,
+        expectedPrimarySourceId: existingSource.id,
         sourceType,
         sourceName,
         sourceTable,
@@ -511,6 +514,7 @@ export default defineAction({
       if (additionalRead.state === "live") {
         const importResult = await importBuilderCmsEntriesAsDatabaseItems({
           database,
+          sourceId: additionalSourceId,
           entries: additionalEntries,
           now,
           sourceTable,
@@ -634,6 +638,7 @@ export default defineAction({
     if (builderRead?.state === "live") {
       const importResult = await importBuilderCmsEntriesAsDatabaseItems({
         database,
+        sourceId,
         entries: builderEntries,
         now,
         sourceTable,
@@ -682,7 +687,7 @@ export default defineAction({
         builderSampleEntries: builderEntries,
         now,
       });
-      await seedMockSourceRows({
+      await replaceMockSourceRows({
         sourceId,
         ownerEmail: database.ownerEmail,
         sourceType,
