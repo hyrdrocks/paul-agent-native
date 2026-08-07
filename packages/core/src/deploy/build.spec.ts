@@ -380,6 +380,10 @@ describe("isCloudflareModulePreset", () => {
 });
 
 describe("Cloudflare module Worker entry", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("defers Nitro's handler and lifecycle initialization", () => {
     const source =
       'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}';
@@ -485,7 +489,9 @@ describe("Cloudflare module Worker entry", () => {
       'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
     );
 
-    configureCloudflareModuleWorkerOutput(serverDir);
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
 
     expect(
       JSON.parse(
@@ -515,7 +521,9 @@ describe("Cloudflare module Worker entry", () => {
   it("emits the producer binding, the consumer registration, and a raised CPU limit", () => {
     const config: Record<string, unknown> = { name: "design" };
 
-    configureCloudflareModuleBackgroundQueue(config);
+    configureCloudflareModuleBackgroundQueue(config, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
 
     expect(config.queues).toEqual({
       producers: [
@@ -549,7 +557,9 @@ describe("Cloudflare module Worker entry", () => {
       limits: { cpu_ms: 300_000, other: true },
     };
 
-    configureCloudflareModuleBackgroundQueue(config);
+    configureCloudflareModuleBackgroundQueue(config, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
 
     const queues = config.queues as {
       producers: unknown[];
@@ -575,7 +585,9 @@ describe("Cloudflare module Worker entry", () => {
       },
     };
 
-    configureCloudflareModuleBackgroundQueue(config);
+    configureCloudflareModuleBackgroundQueue(config, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
 
     const queues = config.queues as {
       producers: { queue: string }[];
@@ -592,9 +604,57 @@ describe("Cloudflare module Worker entry", () => {
   });
 
   it("refuses to name a background queue for an unnamed Worker", () => {
-    expect(() => configureCloudflareModuleBackgroundQueue({})).toThrow(
-      /has no `name`/,
+    expect(() =>
+      configureCloudflareModuleBackgroundQueue(
+        {},
+        { CLOUDFLARE_BACKGROUND_QUEUE: "1" },
+      ),
+    ).toThrow(/has no `name`/);
+  });
+
+  it("emits no queue for a Worker that asked for neither a queue nor durable background", () => {
+    vi.stubEnv("AGENT_CHAT_DURABLE_BACKGROUND", "false");
+    const config: Record<string, unknown> = { name: "design" };
+
+    configureCloudflareModuleBackgroundQueue(config, {});
+
+    // No `queues` key at all: wrangler rejects a producer or a consumer whose
+    // queue does not exist, so an app that never hands a run to the background
+    // must not be made to provision one to deploy.
+    expect(config.queues).toBeUndefined();
+    expect(config.limits).toEqual({ cpu_ms: 300_000 });
+  });
+
+  it("refuses at build time when durable background is requested with no queue", () => {
+    const config: Record<string, unknown> = { name: "paul-dispatch-app" };
+
+    // The refusal must name both resources: a consumer whose dead-letter queue
+    // is missing is rejected by wrangler exactly like a missing queue, and
+    // "create the queue" alone sends the operator round the loop twice.
+    expect(() => configureCloudflareModuleBackgroundQueue(config, {})).toThrow(
+      /CLOUDFLARE_BACKGROUND_QUEUE/,
     );
+    expect(() => configureCloudflareModuleBackgroundQueue(config, {})).toThrow(
+      /paul-dispatch-app-agent-background\b/,
+    );
+    expect(() => configureCloudflareModuleBackgroundQueue(config, {})).toThrow(
+      /paul-dispatch-app-agent-background-dlq/,
+    );
+    expect(() => configureCloudflareModuleBackgroundQueue(config, {})).toThrow(
+      /AGENT_CHAT_DURABLE_BACKGROUND=false/,
+    );
+    // Refused, not degraded: nothing partial is left on the config for a caller
+    // to mistake for a configured Worker.
+    expect(config.queues).toBeUndefined();
+  });
+
+  it("refuses an unrecognised queue declaration rather than reading it as either answer", () => {
+    expect(() =>
+      configureCloudflareModuleBackgroundQueue(
+        { name: "design" },
+        { CLOUDFLARE_BACKGROUND_QUEUE: "maybe" },
+      ),
+    ).toThrow(/is not a recognised value/);
   });
 });
 
@@ -660,6 +720,7 @@ describe("Cloudflare module Worker D1 binding", () => {
     configureCloudflareModuleWorkerOutput(serverDir, {
       CLOUDFLARE_D1_DATABASE_NAME: "design-local",
       CLOUDFLARE_D1_DATABASE_ID: "00000000-0000-0000-0000-000000000000",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
     });
 
     expect(
@@ -699,6 +760,7 @@ describe("Cloudflare module Worker D1 binding", () => {
     configureCloudflareModuleWorkerOutput(serverDir, {
       CLOUDFLARE_D1_DATABASE_NAME: "design-local",
       CLOUDFLARE_D1_DATABASE_ID: "fresh-id",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
     });
 
     expect(
@@ -725,7 +787,9 @@ describe("Cloudflare module Worker D1 binding", () => {
       'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
     );
 
-    configureCloudflareModuleWorkerOutput(serverDir, {});
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
 
     expect(
       JSON.parse(
@@ -776,6 +840,7 @@ describe("Cloudflare module Worker R2 binding", () => {
 
     configureCloudflareModuleWorkerOutput(serverDir, {
       CLOUDFLARE_R2_BUCKET_NAME: "app-uploads",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
     });
 
     expect(readConfig(serverDir)).toMatchObject({
@@ -790,7 +855,9 @@ describe("Cloudflare module Worker R2 binding", () => {
     // with setup guidance instead — see the file-upload registry.
     const serverDir = makeWorkerDir({});
 
-    configureCloudflareModuleWorkerOutput(serverDir, {});
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
 
     expect(readConfig(serverDir)).not.toHaveProperty("r2_buckets");
   });
@@ -805,6 +872,7 @@ describe("Cloudflare module Worker R2 binding", () => {
 
     configureCloudflareModuleWorkerOutput(serverDir, {
       CLOUDFLARE_R2_BUCKET_NAME: "app-uploads",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
     });
 
     expect(readConfig(serverDir).r2_buckets).toEqual([
@@ -875,6 +943,7 @@ describe("Cloudflare module Worker Browser Rendering binding", () => {
 
     configureCloudflareModuleWorkerOutput(serverDir, {
       CLOUDFLARE_BROWSER_RENDERING: "1",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
     });
 
     expect(readConfig(serverDir)).toMatchObject({
@@ -890,7 +959,9 @@ describe("Cloudflare module Worker Browser Rendering binding", () => {
     // runtime with setup guidance instead.
     const serverDir = makeWorkerDir({});
 
-    configureCloudflareModuleWorkerOutput(serverDir, {});
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
 
     expect(readConfig(serverDir)).not.toHaveProperty("browser");
   });
@@ -902,6 +973,7 @@ describe("Cloudflare module Worker Browser Rendering binding", () => {
 
     configureCloudflareModuleWorkerOutput(serverDir, {
       CLOUDFLARE_BROWSER_RENDERING: "on",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
     });
 
     expect(readConfig(serverDir).browser).toEqual({

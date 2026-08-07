@@ -34,6 +34,7 @@ import {
   AGENT_BACKGROUND_PROCESSOR_INTEGRATION,
   AGENT_BACKGROUND_PROCESSOR_ROUTE,
   AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD,
+  AGENT_CHAT_DURABLE_BACKGROUND_ENV,
   AGENT_CHAT_PROCESS_RUN_PATH,
   BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY,
   isDurableBackgroundFlagExplicitlyDisabled,
@@ -492,8 +493,29 @@ export interface CloudflareBrowserBindingConfig {
   binding: string;
 }
 
-const BROWSER_RENDERING_ON = new Set(["1", "true", "yes", "on"]);
-const BROWSER_RENDERING_OFF = new Set(["", "0", "false", "no", "off"]);
+const CLOUDFLARE_TOGGLE_ON = new Set(["1", "true", "yes", "on"]);
+const CLOUDFLARE_TOGGLE_OFF = new Set(["", "0", "false", "no", "off"]);
+
+/**
+ * Shared parse for the deploy-time toggles that DECLARE a Cloudflare capability
+ * rather than naming a resource. An unrecognised value throws rather than being
+ * read as either answer: `=maybe` silently meaning "on" (JS truthiness) or
+ * "off" (a strict `=== "1"`) are both a deploy that does not match what its
+ * operator wrote down.
+ */
+function parseCloudflareDeployToggle(
+  name: string,
+  raw: string | undefined,
+  guidance: string,
+): boolean {
+  if (raw === undefined) return false;
+  const value = raw.trim().toLowerCase();
+  if (CLOUDFLARE_TOGGLE_OFF.has(value)) return false;
+  if (CLOUDFLARE_TOGGLE_ON.has(value)) return true;
+  throw new Error(
+    `[deploy] ${name}="${raw}" is not a recognised value — ${guidance}`,
+  );
+}
 
 /**
  * Resolve the Worker's Browser Rendering binding from the build environment.
@@ -520,15 +542,12 @@ const BROWSER_RENDERING_OFF = new Set(["", "0", "false", "no", "off"]);
 export function resolveCloudflareBrowserBinding(
   env: NodeJS.ProcessEnv = process.env,
 ): CloudflareBrowserBindingConfig | null {
-  const raw = env[CLOUDFLARE_BROWSER_RENDERING_ENV];
-  if (raw === undefined) return null;
-  const value = raw.trim().toLowerCase();
-  if (BROWSER_RENDERING_OFF.has(value)) return null;
-  if (!BROWSER_RENDERING_ON.has(value)) {
-    throw new Error(
-      `[deploy] ${CLOUDFLARE_BROWSER_RENDERING_ENV}="${raw}" is not a recognised value — use 1/true/yes/on to bind ${CLOUDFLARE_BROWSER_BINDING_NAME}, or 0/false/no/off to leave it unbound`,
-    );
-  }
+  const enabled = parseCloudflareDeployToggle(
+    CLOUDFLARE_BROWSER_RENDERING_ENV,
+    env[CLOUDFLARE_BROWSER_RENDERING_ENV],
+    `use 1/true/yes/on to bind ${CLOUDFLARE_BROWSER_BINDING_NAME}, or 0/false/no/off to leave it unbound`,
+  );
+  if (!enabled) return null;
   return { binding: CLOUDFLARE_BROWSER_BINDING_NAME };
 }
 
@@ -545,6 +564,20 @@ export const CLOUDFLARE_MODULE_WORKER_CPU_MS = 300_000;
 export const CLOUDFLARE_BACKGROUND_QUEUE_MAX_BATCH_SIZE = 1;
 
 /**
+ * Declares that the background queue and its dead-letter queue EXIST for this
+ * Worker. Like `CLOUDFLARE_BROWSER_RENDERING` and unlike the D1 and R2
+ * variables it names nothing: the queue name is derived from the Worker's own
+ * name, so there is no id to carry — only the fact that the resources were
+ * created.
+ */
+export const CLOUDFLARE_BACKGROUND_QUEUE_ENV = "CLOUDFLARE_BACKGROUND_QUEUE";
+
+/** Suffix wrangler requires to already exist before it accepts the consumer. */
+export function agentBackgroundDeadLetterQueueName(queueName: string): string {
+  return `${queueName}-dlq`;
+}
+
+/**
  * Write the durable background queue into the generated Worker configuration:
  * the producer binding the framework resolves, the consumer registration that
  * makes this same Worker claim those messages, and the raised CPU ceiling.
@@ -553,13 +586,29 @@ export const CLOUDFLARE_BACKGROUND_QUEUE_MAX_BATCH_SIZE = 1;
  * are framework internals — a hand-maintained copy drifting from them is a
  * producer that sends into a queue no consumer reads, which is the silent
  * lost-budget failure this whole path exists to make impossible.
+ *
+ * Conditional, like D1, R2 and Browser Rendering: `wrangler deploy` rejects a
+ * producer or a consumer whose queue does not exist, so an unconditional emit
+ * makes a queue and a DLQ a prerequisite for EVERY Cloudflare deploy, including
+ * apps that never hand a run to the background.
+ *
+ * The two halves are not separable. Skipping the emit for an app that still
+ * requests durable background runs would leave the deployed Worker accepting
+ * background work and running it inline under the foreground clamp — a silent
+ * runtime degrade traded for a loud deploy failure, which is strictly worse.
+ * So that combination throws HERE, at build time, before anything is deployed.
+ * "No queue configured" and "queue configured and working" stay distinguishable
+ * states; only the first is ever reached deliberately.
  */
-export function configureCloudflareModuleBackgroundQueue(config: {
-  name?: unknown;
-  queues?: unknown;
-  limits?: unknown;
-  [key: string]: unknown;
-}): void {
+export function configureCloudflareModuleBackgroundQueue(
+  config: {
+    name?: unknown;
+    queues?: unknown;
+    limits?: unknown;
+    [key: string]: unknown;
+  },
+  env: NodeJS.ProcessEnv = process.env,
+): void {
   const workerName = typeof config.name === "string" ? config.name.trim() : "";
   if (!workerName) {
     throw new Error(
@@ -569,6 +618,35 @@ export function configureCloudflareModuleBackgroundQueue(config: {
     );
   }
   const queueName = agentBackgroundQueueName(workerName);
+  const deadLetterQueueName = agentBackgroundDeadLetterQueueName(queueName);
+  const queueProvisioned = parseCloudflareDeployToggle(
+    CLOUDFLARE_BACKGROUND_QUEUE_ENV,
+    env[CLOUDFLARE_BACKGROUND_QUEUE_ENV],
+    `use 1/true/yes/on once "${queueName}" and "${deadLetterQueueName}" exist, or 0/false/no/off to build a Worker with no background queue`,
+  );
+  if (!queueProvisioned) {
+    // `isDurableBackgroundDeployEnabled()` reads process.env deliberately: it is
+    // the same gate the Netlify emit uses, and a second parse of the flag here
+    // is how the two hosts come to disagree about what "requests durable
+    // background" means.
+    if (isDurableBackgroundDeployEnabled()) {
+      throw new Error(
+        `[deploy] This Worker requests durable background runs but ${CLOUDFLARE_BACKGROUND_QUEUE_ENV} ` +
+          "is not set, so no queue transport would be emitted and every background run would " +
+          "execute inline under the foreground clamp instead of the durable budget.\n" +
+          "Create both queues, dead-letter queue first, and declare them on the build:\n" +
+          `  wrangler queues create ${deadLetterQueueName}\n` +
+          `  wrangler queues create ${queueName}\n` +
+          `  ${CLOUDFLARE_BACKGROUND_QUEUE_ENV}=1\n` +
+          `Both are required: the emitted consumer names "${deadLetterQueueName}" as its ` +
+          "dead-letter queue, and wrangler refuses a consumer whose DLQ does not exist.\n" +
+          `Or set ${AGENT_CHAT_DURABLE_BACKGROUND_ENV}=false to build a Worker that runs every ` +
+          "agent turn inline and needs no queue.",
+      );
+    }
+    configureCloudflareModuleWorkerCpuLimit(config);
+    return;
+  }
   const existing = (
     typeof config.queues === "object" && config.queues !== null
       ? config.queues
@@ -611,10 +689,22 @@ export function configureCloudflareModuleBackgroundQueue(config: {
         max_batch_size: CLOUDFLARE_BACKGROUND_QUEUE_MAX_BATCH_SIZE,
         max_batch_timeout: 0,
         max_retries: 3,
-        dead_letter_queue: `${queueName}-dlq`,
+        dead_letter_queue: deadLetterQueueName,
       },
     ],
   };
+  configureCloudflareModuleWorkerCpuLimit(config);
+}
+
+/**
+ * Applied whether or not a queue is emitted: the ceiling protects a long agent
+ * turn, and a Worker with no durable transport runs that turn inline — where it
+ * has MORE need of the raised limit, not less.
+ */
+function configureCloudflareModuleWorkerCpuLimit(config: {
+  limits?: unknown;
+  [key: string]: unknown;
+}): void {
   const limits = (
     typeof config.limits === "object" && config.limits !== null
       ? config.limits
@@ -688,7 +778,7 @@ export function configureCloudflareModuleWorkerOutput(
         : {};
     config.browser = { ...existing, binding: browserBinding.binding };
   }
-  configureCloudflareModuleBackgroundQueue(config);
+  configureCloudflareModuleBackgroundQueue(config, env);
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
   fs.writeFileSync(
     nitroEntryPath,
@@ -3137,12 +3227,13 @@ export function findInstalledResvgPackages(
 }
 
 /**
- * Deploy-time gate for emitting the second `-background` Netlify function.
- * Netlify deploys are default-on; an explicit falsy
- * `AGENT_CHAT_DURABLE_BACKGROUND` value opts out. This is called only from the
- * Netlify preset, so non-Netlify builds remain unaffected. The gate and runtime
- * default must agree: otherwise the runtime could target a worker that the
- * deploy did not emit.
+ * Deploy-time gate for durable background runs: "does this app want the long
+ * budget at all". Both hosts are default-on and an explicit falsy
+ * `AGENT_CHAT_DURABLE_BACKGROUND` value opts out, matching each host's runtime
+ * default — otherwise the runtime could target a worker the deploy did not
+ * emit. Netlify reads it to decide whether to emit the second `-background`
+ * function; Cloudflare reads it to decide whether a build with no queue
+ * declared is a deliberate no-background Worker or a misconfiguration.
  */
 export function isDurableBackgroundDeployEnabled(): boolean {
   return !isDurableBackgroundFlagExplicitlyDisabled();

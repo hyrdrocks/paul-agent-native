@@ -52,7 +52,7 @@ and nothing else. R3 (#14) added the queue emitter, R4 (#15) added
 Neither variable is inert, and the local-versus-remote R2 divergence below is
 live — see the `justfile` note under Local run.
 
-The R2 emitter is conditional, like D1 and unlike the queue: with
+The R2 emitter is conditional, like D1: with
 `CLOUDFLARE_R2_BUCKET_NAME` unset the generated config carries no `r2_buckets`
 key at all, the deploy succeeds, and uploads fail closed at runtime with setup
 guidance. That absent-binding deploy is what #15's AC3 negative control ran
@@ -63,7 +63,8 @@ stating because Browser Rendering has no resource behind it. An entitlement is
 *more* of a deploy prerequisite than a resource, not less: `wrangler deploy`
 rejects a binding the account is not entitled to, so an unconditional emit would
 fail the deploy of every app that never renders anything — R3's queue mistake
-(#30) in a second place. With no id to derive from, `CLOUDFLARE_BROWSER_RENDERING`
+(#30, since fixed: the queue emitter is conditional too, see below) in a second
+place. With no id to derive from, `CLOUDFLARE_BROWSER_RENDERING`
 declares intent rather than pointing at something; what stops it being a switch
 nobody flips is that a Worker with no `BROWSER` bound refuses at the first render
 and names both the variable and the binding. That absent-binding deploy is what
@@ -77,7 +78,7 @@ and names both the variable and the binding. That absent-binding deploy is what
 | — | Queue consumer | same queue, DLQ `paul-design-app-agent-background-dlq` (id `8bd3355ef05f4efda0e8e35010d7a33d`) | emitted by `configureCloudflareModuleBackgroundQueue()` |
 | `BROWSER` | Browser Rendering | account entitlement, no resource to create | `CLOUDFLARE_BROWSER_BINDING_NAME` in `browser-rendering/cloudflare-browser.ts`, read through the seam by the Design template's `server/lib/playwright-runtime.ts` |
 
-The DLQ exists because the preset names it unconditionally
+The DLQ exists because the emitted consumer names it
 (`` `${queueName}-dlq` ``). A missing DLQ is a deploy-time failure, not a
 runtime one, so it was created rather than left to be discovered.
 
@@ -113,8 +114,8 @@ pointing at r2.dev, so do it before real content lands, or not at all.
 ## Build-time configuration
 
 The Worker preset generates `.output/server/wrangler.json`; it does not read a
-hand-written one for these. Three of the five bindings come from build
-environment variables, and two are emitted unconditionally:
+hand-written one for these. Four of the five bindings come from build
+environment variables, and only `ASSETS` is emitted unconditionally:
 
 ```sh
 NITRO_PRESET=cloudflare_module
@@ -122,6 +123,7 @@ CLOUDFLARE_D1_DATABASE_NAME=paul-design-app
 CLOUDFLARE_D1_DATABASE_ID=256288ec-77ac-4e9d-ab1b-8d415e4ee997
 CLOUDFLARE_R2_BUCKET_NAME=paul-design-app-uploads
 CLOUDFLARE_BROWSER_RENDERING=1
+CLOUDFLARE_BACKGROUND_QUEUE=1
 ```
 
 `resolveCloudflareD1Binding()` throws when exactly one of the two D1 variables
@@ -146,8 +148,26 @@ rather than being read as either answer, because truthiness would make
 `=maybe` mean on and a strict `=== "1"` would make it mean off, and both are a
 deploy that does not match what its operator wrote down.
 
-The queue (producer, consumer, DLQ, `cpu_ms: 300000`) needs no variables — the
-preset writes it from the Worker name.
+`CLOUDFLARE_BACKGROUND_QUEUE` declares that
+`paul-design-app-agent-background` and its `-dlq` exist. Like
+`CLOUDFLARE_BROWSER_RENDERING` it names nothing — the queue name is still
+derived from the Worker's name — but unlike every other variable here, omitting
+it is not a quiet no-binding deploy. A build that still wants durable background
+runs (`AGENT_CHAT_DURABLE_BACKGROUND` unset or truthy, the default on Workers)
+is REFUSED at build time, naming both queues and both ways out. That asymmetry
+is deliberate: an unbound `UPLOADS` fails the first upload loudly, whereas an
+unbound queue leaves every background turn running inline under the foreground
+clamp on a Worker that looks healthy. The one variable that does not gate a
+binding is `cpu_ms: 300000`, which the preset raises on every build — a long
+turn needs the ceiling most when it has no queue to escape to.
+
+The DLQ must exist before the queue is useful, and before either the emitted
+consumer is accepted:
+
+```sh
+wrangler queues create paul-design-app-agent-background-dlq
+wrangler queues create paul-design-app-agent-background
+```
 
 See `design-app.build.env.example` and `design-app.wrangler.reference.jsonc` in
 this directory.
