@@ -1,8 +1,10 @@
-# Agent Native
+# Agent Native — Host
 
-An app framework where the AI agent and the UI are equal partners over the same
-SQL data and action surface. It runs the same application on more than one
-deployment platform, which is where the vocabulary below comes from.
+The framework runs the same application on more than one deployment platform.
+This is the vocabulary of that seam, and it is the vocabulary of the framework
+itself: nothing here depends on our forks existing. The repository's other
+glossary is `CONTEXT.md` at the root, which is about the forks; `CONTEXT-MAP.md`
+says which is which and why they stay apart.
 
 Use these terms as defined. Where a term has common synonyms, they are listed
 under `_Avoid_` — the synonyms mean something else here, or nothing.

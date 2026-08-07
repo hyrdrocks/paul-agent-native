@@ -38,9 +38,26 @@ Multi-context repo (presence of `CONTEXT-MAP.md` at the root):
         └── docs/adr/
 ```
 
+**This repo is the multi-context shape**, with the context directory one level
+deeper than the sketch because the framework is a package:
+
+```
+/
+├── CONTEXT-MAP.md                     ← start here
+├── CONTEXT.md                         ← Fork Distribution
+├── docs/adr/                          ← every ADR, one sequence
+└── packages/core/src/hosts/
+    └── CONTEXT.md                     ← Host
+```
+
+All ADRs live in the single root sequence — `docs/adr/` — no matter which
+context they belong to, because only the trunk allocates ADR numbers (ADR 0009)
+and a per-context sequence would reintroduce the collision that rule exists to
+stop. There is no `src/<context>/docs/adr/` here.
+
 ## Use the glossary's vocabulary
 
-When your output names a domain concept (in an issue title, a refactor proposal, a hypothesis, a test name), use the term as defined in `CONTEXT.md`. Don't drift to synonyms the glossary explicitly avoids.
+When your output names a domain concept (in an issue title, a refactor proposal, a hypothesis, a test name), use the term as defined in the `CONTEXT.md` **for that context**. Don't drift to synonyms the glossary explicitly avoids, and don't reach into the other context's glossary for a term this one already defines — read `CONTEXT-MAP.md` for which is which and where they touch.
 
 If the concept you need isn't in the glossary yet, that's a signal — either you're inventing language the project doesn't use (reconsider) or there's a real gap (note it for `/domain-modeling`).
 
