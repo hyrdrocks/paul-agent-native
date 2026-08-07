@@ -3,6 +3,10 @@
 How our private forks of `BuilderIO/agent-native` are built, released, and
 consumed by the workspace apps we run on Cloudflare.
 
+This is one of two glossaries. The framework's own Host vocabulary lives in
+`packages/core/src/hosts/CONTEXT.md`; `CONTEXT-MAP.md` says which is which and
+why they are not one list.
+
 ## Language
 
 **Upstream**:

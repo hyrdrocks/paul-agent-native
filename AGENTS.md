@@ -293,10 +293,23 @@ Two are entry points rather than area guides:
 
 ## Agent skills
 
+Configuration the installed engineering skills read. These describe where work
+is tracked, not how to write code — the rules above still govern that.
+
 ### Issue tracker
 
 See `docs/agents/issue-tracker.md` — tickets for this work do **not** live where `git remote -v`
 would suggest; read that file before any `gh issue` call.
+
+### Triage labels
+
+The five canonical roles, each label string equal to its name.
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Multi-context: `CONTEXT-MAP.md` at the root names each context and points at its
+own `CONTEXT.md`. See `docs/agents/domain.md`.
 
 ### Delegation profile
 
