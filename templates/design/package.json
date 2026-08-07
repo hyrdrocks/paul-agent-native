@@ -21,6 +21,7 @@
     "@agent-native/core": "workspace:*",
     "@agent-native/creative-context": "workspace:*",
     "@agent-native/toolkit": "workspace:*",
+    "@cloudflare/puppeteer": "^1.3.0",
     "@fontsource-variable/inter": "^5.2.8",
     "@libsql/client": "^0.15.8",
     "@paper-design/shaders-react": "0.0.76",

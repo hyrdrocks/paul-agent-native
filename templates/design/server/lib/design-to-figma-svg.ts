@@ -41,7 +41,7 @@ import {
 } from "@agent-native/core/extensions/url-safety";
 
 import { parseCssColorExtended } from "../../shared/color-utils.js";
-import { importPlaywright, launchChromium } from "./playwright-runtime.js";
+import { launchRenderBrowser } from "./playwright-runtime.js";
 
 export const MAX_EMBEDDED_IMAGE_BYTES = 8 * 1024 * 1024;
 const EMBEDDED_IMAGE_MIME_TYPES = new Set([
@@ -1533,6 +1533,24 @@ export class FigmaSvgRootSelectorNotFoundError extends Error {
   }
 }
 
+/** Any element that puts marks on the page. `<svg>` and `<defs>` do not. */
+const FIGMA_SVG_DRAW_NODE =
+  /<(rect|path|text|image|g|circle|ellipse|line|polygon|polyline|use)\b/;
+
+/**
+ * Thrown when the render produced a document with nothing drawn in it. Its own
+ * error rather than an empty return, because an empty SVG is valid SVG: every
+ * caller that got one back read it as a successful export of a blank screen.
+ */
+export class FigmaSvgEmptyDocumentError extends Error {
+  constructor() {
+    super(
+      "The rendered screen produced an SVG with no drawing nodes — nothing was rendered.",
+    );
+    this.name = "FigmaSvgEmptyDocumentError";
+  }
+}
+
 export function isMissingRootSelectorError(
   err: unknown,
 ): err is FigmaSvgRootSelectorNotFoundError {
@@ -1542,8 +1560,11 @@ export function isMissingRootSelectorError(
 /**
  * Renders `html` in headless Chromium, walks the live DOM to build a
  * `FigmaSvgNode` scene, and serializes it into a genuinely vector SVG
- * document via `buildFigmaSvgDocument`. Throws when no Chromium binary is
- * available — callers should catch and fall back (mirrors
+ * document via `buildFigmaSvgDocument`. Renders through whatever this host
+ * provides — a local Chromium, or the Host's browser binding; see
+ * `launchRenderBrowser`. Throws when no browser is reachable, either because
+ * no binary is installed or because the host has nothing bound — callers
+ * should catch and surface the refusal rather than return a document (mirrors
  * `take-design-screenshot.ts`'s `chromiumUnavailableReason` pattern). Throws
  * `FigmaSvgRootSelectorNotFoundError` when `rootSelector` matches nothing —
  * callers should catch that specific error and fail soft (see
@@ -1552,8 +1573,7 @@ export function isMissingRootSelectorError(
 export async function renderDesignToFigmaSvg(
   options: RenderFigmaSvgOptions,
 ): Promise<{ svg: string; report: FigmaSvgExportReport }> {
-  const playwright = await importPlaywright();
-  const browser = await launchChromium(playwright.chromium);
+  const browser = await launchRenderBrowser();
   try {
     const context = await browser.newContext({
       viewport: { width: options.width, height: options.height },
@@ -1626,6 +1646,13 @@ export async function renderDesignToFigmaSvg(
         root,
       });
       result.report.omitted.push(...embeddedImageOmissions);
+      // A document with no drawing nodes is still well-formed SVG, and it is
+      // exactly what a browser that rendered nothing produces — the caller
+      // cannot tell it from a screen that is genuinely blank, and neither can
+      // the person who opens it in Figma. Refuse it here rather than return it.
+      if (!FIGMA_SVG_DRAW_NODE.test(result.svg)) {
+        throw new FigmaSvgEmptyDocumentError();
+      }
       return result;
     } finally {
       await context.close().catch(() => {});

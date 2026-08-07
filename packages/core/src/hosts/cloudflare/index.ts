@@ -8,10 +8,12 @@
  */
 
 import { registerCloudflareBackgroundTransport } from "./background-transport.js";
+import { registerCloudflareBrowserRendering } from "./browser-rendering.js";
 import { registerCloudflareFallbackStorage } from "./fallback-storage.js";
 
 export function registerCloudflareHost(): void {
   registerCloudflareBackgroundTransport();
+  registerCloudflareBrowserRendering();
   registerCloudflareFallbackStorage();
 }
 

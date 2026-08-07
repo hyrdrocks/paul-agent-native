@@ -29,7 +29,10 @@ import {
   renderDesignToFigmaSvg,
   safeFigmaSvgFilename,
 } from "../server/lib/design-to-figma-svg.js";
-import { isMissingBrowserError } from "../server/lib/playwright-runtime.js";
+import {
+  isBrowserRenderingUnavailableError,
+  isMissingBrowserError,
+} from "../server/lib/playwright-runtime.js";
 import { parseCanvasFrameGeometryById } from "../shared/canvas-frames.js";
 import { buildCodeLayerProjection } from "../shared/code-layer.js";
 import "../server/db/index.js"; // ensure registerShareableResource runs
@@ -307,6 +310,12 @@ export default defineAction({
         embedImages: embedImages ?? true,
       });
     } catch (err) {
+      if (isBrowserRenderingUnavailableError(err)) {
+        // The host owns a browser and has none bound. Nothing to install and
+        // no second renderer to try — surface the setup step instead of an
+        // SVG with no nodes in it.
+        return { ok: false, reason: err.message, setup: err.setup };
+      }
       if (isMissingBrowserError(err)) {
         return { ok: false, reason: chromiumUnavailableReason(err) };
       }

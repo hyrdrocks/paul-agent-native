@@ -39,6 +39,7 @@
   "type": "module",
   "sideEffects": [
     "*.css",
+    "dist/hosts/**",
     "dist/client/dev-overlay/builtins.js",
     "dist/client/tombstone/agent-presence-chip.js",
     "dist/client/tombstone/editor.js",
@@ -318,6 +319,7 @@
     "./agent/json-schema-validator": "./dist/agent/json-schema-validator.js",
     "./agent/durable-background": "./dist/agent/durable-background.js",
     "./hosts": "./dist/hosts/index.js",
+    "./browser-rendering": "./dist/browser-rendering/index.js",
     "./eval": "./dist/eval/index.js",
     "./tsconfig.base.json": "./tsconfig.base.json"
   },

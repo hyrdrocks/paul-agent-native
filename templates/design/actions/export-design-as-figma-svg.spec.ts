@@ -94,9 +94,16 @@ vi.mock("../server/lib/design-to-figma-svg.js", () => ({
     err instanceof MockFigmaSvgRootSelectorNotFoundError,
 }));
 
+class MockBrowserRenderingUnavailableError extends Error {
+  readonly setup = "build with CLOUDFLARE_BROWSER_RENDERING=1";
+  readonly provider = "cloudflare";
+}
+
 vi.mock("../server/lib/playwright-runtime.js", () => ({
   isMissingBrowserError: (err: unknown) =>
     /no chromium/i.test(err instanceof Error ? err.message : String(err)),
+  isBrowserRenderingUnavailableError: (err: unknown) =>
+    err instanceof MockBrowserRenderingUnavailableError,
 }));
 
 import action, {
@@ -168,6 +175,23 @@ describe("export-design-as-figma-svg action.run", () => {
     )) as { ok: boolean; reason?: string };
     expect(result.ok).toBe(false);
     expect(result.reason).toContain("export-svg");
+  });
+
+  it("reports a host with no browser bound as a failure carrying the setup step", async () => {
+    // Not an SVG with no nodes, not an empty document — the caller must be
+    // able to tell "this host cannot render" from "this screen is blank".
+    renderDesignToFigmaSvg.mockRejectedValueOnce(
+      new MockBrowserRenderingUnavailableError("no Chromium on this host"),
+    );
+
+    const result = (await action.run(
+      { designId: "design_1", filename: "index.html" } as never,
+      {} as never,
+    )) as { ok: boolean; reason?: string; setup?: string; svg?: string };
+
+    expect(result.ok).toBe(false);
+    expect(result.svg).toBeUndefined();
+    expect(result.setup).toContain("CLOUDFLARE_BROWSER_RENDERING");
   });
 
   it("re-throws a non-Chromium render error", async () => {

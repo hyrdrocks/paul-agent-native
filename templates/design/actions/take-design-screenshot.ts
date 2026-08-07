@@ -163,11 +163,11 @@ export {
   importPlaywright,
   isMissingBrowserError,
   launchChromium,
+  launchRenderBrowser,
 } from "../server/lib/playwright-runtime.js";
 import {
-  importPlaywright,
-  launchChromium,
-  type PlaywrightModule,
+  isBrowserRenderingUnavailableError,
+  launchRenderBrowser,
 } from "../server/lib/playwright-runtime.js";
 
 /** Human-readable, model-actionable message for the "no Chromium available" case. */
@@ -456,8 +456,9 @@ export default defineAction({
     "the diagnostics are actionable immediately; the screenshot URL is for " +
     "human review in chat today and becomes agent-visible once tool-result " +
     "images ship. Requires a headless Chromium binary; in hosted/serverless " +
-    "deploys where one isn't available, returns `{ ok: false, reason }` " +
-    "instead of throwing — fall back to run-design-audit in that case.",
+    "deploys where one isn't available, returns `{ ok: false, reason, setup }` " +
+    "instead of throwing — `setup` names the configuration that would make " +
+    "rendering work here. Fall back to run-design-audit in that case.",
   schema: z.object({
     designId: z
       .string()
@@ -547,18 +548,18 @@ export default defineAction({
 
     const html = await liveContent(file.id, file.content ?? "");
 
-    let playwright: PlaywrightModule;
-    try {
-      playwright = await importPlaywright();
-    } catch (err) {
-      return { ok: false, reason: chromiumUnavailableReason(err) };
-    }
-
     const viewports = resolveViewports(widths, heights);
-    let browser: import("@playwright/test").Browser | undefined;
+    let browser: import("@playwright/test").Browser;
     try {
-      browser = await launchChromium(playwright.chromium);
+      browser = await launchRenderBrowser();
     } catch (err) {
+      if (isBrowserRenderingUnavailableError(err)) {
+        // A host that claims this process and has no browser is not the same
+        // as a machine with no Chromium installed: there is nothing to install
+        // and no fallback renderer, only a binding to configure. Say so, and
+        // hand back the setup step rather than a screenshot-shaped nothing.
+        return { ok: false, reason: err.message, setup: err.setup };
+      }
       return { ok: false, reason: chromiumUnavailableReason(err) };
     }
 
@@ -667,13 +668,26 @@ export default defineAction({
           // this is the "PNG export produces ... broken layouts" complaint
           // for tall complex screens, reproduced on a 1440x3200 fixture.
           const png = await page.screenshot({ type: "png", fullPage: true });
+          // A browser that answered with no bytes did not render this screen.
+          // Reporting that as a screenshot of zero length is the empty-artifact
+          // failure — a value no caller can tell from a blank design.
+          if (png.byteLength === 0) {
+            throw new Error(
+              `The browser returned an empty image for ${file.filename} at ${viewport.label} — nothing was rendered.`,
+            );
+          }
 
+          // Deliberately un-caught. A storage refusal must not become
+          // `url: ""` on an otherwise ok:true result — an artifact that reads
+          // as a success everywhere except one boolean nobody checks. The
+          // `null` below is the single remaining case: no provider AND this
+          // host permits keeping the bytes elsewhere, which is a local run.
           const uploaded = await uploadFile({
             data: png,
             mimeType: "image/png",
             filename: `design-${file.designId}-${file.filename}-${viewport.label}.png`,
             ownerEmail,
-          }).catch(() => null);
+          });
 
           screenshots.push({
             viewport,
@@ -697,6 +711,20 @@ export default defineAction({
           await context.close().catch(() => {});
         }
       }
+    } catch (err) {
+      // A render or a store that failed is a failure of this action, not a
+      // partial result. Returning the screenshots taken so far would hand back
+      // an artifact set that is short by however many viewports broke, with
+      // nothing in it saying so.
+      const setup =
+        err && typeof err === "object" && "setup" in err
+          ? String((err as { setup: unknown }).setup)
+          : undefined;
+      return {
+        ok: false as const,
+        reason: err instanceof Error ? err.message : String(err),
+        ...(setup ? { setup } : {}),
+      };
     } finally {
       await browser.close().catch(() => {});
     }
