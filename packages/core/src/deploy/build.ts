@@ -573,7 +573,7 @@ export const CLOUDFLARE_BACKGROUND_QUEUE_MAX_BATCH_SIZE = 1;
 export const CLOUDFLARE_BACKGROUND_QUEUE_ENV = "CLOUDFLARE_BACKGROUND_QUEUE";
 
 /** Suffix wrangler requires to already exist before it accepts the consumer. */
-export function agentBackgroundDeadLetterQueueName(queueName: string): string {
+function agentBackgroundDeadLetterQueueName(queueName: string): string {
   return `${queueName}-dlq`;
 }
 
@@ -592,13 +592,11 @@ export function agentBackgroundDeadLetterQueueName(queueName: string): string {
  * makes a queue and a DLQ a prerequisite for EVERY Cloudflare deploy, including
  * apps that never hand a run to the background.
  *
- * The two halves are not separable. Skipping the emit for an app that still
- * requests durable background runs would leave the deployed Worker accepting
- * background work and running it inline under the foreground clamp — a silent
- * runtime degrade traded for a loud deploy failure, which is strictly worse.
- * So that combination throws HERE, at build time, before anything is deployed.
- * "No queue configured" and "queue configured and working" stay distinguishable
- * states; only the first is ever reached deliberately.
+ * Conditional does NOT mean optional. This host's durable gate is default-on,
+ * so a Worker built with no queue and no opt-out accepts background work and
+ * runs it inline under the foreground clamp while looking healthy. Every path
+ * out of here therefore leaves the two facts agreeing: a queue, or a declared
+ * opt-out that reaches the runtime, or a refusal.
  */
 export function configureCloudflareModuleBackgroundQueue(
   config: {
@@ -625,11 +623,10 @@ export function configureCloudflareModuleBackgroundQueue(
     `use 1/true/yes/on once "${queueName}" and "${deadLetterQueueName}" exist, or 0/false/no/off to build a Worker with no background queue`,
   );
   if (!queueProvisioned) {
-    // `isDurableBackgroundDeployEnabled()` reads process.env deliberately: it is
-    // the same gate the Netlify emit uses, and a second parse of the flag here
-    // is how the two hosts come to disagree about what "requests durable
+    // The same gate the Netlify emit reads. A second parse of the flag here is
+    // how the two hosts would come to disagree about what "requests durable
     // background" means.
-    if (isDurableBackgroundDeployEnabled()) {
+    if (isDurableBackgroundDeployEnabled(env)) {
       throw new Error(
         `[deploy] This Worker requests durable background runs but ${CLOUDFLARE_BACKGROUND_QUEUE_ENV} ` +
           "is not set, so no queue transport would be emitted and every background run would " +
@@ -644,6 +641,13 @@ export function configureCloudflareModuleBackgroundQueue(
           "agent turn inline and needs no queue.",
       );
     }
+    // The opt-out is a BUILD variable and the Worker re-reads its own env, where
+    // this host's durable gate is default-on. Left unwritten, the deployed
+    // Worker opens the gate, finds no queue, and runs the turn inline under the
+    // foreground clamp — the silent degrade the refusal above exists to
+    // prevent, reached through the escape hatch that refusal recommends. Never
+    // overwrite a value the app declared for itself.
+    carryDurableBackgroundOptOutToRuntime(config);
     configureCloudflareModuleWorkerCpuLimit(config);
     return;
   }
@@ -694,6 +698,17 @@ export function configureCloudflareModuleBackgroundQueue(
     ],
   };
   configureCloudflareModuleWorkerCpuLimit(config);
+}
+
+function carryDurableBackgroundOptOutToRuntime(config: {
+  vars?: unknown;
+  [key: string]: unknown;
+}): void {
+  const vars = (
+    typeof config.vars === "object" && config.vars !== null ? config.vars : {}
+  ) as Record<string, unknown>;
+  if (AGENT_CHAT_DURABLE_BACKGROUND_ENV in vars) return;
+  config.vars = { ...vars, [AGENT_CHAT_DURABLE_BACKGROUND_ENV]: "false" };
 }
 
 /**
@@ -3235,8 +3250,10 @@ export function findInstalledResvgPackages(
  * function; Cloudflare reads it to decide whether a build with no queue
  * declared is a deliberate no-background Worker or a misconfiguration.
  */
-export function isDurableBackgroundDeployEnabled(): boolean {
-  return !isDurableBackgroundFlagExplicitlyDisabled();
+export function isDurableBackgroundDeployEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return !isDurableBackgroundFlagExplicitlyDisabled(env);
 }
 
 /**

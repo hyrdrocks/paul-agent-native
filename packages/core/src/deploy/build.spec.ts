@@ -613,16 +613,62 @@ describe("Cloudflare module Worker entry", () => {
   });
 
   it("emits no queue for a Worker that asked for neither a queue nor durable background", () => {
-    vi.stubEnv("AGENT_CHAT_DURABLE_BACKGROUND", "false");
     const config: Record<string, unknown> = { name: "design" };
 
-    configureCloudflareModuleBackgroundQueue(config, {});
+    configureCloudflareModuleBackgroundQueue(config, {
+      AGENT_CHAT_DURABLE_BACKGROUND: "false",
+    });
 
     // No `queues` key at all: wrangler rejects a producer or a consumer whose
     // queue does not exist, so an app that never hands a run to the background
     // must not be made to provision one to deploy.
     expect(config.queues).toBeUndefined();
     expect(config.limits).toEqual({ cpu_ms: 300_000 });
+  });
+
+  it("carries the build's opt-out into the Worker's own environment", () => {
+    const config: Record<string, unknown> = { name: "design" };
+
+    configureCloudflareModuleBackgroundQueue(config, {
+      AGENT_CHAT_DURABLE_BACKGROUND: "off",
+    });
+
+    // The opt-out is a BUILD variable and the deployed Worker re-reads its own
+    // env, where this host's durable gate is default-ON. Unwritten, the Worker
+    // opens the gate, finds no queue, and runs the turn inline under the
+    // foreground clamp — the degrade the refusal exists to prevent, reached
+    // through the escape hatch the refusal recommends.
+    expect(config.vars).toEqual({ AGENT_CHAT_DURABLE_BACKGROUND: "false" });
+  });
+
+  it("never overwrites a durable background value the app declared itself", () => {
+    const config: Record<string, unknown> = {
+      name: "design",
+      vars: { AGENT_CHAT_DURABLE_BACKGROUND: "1", APP_URL: "https://x.test" },
+    };
+
+    configureCloudflareModuleBackgroundQueue(config, {
+      AGENT_CHAT_DURABLE_BACKGROUND: "false",
+    });
+
+    expect(config.vars).toEqual({
+      AGENT_CHAT_DURABLE_BACKGROUND: "1",
+      APP_URL: "https://x.test",
+    });
+  });
+
+  it("reads both halves of the decision from the build environment it was given", () => {
+    // The queue toggle and the durable flag are one decision. Read from two
+    // environments, a build is refused — or emitted — for a reason its operator
+    // never wrote.
+    vi.stubEnv("AGENT_CHAT_DURABLE_BACKGROUND", "true");
+    const config: Record<string, unknown> = { name: "design" };
+
+    configureCloudflareModuleBackgroundQueue(config, {
+      AGENT_CHAT_DURABLE_BACKGROUND: "false",
+    });
+
+    expect(config.queues).toBeUndefined();
   });
 
   it("refuses at build time when durable background is requested with no queue", () => {

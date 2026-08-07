@@ -520,8 +520,17 @@ export function isDurableBackgroundFlagEnabled(): boolean {
   );
 }
 
-export function isDurableBackgroundFlagExplicitlyDisabled(): boolean {
-  const raw = process.env.AGENT_CHAT_DURABLE_BACKGROUND;
+/**
+ * `env` exists for the deploy-time gates, which are handed the build
+ * environment rather than reading the ambient one. It must stay the SAME parse
+ * the runtime uses: a build deciding "this app opted out" against different
+ * words than the Worker reads is how an app is refused, or emitted, for a
+ * reason its operator never wrote.
+ */
+export function isDurableBackgroundFlagExplicitlyDisabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const raw = env.AGENT_CHAT_DURABLE_BACKGROUND;
   if (raw == null) return false;
   const normalized = raw.trim().toLowerCase();
   return (

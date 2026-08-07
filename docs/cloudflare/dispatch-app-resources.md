@@ -22,6 +22,10 @@ queues were created instead.
 | Queue | `paul-dispatch-app-agent-background` | `8a0a4d314873465280a620b40213c5a8` |
 | Dead-letter queue | `paul-dispatch-app-agent-background-dlq` | `2cf21f67fc6a42af9fbb378eca4758b4` |
 
+A queue id is an identifier, not a credential — the same reason
+`design-app-resources.md` commits a database id and an account id. Nothing here
+authorises anything.
+
 Both names are derived, not chosen. `agentBackgroundQueueName()` in
 `@agent-native/core` builds the first from the Worker's own name
 (`paul-dispatch-app`) and `configureCloudflareModuleBackgroundQueue()` names the
