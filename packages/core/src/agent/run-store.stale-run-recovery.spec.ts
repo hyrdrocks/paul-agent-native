@@ -59,8 +59,9 @@ function makeRawClient(withTransaction: boolean) {
   return client;
 }
 
-// Default: transactional client (the primary, expected-in-production path —
-// every real DbExec implementation provides `.transaction`, see db/client.ts).
+// Default: transactional client (SQLite/libsql/Postgres). D1 has no
+// interactive transactions and is exercised by the `makeRawClient(false)`
+// tests below — it is a production dialect, not a degraded one.
 let currentClient = makeRawClient(true);
 
 vi.mock("../db/client.js", () => ({
@@ -399,10 +400,10 @@ describe("FIX 3 — stale-run reaper server-owned recovery (reapIfStale)", () =>
     expect(rowsForTurn(turn)).toHaveLength(1);
   });
 
-  it("falls back to insert-then-update ordering when the DbExec has no transaction() primitive, and still recovers", async () => {
-    // Defensive fallback path — see reapSingleStaleRun's comment. Every real
-    // DbExec provides `.transaction`; this proves the degraded path still
-    // produces a correct, recoverable outcome.
+  it("still recovers a genuinely dead worker when the DbExec has no transaction() primitive (D1)", async () => {
+    // D1's DbExec is `{ execute, atomicBatch }` — no `transaction` (see
+    // db/client.ts, and `supportsInteractiveTransactions`). This is the
+    // production path on Cloudflare, not a defensive one.
     currentClient = makeRawClient(false);
     const { runId, thread, turn } = ids();
     await insertRun(runId, thread, turn, {
@@ -416,6 +417,51 @@ describe("FIX 3 — stale-run reaper server-owned recovery (reapIfStale)", () =>
     expect(reaped).toBe(true);
     expect(readRow(runId)?.status).toBe("errored");
     expect(rowsForTurn(turn)).toHaveLength(2);
+  });
+
+  it("creates NO successor for a live, heartbeating background run when the DbExec has no transaction() primitive", async () => {
+    // #32: on D1 (no interactive transactions) the reaper used to insert the
+    // recovery successor BEFORE — and independently of — the conditional reap
+    // UPDATE, so a run that was not stale at all still got one. Recovery is
+    // for a run the reaper actually terminalised; a live producer must be
+    // left alone on every dialect.
+    currentClient = makeRawClient(false);
+    const { runId, thread, turn } = ids();
+    await insertRun(runId, thread, turn, {
+      dispatchMode: "background",
+      dispatchPayload: JSON.stringify({ message: "probe", threadId: thread }),
+    });
+    await claimBackgroundRun(runId);
+
+    expect(await reapIfStale(runId)).toBe(false);
+    expect(readRow(runId)?.status).toBe("running");
+    expect(rowsForTurn(turn)).toHaveLength(1);
+  });
+
+  it("does not grow the turn's run ledger while a client polls a live background run (no transaction() primitive)", async () => {
+    // The measured #32 shape: one claimed run, then a successor per
+    // `/runs/active` poll — each poll calls `reapIfStale` on the thread's
+    // newest row, so every insert moved the target to the row it had just
+    // created and the chain only stopped at the 25-run budget.
+    currentClient = makeRawClient(false);
+    const { runId, thread, turn } = ids();
+    await insertRun(runId, thread, turn, {
+      dispatchMode: "background",
+      dispatchPayload: JSON.stringify({ message: "probe", threadId: thread }),
+    });
+    await claimBackgroundRun(runId);
+
+    for (let poll = 0; poll < 30; poll++) {
+      const newest = sqlite
+        .prepare(
+          `SELECT id FROM agent_runs WHERE turn_id = ? AND status = 'running' ORDER BY started_at DESC LIMIT 1`,
+        )
+        .get(turn) as { id: string } | undefined;
+      if (!newest) break;
+      await reapIfStale(newest.id);
+    }
+
+    expect(rowsForTurn(turn)).toHaveLength(1);
   });
 });
 
