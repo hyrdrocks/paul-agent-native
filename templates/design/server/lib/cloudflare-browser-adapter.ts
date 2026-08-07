@@ -241,8 +241,14 @@ function wrapPage(page: PuppeteerPageLike): PlaywrightPage {
 export async function connectHostedBrowser(
   binding: unknown,
 ): Promise<PlaywrightBrowser> {
-  const specifier = "@cloudflare/puppeteer";
-  const puppeteer = (await import(/* @vite-ignore */ specifier)) as unknown as {
+  // A literal specifier with NO `@vite-ignore`, unlike `importPlaywright`'s
+  // deliberately opaque one. That comment tells the bundler not to resolve the
+  // import, and a Worker has no module resolution at runtime — measured on a
+  // real build, the emitted chunk kept `import("@cloudflare/puppeteer")`
+  // verbatim and every hosted render would have died on it. Playwright is
+  // opaque because it is optional and genuinely absent here; this package must
+  // be IN the bundle.
+  const puppeteer = (await import("@cloudflare/puppeteer")) as unknown as {
     default?: CloudflarePuppeteerModule;
     launch?: CloudflarePuppeteerModule["launch"];
   };

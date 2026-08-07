@@ -41,16 +41,16 @@ in the same organisation (spec #5, Out of Scope).
 Every binding name is a framework constant, not app configuration. Renaming any
 of them yields a binding nothing reads.
 
-**Two of these are emitted as of R4; one is still not.** Measured on the first
-real deploy of `paul-design-app` (#12) the generated `wrangler.json` carried `DB`
-and `ASSETS` and nothing else. R3 (#14) added the queue emitter and R4 (#15)
-added `resolveCloudflareR2Binding` and the `r2_buckets` emitter, so a build with
-`CLOUDFLARE_R2_BUCKET_NAME` set now binds `UPLOADS`. Verified on the deploy:
-`env.UPLOADS (paul-design-app-uploads)  R2 Bucket`. The variable is no longer
-inert, and the local-versus-remote R2 divergence below is live — see the
-`justfile` note under Local run.
-
-There is still **no `BROWSER` emitter**; that is R5.
+**All of these are emitted as of R5.** Measured on the first real deploy of
+`paul-design-app` (#12) the generated `wrangler.json` carried `DB` and `ASSETS`
+and nothing else. R3 (#14) added the queue emitter, R4 (#15) added
+`resolveCloudflareR2Binding` and the `r2_buckets` emitter, and R5 (#16) added
+`resolveCloudflareBrowserBinding` and the `browser` emitter. A build with
+`CLOUDFLARE_R2_BUCKET_NAME` set binds `UPLOADS`; a build with
+`CLOUDFLARE_BROWSER_RENDERING=1` binds `BROWSER`. Verified on the deploy:
+`env.UPLOADS (paul-design-app-uploads)  R2 Bucket` and `env.BROWSER  Browser`.
+Neither variable is inert, and the local-versus-remote R2 divergence below is
+live — see the `justfile` note under Local run.
 
 The R2 emitter is conditional, like D1 and unlike the queue: with
 `CLOUDFLARE_R2_BUCKET_NAME` unset the generated config carries no `r2_buckets`
@@ -58,13 +58,24 @@ key at all, the deploy succeeds, and uploads fail closed at runtime with setup
 guidance. That absent-binding deploy is what #15's AC3 negative control ran
 against.
 
+The `browser` emitter is conditional the same way, and for a reason worth
+stating because Browser Rendering has no resource behind it. An entitlement is
+*more* of a deploy prerequisite than a resource, not less: `wrangler deploy`
+rejects a binding the account is not entitled to, so an unconditional emit would
+fail the deploy of every app that never renders anything — R3's queue mistake
+(#30) in a second place. With no id to derive from, `CLOUDFLARE_BROWSER_RENDERING`
+declares intent rather than pointing at something; what stops it being a switch
+nobody flips is that a Worker with no `BROWSER` bound refuses at the first render
+and names both the variable and the binding. That absent-binding deploy is what
+#16's AC3 negative control ran against.
+
 | Binding | Kind | Resource | Name is fixed by |
 | --- | --- | --- | --- |
 | `DB` | D1 | `paul-design-app` (id `256288ec-77ac-4e9d-ab1b-8d415e4ee997`, region APAC) | `CLOUDFLARE_D1_BINDING_NAME`, read by `getCloudflareD1Binding()` |
 | `UPLOADS` | R2 | `paul-design-app-uploads` | `CLOUDFLARE_R2_BINDING_NAME` in `file-upload/cloudflare-r2.ts` |
 | `AGENT_NATIVE_BACKGROUND_QUEUE` | Queue producer | `paul-design-app-agent-background` (id `2a6089b9f4384295826f33e59369435b`) | `AGENT_BACKGROUND_QUEUE_BINDING` in `agent/background-queue.ts` |
 | — | Queue consumer | same queue, DLQ `paul-design-app-agent-background-dlq` (id `8bd3355ef05f4efda0e8e35010d7a33d`) | emitted by `configureCloudflareModuleBackgroundQueue()` |
-| `BROWSER` | Browser Rendering | account entitlement, no resource to create | `CLOUDFLARE_BROWSER_BINDING_NAME`, and the Design template's `server/lib/playwright-runtime.ts` |
+| `BROWSER` | Browser Rendering | account entitlement, no resource to create | `CLOUDFLARE_BROWSER_BINDING_NAME` in `browser-rendering/cloudflare-browser.ts`, read through the seam by the Design template's `server/lib/playwright-runtime.ts` |
 
 The DLQ exists because the preset names it unconditionally
 (`` `${queueName}-dlq` ``). A missing DLQ is a deploy-time failure, not a
@@ -110,6 +121,7 @@ NITRO_PRESET=cloudflare_module
 CLOUDFLARE_D1_DATABASE_NAME=paul-design-app
 CLOUDFLARE_D1_DATABASE_ID=256288ec-77ac-4e9d-ab1b-8d415e4ee997
 CLOUDFLARE_R2_BUCKET_NAME=paul-design-app-uploads
+CLOUDFLARE_BROWSER_RENDERING=1
 ```
 
 `resolveCloudflareD1Binding()` throws when exactly one of the two D1 variables
@@ -128,8 +140,14 @@ variable, not silently.
 is now on `APP_PROVIDED_DEPLOY_CREDENTIAL_KEYS` so `resolveSecret` reads it on an
 invocation with no request user. It is committed in `wrangler.jsonc` `vars`.
 
-The queue (producer, consumer, DLQ, `cpu_ms: 300000`) and the `BROWSER` binding
-need no variables — the preset writes them from the Worker name.
+`resolveCloudflareBrowserBinding()` reads `CLOUDFLARE_BROWSER_RENDERING` and
+accepts `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`; anything else throws
+rather than being read as either answer, because truthiness would make
+`=maybe` mean on and a strict `=== "1"` would make it mean off, and both are a
+deploy that does not match what its operator wrote down.
+
+The queue (producer, consumer, DLQ, `cpu_ms: 300000`) needs no variables — the
+preset writes it from the Worker name.
 
 See `design-app.build.env.example` and `design-app.wrangler.reference.jsonc` in
 this directory.
@@ -213,7 +231,10 @@ for this app:
   went to a miniflare directory. A stored-but-dangling URL is precisely the
   "looks like success" failure this codebase forbids. Remote mode makes the
   persisted URL resolve.
-- The queue and `BROWSER` need nothing: both work in local mode, verified below.
+- The queue works in local mode, verified below. `BROWSER` needs
+  `CLOUDFLARE_BROWSER_RENDERING=1` on the local build too, or the local run has
+  no browser while the deploy has one — the same divergence the `justfile`
+  closes for R2.
 
 ## Verification
 
