@@ -1969,6 +1969,10 @@ function subscribeFromSQL(
 }
 
 /** Get the active run for a thread (if any) — checks memory then SQL */
+/**
+ * The in-memory entry for a thread, unclassified — see `getRun` on why that
+ * matters. `getActiveRunForThreadAsync` is the reader that applies the policy.
+ */
 export function getActiveRunForThread(threadId: string): ActiveRun | null {
   const runId = threadToRun.get(threadId);
   if (runId) {
@@ -2322,20 +2326,39 @@ async function fetchNewerNonTerminalRunForSameTurn(
   }
 }
 
-/** Get a run by ID */
+/**
+ * Get a run by ID.
+ *
+ * A raw registry lookup: the entry may be one whose producing request context
+ * has gone away. Callers reading it for identity (which thread, which turn) are
+ * fine; callers reading it for LIVENESS must classify it with
+ * `resolveRunProducerState` first.
+ */
 export function getRun(runId: string): ActiveRun | null {
   return activeRuns.get(runId) ?? null;
 }
 
 function abortRunInMemory(runId: string, reason: string): boolean {
   const run = activeRuns.get(runId);
-  if (run) {
-    abortInMemoryRun(run, reason);
-  }
-  return !!run;
+  if (!run) return false;
+  // Clean the entry up either way — it is this isolate's to drop. But a
+  // producer-lost entry had nothing executing behind it, so reporting that we
+  // stopped a run here would be the same presence-means-liveness answer the
+  // readers above were giving. What actually stops such a run is the durable
+  // marker the callers below write.
+  const wasProducing = resolveRunProducerState(run) === "in-flight";
+  abortInMemoryRun(run, reason);
+  return wasProducing;
 }
 
-/** Explicitly abort a run (e.g. Stop button). */
+/**
+ * Explicitly abort a run (e.g. Stop button).
+ *
+ * The boolean says a LIVE run was stopped in this isolate, not that an entry
+ * was found — a producer-lost entry answers false. Either way the durable
+ * marker below is what a run in another isolate, or one nothing is executing,
+ * is actually stopped by.
+ */
 export function abortRun(runId: string, reason: string = "user"): boolean {
   const abortedInMemory = abortRunInMemory(runId, reason);
   // Also mark as aborted in SQL (for cross-isolate abort on Workers)

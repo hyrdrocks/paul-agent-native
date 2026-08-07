@@ -37,13 +37,19 @@ vi.mock("./run-store.js", () => ({
 }));
 
 import {
+  abortRun,
   getActiveRunForThreadAsync,
   RUN_PRODUCER_SILENT_MS,
   resolveRunProducerState,
   startRun,
   subscribeToRun,
 } from "./run-manager.js";
-import { getRunById, getRunByThread, getRunEventsSince } from "./run-store.js";
+import {
+  getRunById,
+  getRunByThread,
+  getRunEventsSince,
+  markRunAborted,
+} from "./run-store.js";
 
 /**
  * Model of the failure this file exists for: on Workers the isolate-global
@@ -199,6 +205,24 @@ describe("a run whose originating request has gone away", () => {
     // it — the false success this AC excludes.
     expect(active!.heartbeatAt).toBe(durableHeartbeatAt);
     expect(active!.heartbeatAt).not.toBe(Date.now());
+  });
+
+  it("does not claim to have stopped a run that nothing was executing", async () => {
+    const runId = startNeverEndingRun("thread-lost-abort");
+    loseTheProducingContext();
+
+    // The entry is still dropped — it is this isolate's to clean up — but the
+    // answer is about what was stopped, and nothing here was running. What
+    // stops such a run is the durable marker, which is still written.
+    expect(abortRun(runId, "user")).toBe(false);
+    expect(markRunAborted).toHaveBeenCalledWith(runId, "user");
+  });
+
+  it("reports a genuine stop for a run that was still ticking", async () => {
+    const runId = startNeverEndingRun("thread-live-abort");
+    await vi.advanceTimersByTimeAsync(RUN_PRODUCER_SILENT_MS * 2);
+
+    expect(abortRun(runId, "user")).toBe(true);
   });
 
   it("keeps the fresh in-memory heartbeat while the producer is still ticking", async () => {

@@ -632,6 +632,13 @@ jobs:
       - name: Run security guards
         run: pnpm guards
 
+      # A guard that has never been shown to fail has not been shown to work,
+      # and `pnpm guards` above only proves it passes on a clean branch. These
+      # tests run it against a throwaway repo where a host literal really was
+      # added.
+      - name: Run host-literal guard tests
+        run: pnpm test:guard-no-host-literals
+
   guard-no-drizzle-push:
     name: Guard — no drizzle-kit push in build paths
     runs-on: ubuntu-latest

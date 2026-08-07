@@ -22,7 +22,12 @@ reports liveness that is not there and folding it into `terminal` reports an
 outcome that never happened. A `producer-lost` entry is not answered from
 memory: subscription falls through to the durable path and `/runs/active`
 reports SQL's heartbeat. Nothing local is synthesised, because knowing the
-producer is gone is not knowing how the run ended.
+producer is gone is not knowing how the run ended. `abortRun` likewise reports
+`false` for such an entry — it still drops it, but nothing there was executing,
+and the durable marker is what stops the run.
+
+New export subpath `@agent-native/core/agent/run-producer-state`, carrying the
+classifier and its two constants.
 
 Cloudflare-Workers detection in the database client now calls the shared
 `isCloudflareRuntime()` rather than a second, narrower copy that omitted the

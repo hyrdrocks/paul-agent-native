@@ -38,6 +38,13 @@
  * separate, schedulable cleanup, and a guard that fails on the backlog is a
  * guard someone turns off.
  *
+ * WHAT IT WILL MISS, stated rather than implied: the match is per line, like
+ * every other diff-scoped guard here, so a comparison the formatter wrapped
+ * across two lines, one against a named constant, or a `HOSTS[name]` dispatch
+ * table all get through. That is a floor, not a ceiling — the direct forms are
+ * how this is actually written, and a parser here would cost more than it
+ * catches.
+ *
  * WIDENING THE BOUNDARY is one reviewed edit to HOST_AWARE_MODULES below.
  * That list is the design artifact — it is the answer to "which modules in
  * core are allowed to know what host they are on" — so it is deliberately
@@ -181,24 +188,33 @@ export function checkLine(lineText) {
   return null;
 }
 
+/**
+ * Violations among `lineNumbers` (1-based) of `lines`. The one place the pragma
+ * lookbehind and the per-line check live, so the whole-file and diff-scoped
+ * callers cannot drift apart about what counts.
+ */
+function violationsForLines(lines, lineNumbers) {
+  const violations = [];
+  for (const lineNumber of [...lineNumbers].sort((a, b) => a - b)) {
+    const lineText = lines[lineNumber - 1];
+    if (lineText === undefined) continue;
+    const prevLine = lineNumber >= 2 ? lines[lineNumber - 2] : "";
+    if (PRAGMA.test(lineText) || PRAGMA.test(prevLine)) continue;
+    const violation = checkLine(lineText);
+    if (!violation) continue;
+    violations.push({ lineNumber, text: lineText.trim(), ...violation });
+  }
+  return violations;
+}
+
 /** Every violating line in `source`, for a file already known to be in scope. */
 export function findHostLiteralViolations(relPath, source) {
   if (!inScope(relPath)) return [];
   const lines = source.split("\n");
-  const violations = [];
-  for (let i = 0; i < lines.length; i++) {
-    const prevLine = i > 0 ? lines[i - 1] : "";
-    if (PRAGMA.test(lines[i]) || PRAGMA.test(prevLine)) continue;
-    const violation = checkLine(lines[i]);
-    if (violation) {
-      violations.push({
-        lineNumber: i + 1,
-        text: lines[i].trim(),
-        ...violation,
-      });
-    }
-  }
-  return violations;
+  return violationsForLines(
+    lines,
+    lines.map((_, i) => i + 1),
+  );
 }
 
 function main() {
@@ -225,22 +241,8 @@ function main() {
     } catch {
       continue; // renamed or deleted since diffing
     }
-    const lines = src.split("\n");
-
-    for (const lineNumber of [...lineNumbers].sort((a, b) => a - b)) {
-      const lineText = lines[lineNumber - 1];
-      if (lineText === undefined) continue;
-      const prevLine = lineNumber >= 2 ? lines[lineNumber - 2] : "";
-      if (PRAGMA.test(lineText) || PRAGMA.test(prevLine)) continue;
-
-      const violation = checkLine(lineText);
-      if (!violation) continue;
-      violations.push({
-        relPath,
-        lineNumber,
-        text: lineText.trim(),
-        ...violation,
-      });
+    for (const violation of violationsForLines(src.split("\n"), lineNumbers)) {
+      violations.push({ relPath, ...violation });
     }
   }
 
