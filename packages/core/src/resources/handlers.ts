@@ -670,6 +670,19 @@ export async function handleDeleteResource(event: any) {
   return { ok: true };
 }
 
+/**
+ * Text value of a multipart field.
+ *
+ * `.toString()` is wrong here: on a Worker the parser yields a plain
+ * `Uint8Array`, whose `toString()` is the comma-joined byte values — so a path
+ * was stored as "47,101,50,..." and every read of it missed. It only looked
+ * right on Node, where the same value happens to be a Buffer.
+ */
+function decodeTextPart(part: { data?: Uint8Array } | undefined): string {
+  if (!part?.data) return "";
+  return new TextDecoder().decode(part.data);
+}
+
 /** POST /_agent-native/resources/upload — upload a file as a resource */
 export async function handleUploadResource(event: any) {
   const parts = await readMultipartFormData(event);
@@ -697,8 +710,8 @@ export async function handleUploadResource(event: any) {
   }
 
   const fileName = filePart.filename || "upload";
-  const path = pathPart?.data?.toString() || `/${fileName}`;
-  const shared = sharedPart?.data?.toString() === "true";
+  const path = decodeTextPart(pathPart) || `/${fileName}`;
+  const shared = decodeTextPart(sharedPart) === "true";
   const mimeType = filePart.type || "application/octet-stream";
 
   // Reject executable / script MIME types.

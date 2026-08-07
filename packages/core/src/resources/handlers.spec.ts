@@ -902,6 +902,73 @@ describe("resource handlers", () => {
       });
     });
 
+    it("reads the path field as text, not as a Uint8Array's byte list", async () => {
+      // On a Worker the multipart parser yields a plain Uint8Array, whose
+      // toString() is "47,101,..." — so the path was stored as a comma-joined
+      // byte list and every later read of it missed. Node's Buffer hid it.
+      mockUploadFile.mockResolvedValue({
+        url: "https://cdn.example.test/photo.png",
+        provider: "test",
+      });
+      mockResourcePut.mockResolvedValue({ id: "img" });
+
+      await handleUploadResource({
+        _multipart: [
+          {
+            name: "file",
+            filename: "photo.png",
+            type: "image/png",
+            data: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+          },
+          {
+            name: "path",
+            data: new Uint8Array(
+              new TextEncoder().encode("/uploads/photo.png"),
+            ),
+          },
+        ],
+      });
+
+      expect(mockResourcePut).toHaveBeenCalledWith(
+        "test@test.com",
+        "/uploads/photo.png",
+        "https://cdn.example.test/photo.png",
+        "image/png",
+      );
+    });
+
+    it("reads the shared flag as text, not as a Uint8Array's byte list", async () => {
+      mockUploadFile.mockResolvedValue({
+        url: "https://cdn.example.test/photo.png",
+        provider: "test",
+      });
+      mockResourcePut.mockResolvedValue({ id: "img" });
+
+      await handleUploadResource({
+        _multipart: [
+          {
+            name: "file",
+            filename: "photo.png",
+            type: "image/png",
+            data: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+          },
+          {
+            name: "shared",
+            data: new Uint8Array(new TextEncoder().encode("true")),
+          },
+        ],
+      });
+
+      // "true" as a byte list is "116,114,117,101", which never equals "true",
+      // so a shared upload silently became a personal one.
+      expect(mockResourcePut).toHaveBeenCalledWith(
+        expect.not.stringMatching(/^test@test\.com$/),
+        "/photo.png",
+        "https://cdn.example.test/photo.png",
+        "image/png",
+      );
+    });
+
     it("rejects unauthenticated shared uploads", async () => {
       vi.mocked(getSession).mockResolvedValue(null as any);
 
