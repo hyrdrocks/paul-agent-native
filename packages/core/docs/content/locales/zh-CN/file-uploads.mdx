@@ -96,9 +96,9 @@ Dispatches to the first configured provider in resolution order. Check the activ
 
 ## 默认：SQL 后备 {#sql-fallback}
 
-当没有配置提供者时，文件通过资源系统以base64数据存储在SQL数据库中。这对于本地开发来说是开箱即用的，但不建议用于生产——大文件会使数据库膨胀，而且没有 CDN。
+当没有配置提供者时，是否允许把负载存到别处由**宿主**决定，而不是由调用方代码决定。针对本地数据库的本地运行会通过资源系统把文件以 base64 存入 SQL，并记录一次性警告——这是开发便利，不是生产模式。
 
-使用后备时会记录一次性警告。
+在其他任何环境下，上传都会失败关闭。在 Cloudflare Workers 上、针对持久化的 `DATABASE_URL`，或在 `NODE_ENV=production` 下，`uploadFile()` 会抛出 `FileUploadStorageNotConfiguredError`，其 `.setup` 字段指明需要配置什么。它绝不会返回一个可能被调用方误认为“文件已存储”的值。
 
 ## Builder.io 托管 {#builder-hosting}
 
@@ -174,6 +174,7 @@ const result = await uploadFile({
 if (result) {
   // Provider handled it — result.url is the public URL
 } else {
-  // No provider configured — handle SQL 兜底 yourself, or skip
+  // 没有配置提供者，且该宿主允许本地兜底。
+  // 在其他环境下，这里会改为抛出 FileUploadStorageNotConfiguredError。
 }
 ```

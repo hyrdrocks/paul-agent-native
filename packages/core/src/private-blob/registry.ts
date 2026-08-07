@@ -202,6 +202,15 @@ export function setPrivateBlobPublicUploadFallbackEnabled(
   publicUploadFallbackRef.enabled = enabled;
 }
 
+/**
+ * The public-upload path is NOT a second fallback-storage policy. It stores the
+ * payload in object storage — encrypted, with the key held apart from the URL —
+ * which is the intended kind of store, not somewhere else. It reaches that
+ * store through `uploadFile`, so the host's refusal already governs it: on a
+ * host that forbids the SQL fallback with no provider configured, this throws
+ * with setup guidance rather than returning null. The explicit disable below is
+ * a declared opt-out, which is a different thing from a guess.
+ */
 export async function putPrivateBlob(
   input: PrivateBlobPutInput,
 ): Promise<PrivateBlobHandle | null> {

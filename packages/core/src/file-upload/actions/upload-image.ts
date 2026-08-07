@@ -1,8 +1,16 @@
 import { z } from "zod";
 
 import { defineAction } from "../../action.js";
+// Registers this host's object storage provider and fallback-storage policy.
+// This action imports the registry directly rather than the package barrel, so
+// it must pull the adapters in itself or a Worker resolves neither.
+import "../../hosts/index.js";
 import { ssrfSafeFetch } from "../../extensions/url-safety.js";
 import { getRequestUserEmail } from "../../server/request-context.js";
+import {
+  FileUploadProviderUnreadableError,
+  FileUploadStorageNotConfiguredError,
+} from "../errors.js";
 import { uploadFile } from "../registry.js";
 
 const MAX_REMOTE_FETCH_BYTES = 25 * 1024 * 1024;
@@ -189,12 +197,26 @@ export default defineAction({
     const filename = (args.filename || defaultFilename(mimeType)).trim();
     const ownerEmail = getRequestUserEmail() ?? undefined;
 
-    const result = await uploadFile({
-      data: bytes,
-      filename,
-      mimeType,
-      ownerEmail,
-    });
+    let result: Awaited<ReturnType<typeof uploadFile>>;
+    try {
+      result = await uploadFile({
+        data: bytes,
+        filename,
+        mimeType,
+        ownerEmail,
+      });
+    } catch (err) {
+      // Report the store's own setup step rather than the generic connect-
+      // Builder line: on a host with no fallback the missing piece is a
+      // bucket, and naming Builder there sends the agent somewhere useless.
+      if (err instanceof FileUploadStorageNotConfiguredError) {
+        return { error: err.message, configured: false, setup: err.setup };
+      }
+      if (err instanceof FileUploadProviderUnreadableError) {
+        return { error: err.message, storageStatusUnknown: true };
+      }
+      throw err;
+    }
 
     if (!result) {
       return {

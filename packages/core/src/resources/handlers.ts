@@ -7,7 +7,11 @@ import {
 } from "h3";
 import { createError } from "h3";
 
-import { uploadFile } from "../file-upload/index.js";
+import {
+  uploadFile,
+  FileUploadProviderUnreadableError,
+  FileUploadStorageNotConfiguredError,
+} from "../file-upload/index.js";
 import { getOrgContext } from "../org/context.js";
 import { getSession } from "../server/auth.js";
 import {
@@ -729,9 +733,28 @@ export async function handleUploadResource(event: any) {
         mimeType,
         ownerEmail: owner,
       });
-    const uploaded = credentialEmail
-      ? await runWithRequestContext({ userEmail: credentialEmail }, doUpload)
-      : await doUpload();
+    let uploaded: Awaited<ReturnType<typeof uploadFile>>;
+    try {
+      uploaded = credentialEmail
+        ? await runWithRequestContext({ userEmail: credentialEmail }, doUpload)
+        : await doUpload();
+    } catch (err) {
+      // The row must never hold the body, so a refused upload is a refused
+      // resource — not a resource whose `content` is the file.
+      if (err instanceof FileUploadStorageNotConfiguredError) {
+        setResponseStatus(event, 503);
+        return {
+          error: err.message,
+          setup: err.setup,
+          storageSetupRequired: true,
+        };
+      }
+      if (err instanceof FileUploadProviderUnreadableError) {
+        setResponseStatus(event, 503);
+        return { error: err.message, storageStatusUnknown: true };
+      }
+      throw err;
+    }
     if (uploaded) {
       const resource = await resourcePut(owner, path, uploaded.url, mimeType);
       setResponseStatus(event, 201);

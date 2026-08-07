@@ -123,6 +123,10 @@ const APP_PROVIDED_DEPLOY_CREDENTIAL_KEYS = new Set([
   "COHERE_API_KEY",
   "RESEND_API_KEY",
   "SENDGRID_API_KEY",
+  // Configures the deployment's own object storage — a public origin, not a
+  // secret and not identity-bearing. It must resolve on a queue-consumer
+  // invocation with no request user, exactly like the provider keys above.
+  "CLOUDFLARE_R2_PUBLIC_BASE_URL",
 ]);
 
 function isAppProvidedDeployCredentialKey(key: string | undefined): boolean {

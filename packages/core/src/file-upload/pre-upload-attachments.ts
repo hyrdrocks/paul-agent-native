@@ -1,4 +1,8 @@
 import type { AgentChatAttachment } from "../agent/types.js";
+import {
+  FileUploadProviderUnreadableError,
+  FileUploadStorageNotConfiguredError,
+} from "./errors.js";
 import { getActiveFileUploadProvider, uploadFile } from "./registry.js";
 
 export interface PreUploadedImageAttachment {
@@ -241,6 +245,18 @@ export async function preUploadAttachments(opts: {
         uploadedFiles.push(entry);
       }
     } catch (err) {
+      // Keeping the base64 leaves the whole payload on the attachment, and the
+      // message this attachment belongs to is persisted — so this recovery is
+      // a file body written into SQL. It is only acceptable for a transient
+      // failure of a store that exists. Where the host has refused the
+      // fallback, or where we could not even find out whether a store is
+      // configured, the payload does not get quietly kept.
+      if (
+        err instanceof FileUploadStorageNotConfiguredError ||
+        err instanceof FileUploadProviderUnreadableError
+      ) {
+        throw err;
+      }
       // Real upload failure (network, API). Keep the base64 so the model
       // can still see the image/file, but don't crash the turn.
       console.warn(
