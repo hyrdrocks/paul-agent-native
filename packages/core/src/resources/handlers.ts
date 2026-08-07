@@ -423,6 +423,20 @@ async function enrichTreeNodes(nodes: TreeNode[]): Promise<void> {
   }
 }
 
+/**
+ * True when a resource's stored content is a handle to an object store rather
+ * than the object itself.
+ *
+ * Binary resources hold one or the other, and the two need opposite handling:
+ * a body must be kept out of a JSON read and base64-decoded on a raw read, a
+ * handle must be returned by the JSON read and redirected to. Deciding by MIME
+ * type alone gets a handle wrong both ways — blanked where it is the whole
+ * answer, and base64-decoded into garbage where the bytes were wanted.
+ */
+function isStorageHandle(content: unknown): content is string {
+  return typeof content === "string" && /^https?:\/\//.test(content);
+}
+
 /** GET /_agent-native/resources/:id — get single resource with content.
  *  `?raw` returns the bytes inline; `?download=1` returns the same bytes as a
  *  safe attachment. */
@@ -449,6 +463,16 @@ export async function handleGetResource(event: any) {
   const query = getQuery(event);
   const wantsRaw = query.raw !== undefined;
   const wantsDownload = query.download === "1";
+
+  if ((wantsRaw || wantsDownload) && isStorageHandle(resource.content)) {
+    // The bytes are in object storage, not in this row. Redirecting is the
+    // only honest answer: base64-decoding a URL would return bytes that are
+    // not the file, under the file's own content type.
+    setResponseHeader(event, "Cache-Control", "private, no-store");
+    setResponseStatus(event, 302);
+    setResponseHeader(event, "Location", resource.content);
+    return null;
+  }
 
   if ((wantsRaw || wantsDownload) && typeof resource.content === "string") {
     const isText =
@@ -481,7 +505,10 @@ export async function handleGetResource(event: any) {
     resource.mimeType.startsWith("video/") ||
     resource.mimeType === "application/octet-stream";
 
-  if (isBinary) {
+  // A handle is not a body: it is short, it is what the caller needs to fetch
+  // the bytes, and blanking it hides the very thing that proves the payload is
+  // not in SQL.
+  if (isBinary && !isStorageHandle(resource.content)) {
     const { content: _content, ...meta } = resource;
     return { ...meta, content: "" };
   }

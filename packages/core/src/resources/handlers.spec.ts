@@ -810,6 +810,63 @@ describe("resource handlers", () => {
     });
   });
 
+  describe("binary resources that hold a storage handle", () => {
+    it("returns the handle on a JSON read instead of blanking it", async () => {
+      // Blanking is right for an inline base64 body — it can be megabytes. A
+      // handle is the opposite: short, and the only thing that shows the
+      // payload is NOT in this row.
+      mockResourceGet.mockResolvedValue({
+        id: "img",
+        path: "/photo.png",
+        owner: "test@test.com",
+        mimeType: "image/png",
+        content: "https://objects.example.test/uploads/abc.png",
+      });
+
+      const result = await handleGetResource({ _params: { id: "img" } });
+
+      expect(result).toMatchObject({
+        content: "https://objects.example.test/uploads/abc.png",
+      });
+    });
+
+    it("still blanks an inline body on a JSON read", async () => {
+      mockResourceGet.mockResolvedValue({
+        id: "img",
+        path: "/photo.png",
+        owner: "test@test.com",
+        mimeType: "image/png",
+        content: "iVBORw0KGgoAAAANSUhEUg",
+      });
+
+      expect(await handleGetResource({ _params: { id: "img" } })).toMatchObject(
+        { content: "" },
+      );
+    });
+
+    it("redirects a raw read to the object rather than base64-decoding a url", async () => {
+      // Decoding a URL as base64 returns bytes that are not the file, served
+      // under the file's own content type — a corrupt image that looks served.
+      mockResourceGet.mockResolvedValue({
+        id: "img",
+        path: "/photo.png",
+        owner: "test@test.com",
+        mimeType: "image/png",
+        content: "https://objects.example.test/uploads/abc.png",
+      });
+
+      const { setResponseHeader } = await import("h3");
+      await handleGetResource({ _params: { id: "img" }, _query: { raw: "" } });
+
+      expect(lastStatus).toBe(302);
+      expect(setResponseHeader).toHaveBeenCalledWith(
+        expect.anything(),
+        "Location",
+        "https://objects.example.test/uploads/abc.png",
+      );
+    });
+  });
+
   describe("handleUploadResource", () => {
     it("stores text uploads in SQL", async () => {
       const resource = {
