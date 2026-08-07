@@ -68,10 +68,19 @@ exist, and both are narrow on purpose.
 
 **Guards** (`pnpm guards`, and CI on every PR — these apply to Codex, Claude
 Code, and a human equally): `no-secret-literals`, `additive-migrations`,
-`no-silent-coercion`, `no-raw-colors`, alongside the existing 37. The last two
-check only lines this branch added, so the pre-existing backlog stays a separate
-cleanup. Each has a documented opt-out pragma, and every opt-out is a decision a
-reviewer should see.
+`no-silent-coercion`, `no-raw-colors`, `no-host-literals`, alongside the
+existing 37. The last three check only lines this branch added, so the
+pre-existing backlog stays a separate cleanup. Each has a documented opt-out
+pragma, and every opt-out is a decision a reviewer should see.
+
+`no-host-literals` keeps `packages/core/src` from deciding anything by testing
+which host it is on: everything a host answers goes through the registries
+under `src/hosts/`. It flags a host name only in a deciding position
+(`=== "cloudflare"`, `case "netlify":`, `.startsWith("cloudflare")`) — a host
+name used as a provider id, preset name or label is a name, not a decision.
+Widening the boundary is one reviewed edit to `HOST_AWARE_MODULES` in
+`scripts/guard-no-host-literals.mjs`; that list, not a scattering of local
+pragmas, is the record of which modules are allowed to know.
 
 **One hook** (`scripts/hooks/file-lease.mjs`): denies a write when another live
 session holds the file, or when it changed on disk under you. It exists because

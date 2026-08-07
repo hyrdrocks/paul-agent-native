@@ -43,6 +43,7 @@ const guards = [
   "guard:additive-migrations",
   "guard:no-silent-coercion",
   "guard:no-raw-colors",
+  "guard:no-host-literals",
 ] as const;
 
 type GuardName = (typeof guards)[number];

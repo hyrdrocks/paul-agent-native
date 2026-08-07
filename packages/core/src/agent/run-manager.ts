@@ -11,6 +11,10 @@ import {
 } from "./engine/error-detail.js";
 import { EngineError } from "./engine/types.js";
 import {
+  RUN_HEARTBEAT_INTERVAL_MS,
+  resolveRunProducerState,
+} from "./run-producer-state.js";
+import {
   insertRun,
   insertRunEvent,
   updateRunStatusIfRunning,
@@ -41,6 +45,14 @@ import {
 import { isContinuationTerminalReason } from "./types.js";
 import type { AgentChatEvent, RunEvent, RunStatus } from "./types.js";
 
+export {
+  RUN_HEARTBEAT_INTERVAL_MS,
+  RUN_PRODUCER_SILENT_MS,
+  resolveRunProducerState,
+  type RunProducerSnapshot,
+  type RunProducerState,
+} from "./run-producer-state.js";
+
 export interface ActiveRun {
   runId: string;
   threadId: string;
@@ -62,6 +74,20 @@ export interface ActiveRun {
     { type: "auto_continue" }
   >;
   startedAt: number;
+  /**
+   * When the run's own periodic timer last fired, stamped from inside that
+   * timer's callback.
+   *
+   * This map is isolate-global but a run's EXECUTION belongs to the request
+   * context that started it: on Workers, when that request goes away workerd
+   * cancels its continuations and timers, and the entry is left here reading
+   * `status: "running"` forever. A number stamped by the timer is the only
+   * thing in the entry that stops being true when that happens — and unlike
+   * the run's promises it can be read from another request context, which is
+   * the same reason `server/cross-request-init.ts` polls a flag instead of
+   * awaiting a foreign promise.
+   */
+  lastProducerTickAt: number;
 }
 
 export interface StartedRun extends ActiveRun {
@@ -722,6 +748,7 @@ export function startRun(
     subscribers: new Set(),
     abort,
     startedAt: Date.now(),
+    lastProducerTickAt: Date.now(),
     finalized,
   };
 
@@ -1046,6 +1073,11 @@ export function startRun(
   // still run every tick (they don't touch the DB on the hot path).
   let heartbeatInFlight = false;
   const heartbeatTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    // Stamped before the DB write, not after it: this records that the
+    // producing context is still executing, which stays true through a
+    // database outage. Deriving it from a successful write instead would make
+    // a slow pooler look identical to a cancelled request.
+    run.lastProducerTickAt = Date.now();
     if (!heartbeatInFlight) {
       heartbeatInFlight = true;
       updateRunHeartbeat(runId)
@@ -1075,7 +1107,7 @@ export function startRun(
     }
     checkSqlAbort();
     checkNoProgressBackstop();
-  }, 1500);
+  }, RUN_HEARTBEAT_INTERVAL_MS);
   const softTimeoutMs = resolveRunSoftTimeoutMs(options?.softTimeoutMs, {
     useHostedDefault: options?.useHostedSoftTimeoutDefault === true,
     backgroundFunction: options?.backgroundFunction === true,
@@ -1560,7 +1592,14 @@ export function subscribeToRun(
   fromSeq: number,
 ): ReadableStream<Uint8Array> | null {
   const run = activeRuns.get(runId);
-  if (run) {
+  // A producer-lost entry has a buffer that will never grow and a terminal
+  // event that will never be sent, so an in-memory subscriber waits forever on
+  // a run nothing is executing. Route it to the durable path instead, which
+  // observes whatever actually becomes of the row (the stale reaper's terminal
+  // write, or a successor claiming the turn). Deliberately NOT a synthesized
+  // terminal event here: this isolate knows the producer is gone, which is not
+  // the same as knowing how the run ended.
+  if (run && resolveRunProducerState(run) !== "producer-lost") {
     return subscribeInMemory(run, fromSeq);
   }
   // Not in local memory — try SQL (cross-isolate path)
@@ -1930,6 +1969,10 @@ function subscribeFromSQL(
 }
 
 /** Get the active run for a thread (if any) — checks memory then SQL */
+/**
+ * The in-memory entry for a thread, unclassified — see `getRun` on why that
+ * matters. `getActiveRunForThreadAsync` is the reader that applies the policy.
+ */
 export function getActiveRunForThread(threadId: string): ActiveRun | null {
   const runId = threadToRun.get(threadId);
   if (runId) {
@@ -2024,7 +2067,18 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
   // that still have events in memory. This allows sub-agent tabs to replay
   // the full conversation from completed runs via SSE.
   const memRun = getActiveRunForThread(threadId);
-  if (memRun && (memRun.status === "running" || memRun.events.length > 0)) {
+  // Every answer this branch gives rests on "in-memory means this isolate is
+  // the producer" — most visibly `heartbeatAt: Date.now()`, which is not read
+  // from anywhere, it is asserted. For a producer-lost entry that assertion
+  // manufactures a heartbeat fresher than the durable one and disarms both the
+  // client's stuck-detector and the reaper that was about to terminalize the
+  // row. Fall through to SQL, which is still being written for this run.
+  const memProducerState = memRun ? resolveRunProducerState(memRun) : null;
+  if (
+    memRun &&
+    memProducerState !== "producer-lost" &&
+    (memRun.status === "running" || memRun.events.length > 0)
+  ) {
     const sqlSnapshot = await fetchRunThreadSnapshot(memRun.runId, threadId);
 
     // FIX 1 (durable-background incident): a terminal in-memory run (chunk
@@ -2272,20 +2326,39 @@ async function fetchNewerNonTerminalRunForSameTurn(
   }
 }
 
-/** Get a run by ID */
+/**
+ * Get a run by ID.
+ *
+ * A raw registry lookup: the entry may be one whose producing request context
+ * has gone away. Callers reading it for identity (which thread, which turn) are
+ * fine; callers reading it for LIVENESS must classify it with
+ * `resolveRunProducerState` first.
+ */
 export function getRun(runId: string): ActiveRun | null {
   return activeRuns.get(runId) ?? null;
 }
 
 function abortRunInMemory(runId: string, reason: string): boolean {
   const run = activeRuns.get(runId);
-  if (run) {
-    abortInMemoryRun(run, reason);
-  }
-  return !!run;
+  if (!run) return false;
+  // Clean the entry up either way — it is this isolate's to drop. But a
+  // producer-lost entry had nothing executing behind it, so reporting that we
+  // stopped a run here would be the same presence-means-liveness answer the
+  // readers above were giving. What actually stops such a run is the durable
+  // marker the callers below write.
+  const wasProducing = resolveRunProducerState(run) === "in-flight";
+  abortInMemoryRun(run, reason);
+  return wasProducing;
 }
 
-/** Explicitly abort a run (e.g. Stop button). */
+/**
+ * Explicitly abort a run (e.g. Stop button).
+ *
+ * The boolean says a LIVE run was stopped in this isolate, not that an entry
+ * was found — a producer-lost entry answers false. Either way the durable
+ * marker below is what a run in another isolate, or one nothing is executing,
+ * is actually stopped by.
+ */
 export function abortRun(runId: string, reason: string = "user"): boolean {
   const abortedInMemory = abortRunInMemory(runId, reason);
   // Also mark as aborted in SQL (for cross-isolate abort on Workers)
