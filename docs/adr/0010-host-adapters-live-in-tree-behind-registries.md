@@ -1,7 +1,9 @@
-# ADR 0004 — Host adapters live in-tree, one directory per host, behind registries
+# ADR 0010 — Host adapters live in-tree, one directory per host, behind registries
 
 - Status: accepted
 - Date: 2026-08-03
+
+Moved from `sonhyrd/agent-native` ADR 0004 under the mapping in ADR 0009.
 
 ## Context
 
@@ -41,13 +43,15 @@ visible number in a diff, not by being the one the resolver was written for.
 
 **The adapters ship in this repository, not as separately published packages.**
 
-**A guard enforces the boundary** — `scripts/guard-no-host-literals.ts` fails
+**A guard enforces the boundary** — `scripts/guard-no-host-literals.mjs` fails
 when a line this branch added names a host or a host-specific dialect from a
-core module that is not on an explicit allow-list. The allow-list is four
-entries today: the `hosts/` directory itself, runtime detection, the database
-client that must pick a concrete driver before a dialect exists, and the deploy
-build that writes each host's own deploy artifacts. Each entry carries the
-reason it is there.
+core module that is not on an explicit allow-list. `HOST_AWARE_MODULES` is two
+entries as landed: the `hosts/` directory itself, and the one runtime-detection
+module every other module asks. Each entry carries the reason it is there. The
+deploy and CLI layers, which this record anticipated needing entries, are held
+out by directory instead, under a separate rule: a host name that selects a
+deploy target is a name, not a decision. The database client needed no entry —
+it names no host in a deciding position on any line this work added.
 
 ## Considered and rejected: a published adapter package
 
@@ -83,7 +87,7 @@ after a second host tells us what the seam should look like.
   reports that itself and still returns `null`, rather than resolving to a
   handoff nothing will claim.
 - **Nothing may be inferred from whether the barrel ran.** An import that did
-  not happen must not change a host's answer about itself. See ADR 0005, which
+  not happen must not change a host's answer about itself. See ADR 0011, which
   exists because that inference has a silent failure mode.
 - **Consultation order is declared, not positional.** A transport cannot
   displace an existing one by being registered, imported, or bundled ahead of
@@ -97,10 +101,14 @@ after a second host tells us what the seam should look like.
   still name a host in code this work does not touch. A guard that failed on all
   of them is a guard someone turns off on day one, so the habit stops spreading
   and the backlog stays a separate, schedulable cleanup.
-- **The guard has no opt-out pragma, on purpose.** Widening the host boundary is
-  one reviewed edit to the allow-list in `scripts/guard-no-host-literals.ts`,
-  not a pragma scattered wherever the pressure happened to land. The list is the
-  design artifact; a reviewer who reads that diff has read the decision.
+- **Widening the boundary is an allow-list edit, not a pragma.** It is one
+  reviewed change to `HOST_AWARE_MODULES` in
+  `scripts/guard-no-host-literals.mjs`, so the list stays the design artifact
+  and a reviewer who reads that diff has read the decision. As landed the guard
+  also carries a `guard:allow-host-literal` line pragma, matching every other
+  guard in the repo; it is for a genuine one-off — a fixture, or an error
+  message that has to name the host — and never for a module that decides
+  something, which belongs on the list.
 - **Cost accepted: a host's code is not versioned separately from core.** An
   adapter fix ships in a core release. That is the price of not freezing the
   interface, and it is paid until a second unfamiliar host makes the shapes
