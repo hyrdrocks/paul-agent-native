@@ -30,9 +30,19 @@ every one of our commits and throws that record away.
 The conflicts fall into two kinds, and they are resolved differently:
 
 - **Versions, changelogs, lockfile** (`packages/*/package.json`,
-  `CHANGELOG.md`, `pnpm-lock.yaml`) — take Upstream wholesale. Step 3 is about
-  to overwrite them anyway, so hand-resolving them means inventing a number with
-  a short life.
+  `CHANGELOG.md`, `pnpm-lock.yaml`) — take Upstream's side of the conflicting
+  hunk. Step 3 is about to overwrite them anyway, so hand-resolving them means
+  inventing a number with a short life.
+
+  **"Take Upstream" is not `git checkout --theirs` on a `package.json`.** That
+  takes the whole stage-3 blob and so discards our cleanly-merged, non-conflicting
+  content along with it. The 0.146.6 Sync lost three fork additions to core's
+  manifest that way — a `sideEffects` entry, five `exports` paths, and a
+  dependency — and it surfaced two steps later as `Cannot find module
+  '@cfworker/json-schema'`, which reads exactly like a bad merge and is not.
+  Resolve it as a real three-way merge; it should conflict on the `version` line
+  alone. For `CHANGELOG.md` the two are equivalent, which is what makes the
+  `package.json` case easy to miss.
 - **Source** (`server/auth.ts`, `core-routes-plugin.ts`, `db/client.ts`,
   `deploy/build.ts`, and the rest of the host seam) — read both sides. This is
   the single most likely place a `=== "cloudflare"` comes back into
