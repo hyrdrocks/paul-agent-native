@@ -1,6 +1,6 @@
 {
   "name": "@agent-native/frame",
-  "version": "0.1.155-paul.0",
+  "version": "0.1.155-paul.1",
   "private": true,
   "description": "Local dev frame — agent chat + CLI sidebar with app iframe",
   "homepage": "https://github.com/BuilderIO/agent-native#readme",
@@ -48,7 +48,7 @@
     "vite": "catalog:"
   },
   "peerDependencies": {
-    "@agent-native/core": ">=0.134.0-paul.0",
+    "@agent-native/core": ">=0.145.3-paul.0",
     "@agent-native/shared-app-config": ">=0.1.0"
   }
 }

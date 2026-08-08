@@ -1,5 +1,435 @@
 # @agent-native/core
 
+## 0.145.3-paul.0
+
+### Patch Changes
+
+- f2fe0b3: Let the Anthropic provider reach a configured base URL, so a self-hosted or
+  local Anthropic-compatible gateway is a supported configuration rather than a
+  detour through an OpenAI-shaped translation. `ANTHROPIC_BASE_URL` resolves with
+  the same precedence `OPENAI_BASE_URL` already had — an explicitly passed
+  endpoint, then the scoped `app_secrets` row, then the deployment env var — and
+  applies to both the native `anthropic` engine and `ai-sdk:anthropic`. Which
+  providers have a configurable endpoint is now one table rather than a name check
+  at each call site, so the agent-engine settings endpoint writes an Anthropic
+  gateway to its own key instead of answering "Endpoint URL is only supported for
+  OpenAI" — without that, the scoped tier the resolver prefers was unreachable and
+  only the deployment env var worked.
+
+  The two Anthropic clients disagree about what a base URL is: the official SDK
+  appends `/v1/messages`, `@ai-sdk/anthropic` appends only `/messages`. One
+  configured value now converts to whichever form the selected engine needs, so
+  the same gateway URL does not 404 on one of them. A resolved endpoint is passed
+  to the SDK explicitly so a scoped row beats the SDK's own `ANTHROPIC_BASE_URL`
+  read; with nothing resolved the SDK default is left alone, because callers that
+  construct the engine directly never reach the registry.
+
+  Fail-closed behaviour is unchanged: with neither a key nor a base URL
+  configured, the engine still stops with the missing-credentials message instead
+  of sending an unauthenticated request. Only a configured base URL makes a
+  keyless run deliberate.
+
+- 1c13483: Resolve the durable background transport through a registry both hosts join as
+  peers. Transport selection used to be one host hardcoded in
+  `resolveBackgroundDispatchTarget()` with a second bolted on beside it, so a
+  reader saw two hosts handled two ways and could not tell which won when both
+  answered. Each host now registers a transport under `hosts/` declaring its own
+  consultation priority, and the resolver asks them in that declared order,
+  terminating in the portable in-process route. Priority is a declaration rather
+  than a position in a branch chain, so adding a host cannot silently displace an
+  existing one by being registered, imported, or bundled ahead of it.
+
+  The caller opt-out (`durableBackground: false`) resolves before any transport is
+  consulted — it is a caller fact, not a host fact, and never reaches the
+  registry.
+
+  `BackgroundDispatchTarget` no longer enumerates a per-host arm. What a caller
+  needs travels as declared properties — whether there is a `path` to POST to, and
+  whether the receiver carries its own long budget — rather than as a discriminant
+  every consumer in core has to recognise. The unclaimed-run watchdog now arms
+  from the transport's own `acknowledgesWithoutClaim` declaration: a transport
+  that acknowledges a handoff without proving a consumer claimed the run opts in,
+  one that returns a synchronous accepted status does not. Callers hand a run to a
+  transport with no path through the new `deliverBackgroundHandoff`, so no call
+  site needs to know which hosts POST and which do not.
+
+  `@agent-native/core/agent/durable-background` is now an export subpath, so a
+  consumer can ask which transport this process actually resolves without pulling
+  the whole server graph.
+
+- e6cf9fa: Bound the Netlify and Vercel immutable-asset config to one entry per mount
+  point instead of one per content-hashed asset, so neither file grows with the
+  app. On a two-app workspace carrying 400 hashed assets each, the generated
+  `_headers` goes from 1600 blocks to 4 and the Vercel `config.json` from 800
+  header routes to 2.
+
+  The collapse is not the same on both platforms, because their formats do not
+  express the same thing. Vercel's `src` is a regex, so it carries the exact
+  hashed-filename test — an unhashed file sitting in the same directory is not
+  newly covered, which the `/assets/**` glob a `_headers` file is limited to
+  cannot avoid. Netlify has no regex form, so it takes `/assets/:file`: a
+  placeholder matches one path segment where `*` crosses `/`, which leaves a
+  subdirectory of hand-maintained files uncovered rather than pinned for a year.
+  What it still cannot exclude is an unhashed file directly in `assets/`, so the
+  Netlify build now names those files rather than widening the policy in silence,
+  and it names only the ones the rule actually pins.
+
+  `collectImmutableAssetPaths` is unchanged and still decides per-path headers at
+  runtime, where exactness is affordable.
+
+- 8693d39: Boot an app on the Cloudflare SQL dialect: dialect capabilities, lazy schema
+  initialisation, the Workers runtime counted as hosted, and the D1 binding
+  emitted into the generated Worker configuration.
+
+  The database layer now answers capability questions instead of making callers
+  name a product. `supportsInteractiveTransactions()` says whether a dialect can
+  hold a `BEGIN` open across round trips — read literally, because every supported
+  dialect writes atomically and the one that answers `false` does so through a
+  batched statement list. `runAtomicWrites` and `runCompareAndSwap` each have one
+  implementation with that branch inside, so the dialects cannot drift apart, and
+  no caller outside the database layer checks the dialect by name any more.
+  `@agent-native/creative-context` creates a context through `runAtomicWrites`
+  rather than an interactive transaction, so the sources, the context row and its
+  audit entry still land together on a dialect that has no `BEGIN` to hold open. The
+  human-readable database label and the platform-binding client both travel with
+  the dialect, so authentication asks for a client rather than reaching for a
+  host's binding — on a bound dialect with nothing bound it now names the missing
+  binding instead of failing inside the fail-closed `better-sqlite3` stub.
+
+  Schema initialisation no longer fires outside a request. The five
+  fire-and-forget `ensure*Tables()` calls at plugin-init are gone and each store
+  wraps its existing routine in the cold-isolate init memo; the request-scoped
+  entry points thread their h3 event through so the request that starts the work
+  can hold it open. The audit cleanup job ticks on a timer with no request of its
+  own, so it awaits its own initialisation.
+
+  The Workers runtime counts as hosted, including under `wrangler dev`, which runs
+  the same runtime binary under the same constraints. The long-budget signal is
+  carried per invocation there rather than per isolate, because one Worker isolate
+  serves concurrent fetch and queue invocations and an isolate-wide marker would
+  let an unrelated foreground turn lift its own clamp. Until a durable transport
+  exists for this host, an enabled gate reports once per isolate that the run is
+  executing inline rather than degrading in silence.
+
+  Native packages that survive as bare specifiers in an emitted Worker bundle are
+  stubbed to throw on every access, replacing a stub whose empty default and no-op
+  `watch()` a caller could not tell from the capability working and finding
+  nothing.
+
+- 5c07988: Carry a durable background agent run on Cloudflare through a queue.
+
+  A Worker with the emitted background queue bound resolves the dispatch target's
+  `queue` arm, and the generated Worker entry exports the consumer alongside the
+  request handler: per message it enters the per-invocation background scope,
+  synthesises a request to the existing processor route with the signed internal
+  token preserved, and delegates to the same handler that serves fetch. The
+  processor-selection field is honoured, so agent chat, A2A, integration webhooks
+  and the background route processor all reach the correct processor.
+
+  The build emits the producer binding, the consumer registration, and a 300,000 ms
+  CPU limit into the generated Worker configuration.
+
+  An absent binding or a failed send degrades to an inline run with the circuit
+  breaker unchanged; a queue that accepts a run no consumer ever claims is reported
+  once per isolate rather than downgraded silently; and an oversized inline-body
+  payload is refused rather than truncated.
+
+- b9ae314: Emit the Cloudflare background queue only when the app declares it, and refuse
+  at build time when it wants one and has none.
+
+  The queue emitter was the only one of the four Cloudflare emitters that was
+  unconditional, so from the release that added it every Cloudflare deploy needed
+  a queue and a `-dlq` to exist — including apps that never hand a run to the
+  background. They learned that from a `wrangler deploy` failure rather than from
+  anything they had configured.
+
+  `CLOUDFLARE_BACKGROUND_QUEUE` now declares them, the way
+  `CLOUDFLARE_BROWSER_RENDERING` declares the Browser Rendering entitlement: the
+  queue name is still derived from the Worker's own name, so the variable carries
+  no id, only the fact that the resources exist. Unset means no `queues` key at
+  all in the generated config and a deploy that needs no queue.
+
+  The two halves are not separable, and the second is the one that matters.
+  Simply skipping the emit for an app that still wants durable background runs
+  would leave a deployed Worker accepting background work and running it inline
+  under the foreground clamp — a silent runtime degrade traded for a loud deploy
+  failure, which is strictly worse. So that combination throws at build time,
+  before anything is deployed, naming the queue, the dead-letter queue, the two
+  `wrangler queues create` calls in the order wrangler accepts them, and
+  `AGENT_CHAT_DURABLE_BACKGROUND=false` as the other way out. "No queue
+  configured" and "queue configured and working" stay distinguishable states.
+
+  Whether the app wants durable background runs is read through the existing
+  `isDurableBackgroundDeployEnabled()` gate rather than a second parse of the
+  flag, so the Cloudflare and Netlify emits cannot come to disagree about what
+  requesting it means. The raised `cpu_ms` ceiling stays unconditional: a Worker
+  with no queue runs its long turns inline, where it needs the ceiling more.
+  `CLOUDFLARE_BROWSER_RENDERING` and the new variable now share one toggle parse,
+  so an unrecognised value throws for both rather than being read as either
+  answer.
+
+- 2c2f66d: Resolve the durable background handoff as one typed transport decision. A single
+  `resolveBackgroundDispatchTarget()` returns a `BackgroundDispatchTarget` union —
+  an HTTP function target, a queue target, and the portable in-process route —
+  carrying the runtime expectation alongside the transport, so the two agent-chat
+  dispatch call sites no longer re-derive host knowledge from the dispatch path
+  string. Netlify resolves to exactly the values it produced before; no behaviour
+  changes.
+- e5d6c95: Add the Host glossary at `packages/core/src/hosts/CONTEXT.md`, defining the
+  vocabulary of the host seam — Host, host adapter, background transport, dialect
+  capability, provider tier, fallback storage, seam allow-list — so a term used in
+  one adapter means the same thing in the next.
+- a33bb80: Give the Host ownership of how a process reaches a browser, and emit this
+  Host's Browser Rendering binding.
+
+  Rendering a real DOM used to be decided at the call site, and a call site can
+  only see "the Chromium import threw". Every call site resolves that the same
+  way — it returns something the caller cannot tell from a render: an empty
+  screenshot, a blank page, an SVG with no nodes. On a Worker there is no Chromium
+  binary and nowhere to install one, so that is not an edge case there, it is
+  every render.
+
+  So the question is asked once. Hosts register a provider under
+  `browser-rendering` declaring their own consultation priority, exactly as
+  background transports and fallback-storage policies do.
+  `resolveBrowserRenderingDecision()` answers with a binding to render through, or
+  a refusal carrying the setup step that fixes it, or `null` for "no host claimed
+  this process" — which is the only case where launching a local browser is
+  correct. A refusal is deliberately a different value from `null`: answering one
+  with the other is what sends a Worker off to spawn a binary that is not there.
+
+  The Cloudflare provider resolves the `BROWSER` binding, and tells an absent
+  binding apart from a malformed one because those send an operator to opposite
+  repairs. `CLOUDFLARE_BROWSER_BINDING_NAME` sits next to the code that reads it
+  and is re-exported from `deploy/build.ts` beside the D1 and R2 names.
+
+  The build emits a `browser` binding when `CLOUDFLARE_BROWSER_RENDERING` asks for
+  one, and no `browser` key at all when it does not. Conditional like D1 and R2:
+  Browser Rendering is an entitlement rather than a resource, which makes it more
+  of a deploy prerequisite, not less — `wrangler deploy` rejects a binding the
+  account is not entitled to, so an unconditional emit would fail the deploy of
+  every app that never renders anything. With no resource id to derive from, the
+  variable declares intent; what stops it being a switch nobody flips is that a
+  Worker with no binding refuses by name at the first render, quoting both the
+  variable and the binding. An unrecognised value throws rather than being read as
+  either answer.
+
+  Also adds `dist/hosts/**` to this package's `sideEffects` allow-list. Host
+  registrations are reached through a side-effect-only import of the host barrel,
+  which a bundler honouring that allow-list is entitled to drop — and measurably
+  did: the Cloudflare background transport was absent from every emitted chunk of
+  a built Worker, so the seam resolved as "no host claimed this process" and a
+  durable background run went to the in-process route with nothing reporting it.
+
+- 20a6b93: Give the Host ownership of fallback-storage policy, and add this Host's object
+  storage provider behind that seam.
+
+  `uploadFile()` used to return `null` for three different facts — no provider is
+  configured, the credential store could not be read, and this deployment permits
+  no alternative store at all — and every caller resolved all three the same way,
+  by keeping the file body and writing it into SQL. A call site cannot answer that
+  question: whether a payload may be stored somewhere other than the store it was
+  meant for is a property of the Host.
+
+  So it is asked once. Hosts register a policy under `hosts/fallback-storage`
+  declaring their own consultation priority, exactly as background transports do,
+  and a refusal carries the setup step that fixes it rather than only a "no".
+  Cloudflare Workers refuse — the database there is D1 — and a portable baseline
+  refuses for any unrecognised process running against a persistent `DATABASE_URL`
+  or in production, so an unrecognised deployment is never the reason a payload
+  reaches SQL. A local run against a local database still gets the documented
+  capped fallback.
+
+  `uploadFile()` now returns `null` for exactly one condition: no provider is
+  configured AND this host permits the caller to store the payload elsewhere. The
+  other two are typed throws — `FileUploadStorageNotConfiguredError`, carrying
+  `.setup`, and `FileUploadProviderUnreadableError`, which is raised instead of
+  reporting "not configured" when a credential lookup failed. The two `catch {}`
+  blocks that coerced a failed lookup into "unavailable" are gone;
+  `resolveFileUploadProviderForRequest()` reports `provider` / `absent` /
+  `unreadable` as distinct results. Chat attachment pre-upload no longer recovers
+  a refusal by keeping the base64 payload on a message that is about to be
+  persisted, and the resource upload, file-upload and upload-image surfaces report
+  the store's own setup guidance instead of a hardcoded connect-Builder line.
+
+  Adds `cloudflareR2FileUploadProvider`, registered by the Cloudflare host adapter
+  and reporting itself unconfigured anywhere else. It writes through the `UPLOADS`
+  binding and resolves the bucket's public origin through `resolveSecret`, the
+  single reader for app-provided deploy configuration. It resolves that origin
+  _before_ the put: an object stored under a URL that resolves to nothing is a
+  dangling upload every layer above reads as a success. Object keys are a random
+  UUID plus the extension, never the filename or owner, because the bucket is
+  world-readable by construction and the key is what protects the object.
+
+  The build emits an `r2_buckets` binding when `CLOUDFLARE_R2_BUCKET_NAME` is set,
+  and nothing at all when it is not — modelled on the D1 emitter. An
+  unconditional binding would make a bucket a prerequisite for every Cloudflare
+  deploy, discovered from a `wrangler deploy` failure rather than from anything
+  the app configured. Uploads fail closed at runtime with setup guidance instead.
+
+- a12f7f9: Emit one `/assets/**` immutable-cache route rule instead of one per hashed asset, so the generated `_headers` stays inside Cloudflare's 100-rule limit at any asset count. Enumerating each asset produced a file `wrangler deploy` rejects outright, which `wrangler dev` only warns about. Non-hashed files under `/assets/` are now covered by that rule and are reported at build time.
+- bef7405: Add the combined cold-isolate Init Memo: `createInitMemo` wraps a one-time
+  schema-init routine and, on Workers, lets a second caller learn how the first
+  attempt ended by polling an `InitState` flag rather than awaiting a promise that
+  belongs to another request.
+
+  This is one mechanism, not two. The seam — a callable returning `Promise<void>`
+  with a `reset()` — is the one the store refactor adopted; the policy inside it is
+  the measured one from `cross-request-init.ts`: the request that starts the work
+  holds it open with its own `waitUntil`, everyone else polls a flag on timers they
+  own, backing off toward a ceiling.
+
+  A waiter can tell "still running" from "ran and failed": a failed attempt sets
+  `error` on the flag, so the waiter raises that error instead of waiting out the
+  deadline, and the attempt is dropped rather than memoized — one transient DDL
+  failure is no longer replayed to every later caller for the isolate's life. The
+  memo takes an optional h3 event so the caller that starts the work can hand it to
+  its own keep-alive; existing call sites are unaffected.
+
+- 0ebd8af: Stop a background turn from minting an unclaimed recovery successor on every
+  `/runs/active` poll. On a dialect without interactive transactions (D1) the
+  stale-run reaper inserted the successor before, and independently of, the
+  conditional reap UPDATE, so a run that was still heartbeating — or already
+  terminal — accumulated one extra `agent_runs` row and queue message per poll
+  until the 25-run per-turn ledger cap. The reap now decides first on every
+  dialect, and only a run it actually terminalised is recovered; a genuinely
+  lost handoff is still reaped and redispatched exactly as before.
+- c2b7f82: Bound how long a hosted realtime stream can outlive the session that authorized it. Subscribe tokens now carry an optional `absExp` ceiling that `verifyRealtimeSubscribeToken` enforces independently of `exp` (rejecting with `session_expired`), and the mint endpoint sets it to 15 minutes. The gateway re-signs a stream's token every few minutes without consulting the app, so previously one mint could be extended indefinitely and logout, session expiry, user deletion or org removal never reached an open stream. Rotation must copy `absExp` verbatim and refuse to rotate past it.
+
+  `AppSyncStateOptions` also gains `accessAllowTtlMs` (default 30s). `invalidateCollabAccessCache` only reaches the in-process default instance, so a gateway holding per-app instances cannot be told a share was revoked and keeps serving its cached ALLOW until the TTL lapses; a shorter value bounds that window at the cost of more `can-see` round-trips.
+
+- a1311d7: Stop the run registry answering for a run whose originating request has gone away.
+
+  `activeRuns` is isolate-global, but a run's execution belongs to the request
+  context that started it. On Workers that context is cancelled independently of
+  the isolate, taking the run's timers, its promise continuations and its terminal
+  persistence with it — and leaving the map entry reading `running` forever. Both
+  readers of that entry treated its presence as proof this isolate was still
+  producing it: an SSE subscriber attached to a buffer that would never be written
+  to again and pinged indefinitely, and `/runs/active` reported
+  `heartbeatAt: Date.now()` — asserted, not read — which is fresher than the
+  durable heartbeat and so overrode the stale-run detection that was about to
+  terminalise the row.
+
+  A run now stamps `lastProducerTickAt` from inside its own heartbeat timer, and
+  `resolveRunProducerState` classifies an entry as `terminal`, `in-flight` or
+  `producer-lost` — three states, because folding the third into `in-flight`
+  reports liveness that is not there and folding it into `terminal` reports an
+  outcome that never happened. A `producer-lost` entry is not answered from
+  memory: subscription falls through to the durable path and `/runs/active`
+  reports SQL's heartbeat. Nothing local is synthesised, because knowing the
+  producer is gone is not knowing how the run ended. `abortRun` likewise reports
+  `false` for such an entry — it still drops it, but nothing there was executing,
+  and the durable marker is what stops the run.
+
+  New export subpath `@agent-native/core/agent/run-producer-state`, carrying the
+  classifier and its two constants.
+
+  Cloudflare-Workers detection in the database client now calls the shared
+  `isCloudflareRuntime()` rather than a second, narrower copy that omitted the
+  `__env__` global — that copy could take the pooled Node path on a Workers
+  deploy and share a connection across requests.
+
+- e517dcc: Keep the `/_agent-native/events` stream from reading as a hung handler. The SSE
+  endpoint opened and emitted nothing until a DB change arrived, so on Workers
+  the runtime cancelled the request as hung — which under `wrangler dev` surfaced
+  to the dev proxy as "Network connection lost" and killed the whole server,
+  taking any in-flight background agent run with it. The stream now emits a named
+  `keep-alive` frame immediately and every 15s; being a named event, it never
+  reaches the client's `onmessage`.
+- 834ac94: Apply the Cloudflare post-build patches to every emitted chunk, at any depth, so
+  a Worker whose framework code lands in a nested chunk can boot.
+
+  The pass walked three hardcoded directories — the server dir, `_chunks/` and
+  `_libs/` — with a one-level `readdirSync`, skipping any entry that did not end
+  `.mjs`/`.js`. Nitro names an externalised package chunk after the package, so a
+  scoped one lands at `_libs/@agent-native/framework.mjs`: the walk saw
+  `@agent-native` as a directory entry, failed the extension test, and patched
+  none of the files beneath it. The `node:` builtin prefixing, the
+  `import.meta.url` replacement and the global-scope timer shim all reached zero
+  of the chunks that needed them, and the pass logged the same success line it
+  logs when there is nothing to do. workerd then refused the Worker with
+  `Disallowed operation called within global scope`, naming a timer the build had
+  already shipped a shim for.
+
+  The walk is now recursive and every rewritten specifier is computed with
+  `path.relative` from the file being rewritten, replacing the two depths the
+  stub pass assumed (`./stub.mjs` from `_libs/`, `../_libs/stub.mjs` from
+  `_chunks/`) — both wrong for a chunk one level deeper. The pass returns what it
+  scanned, patched and stubbed, and fails outright when the output directory it
+  was pointed at holds no chunks at all, because "patched nothing" and "there was
+  nothing to patch" were previously the same log line.
+
+  `postgres` joins the modules a surviving bare specifier is rewritten to a
+  fail-closed stub for. It is an optional peer that core imports lazily, and an
+  app that correctly omits it got `No such module "_libs/postgres"` at startup
+  instead. The rewrite now covers the dynamic `import("x")` form as well as
+  `from"x"`, which is the form a lazily imported peer actually takes. The stub
+  still throws on use: a Worker reaching it has a live caller, and an empty
+  result would be indistinguishable from the capability working and finding
+  nothing.
+
+- f2fe0b3: Validate agent tool input on runtimes that forbid code generation from strings
+
+  Ajv compiles a schema by building JavaScript source and handing it to
+  `new Function`. Cloudflare Workers refuse that, so on a Worker every
+  `ajv.compile` in the agent loop threw and every tool call was rejected before it
+  ran with "tool schema is invalid: Code generation from strings disallowed for
+  this context" — the agent could talk but could not do anything.
+
+  Both Ajv instances in the agent loop now go through one compile seam that
+  selects on the capability rather than on the host: it probes whether the runtime
+  allows code generation, and where it does not, interprets the schema with
+  `@cfworker/json-schema` instead. Where `new Function` works, Ajv is used exactly
+  as before — same options, same `ErrorObject`s, same error text, same union
+  narrowing.
+
+  The interpreted path reproduces Ajv's `coerceTypes` scalar coercion, in place,
+  so a model sending `"3"` for a number is accepted on both. It also checks the
+  schema structurally before use, because the interpreter would otherwise ignore a
+  malformed keyword and then accept everything — turning "this schema is
+  unreadable" into "this input is fine". Error wording differs between the two
+  paths; the accept/reject decision and the coerced value do not, and a parity
+  spec runs the same schemas and inputs through both to keep it that way.
+
+  The seam is exported as `@agent-native/core/agent/json-schema-validator` so a
+  host can ask the core it actually loaded whether it has this capability, rather
+  than inferring it from a version number.
+
+- d583f7d: Keep the `@agent-native/*` packages in one chunk for Worker and Deno output, so
+  an app that installs more than one of them from `node_modules` can boot.
+
+  Nitro declares one Rolldown code-splitting group per installed package and then
+  lets Rolldown merge those groups down to far fewer physical chunks. Two
+  framework packages that share a dependency land on opposite sides of a merge —
+  one chunk holding zod, the other drizzle-orm — and import each other across the
+  chunk boundary. The module linker evaluates one side of that cycle first, so a
+  module-scope read of the other side throws `Cannot access 'X' before
+initialization` and workerd refuses to start the Worker. Nothing earlier in the
+  pipeline notices: install, resolution, bundling and the size check all pass.
+  Workspace sources never match the group's `test`, so this appears only once an
+  app consumes the packages from `node_modules`, and only once it consumes two.
+
+  `codeSplitting` is the option that governs this. Rolldown ignores
+  `advancedChunks` whenever `codeSplitting` is set, and Nitro always sets it, so
+  reaching for `advancedChunks` changes nothing and only logs a warning.
+
+  The group is scoped to `@agent-native/*` rather than to all of `node_modules`.
+  One chunk for every installed package also removes the cycle, but it drags
+  lazily imported third-party packages into the eagerly evaluated chunk, and their
+  module-scope `require("node:...")` then runs during startup — trading this
+  failure for `No such module` at boot.
+
+  A build that would reintroduce a cycle now fails with the names of the chunks
+  involved rather than producing a bundle that only fails at boot. The
+  `noExternals` value passed for these presets is documented as inert where it is
+  inert: Worker and Deno presets run with `node: false`, and Nitro only installs
+  its externals plugin when `node` is true, so nothing in that output is a Nitro
+  external and nothing reads that value.
+
+  Note for apps that post-process the Worker output: the framework packages now
+  land in `_libs/@agent-native/framework.mjs` instead of one file per package.
+
 ## 0.134.0-paul.2
 
 ### Minor Changes
@@ -199,6 +629,7 @@
   a value-returning vault action is never auto-advertised to external agents;
   `filterAgentTools` is exported from `@agent-native/core/server` so apps can
   assert an `agentTool: false` action really is absent from the agent tool list.
+
 ## 0.145.2
 
 ### Patch Changes

@@ -1,5 +1,40 @@
 # @agent-native/pinpoint
 
+## 0.1.20-paul.0
+
+### Patch Changes
+
+- 35958d1: Renumber the five packages that entering changesets pre mode bumped to `1.0.0`
+  back onto the `0.x` line, so a Fork version is the Upstream version it forks
+  advanced by its own changesets, plus the `-paul.N` prerelease suffix. No
+  changeset ever asked for that major: it is what changesets does to a package
+  declaring `@agent-native/core` as a `>=` peer dependency once core's version
+  carries a prerelease, because a prerelease satisfies no plain `>=` range.
+  `@agent-native/dispatch` goes to `0.17.0-paul.0`, and `creative-context`,
+  `frame`, `pinpoint` and `scheduling` to a patch above their baselines. A
+  vendored tarball name therefore moves backwards without the build inside it
+  moving backwards; `docs/adr/0008` says why.
+- Updated dependencies [f2fe0b3]
+- Updated dependencies [1c13483]
+- Updated dependencies [e6cf9fa]
+- Updated dependencies [8693d39]
+- Updated dependencies [5c07988]
+- Updated dependencies [b9ae314]
+- Updated dependencies [2c2f66d]
+- Updated dependencies [e5d6c95]
+- Updated dependencies [a33bb80]
+- Updated dependencies [20a6b93]
+- Updated dependencies [a12f7f9]
+- Updated dependencies [bef7405]
+- Updated dependencies [0ebd8af]
+- Updated dependencies [c2b7f82]
+- Updated dependencies [a1311d7]
+- Updated dependencies [e517dcc]
+- Updated dependencies [834ac94]
+- Updated dependencies [f2fe0b3]
+- Updated dependencies [d583f7d]
+  - @agent-native/core@0.145.3-paul.0
+
 ## 0.1.19-paul.0
 
 ### Patch Changes
@@ -8,6 +43,7 @@
 - Updated dependencies [0c17835]
 - Updated dependencies [17b5fe8]
   - @agent-native/core@0.134.0-paul.0
+
 ## 0.1.19
 
 ### Patch Changes
