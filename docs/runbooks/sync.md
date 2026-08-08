@@ -62,6 +62,22 @@ Keep the result a PATCH. A minor or major on `@agent-native/core` puts every
 package that declares core as a peer out of range, and changesets answers that by
 majoring all of them at once — the accident ADR 0008 had to undo.
 
+**The order of these two commands is load-bearing, not stylistic.** Re-run the
+Re-baseline *after* the version pass and it writes the fork prerelease into
+`initialVersions` — core is `ahead` of Upstream by then, and the `ahead` branch
+records the version the manifest actually holds. The baseline would name a fork
+prerelease instead of the Upstream release it forks, which is the opposite of
+what ADR 0008 asks of it. Re-baseline first, version second, never the reverse.
+
+Expect the version pass to be a **no-op** on the changesets themselves: pre mode
+records each one as applied, so a Sync that adds no new work has an empty release
+plan. That is not success — it leaves every package on a plain Upstream number
+while carrying fork source, which is the recorded-version-lies failure this whole
+procedure exists to close. Mint one patch changeset naming the packages whose
+`src` actually differs from the Upstream ref (a measured set, not a chosen one)
+to put the `-paul.N` tag back. Do **not** empty `pre.json`'s applied list to make
+the existing changesets re-apply: that reproduces the ADR 0008 major exactly.
+
 ## 4. Audit the pending changesets
 
 In pre mode changesets stay listed and re-apply on every `changeset version`.
