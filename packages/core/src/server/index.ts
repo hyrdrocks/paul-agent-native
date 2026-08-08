@@ -196,6 +196,11 @@ export {
 export { createPollEventsHandler } from "./poll-events.js";
 export { createAuthPlugin, defaultAuthPlugin } from "./auth-plugin.js";
 export {
+  BETTER_AUTH_MIGRATIONS,
+  runBetterAuthMigrations,
+} from "./better-auth-migrations.js";
+export { runFrameworkReleaseMigrations } from "./release-migrations.js";
+export {
   initServerSentry,
   isServerSentryEnabled,
   setSentryUserForRequest,
@@ -238,6 +243,10 @@ export {
 // exported so an app can assert an `agentTool: false` action really is absent
 // from it rather than re-implementing the predicate in a test.
 export { filterAgentTools } from "./agent-chat/action-filters-a2a.js";
+export type {
+  AgentChatMcpIcon,
+  AgentChatMcpOptions,
+} from "./agent-chat/mcp-options.js";
 export {
   configureAgentNativeEmbeddedEnvironment,
   createAgentNativeEmbeddedAuthOptions,
@@ -273,6 +282,20 @@ export {
   FRAMEWORK_ROUTE_PREFIX,
   type CoreRoutesPluginOptions,
 } from "./core-routes-plugin.js";
+export {
+  buildRuntimeConfigPrompt,
+  formatRuntimeConfigReport,
+  getRuntimeConfigReport,
+  parseRuntimeConfigReport,
+  runtimeConfigRequirementsFromSearchParams,
+  type RuntimeConfigEnvironment,
+  type RuntimeConfigIssue,
+  type RuntimeConfigIssueCode,
+  type RuntimeConfigIssueSeverity,
+  type RuntimeConfigPhase,
+  type RuntimeConfigReport,
+  type RuntimeConfigRequirements,
+} from "../shared/runtime-config.js";
 export {
   AGENT_NATIVE_OG_IMAGE_CACHE_CONTROL,
   AGENT_NATIVE_OG_IMAGE_HEIGHT,
@@ -380,6 +403,27 @@ export {
   mergeCoreSharingActions,
   registerPackageActions,
 } from "./action-discovery.js";
+// A standalone `mountMCP` plugin has to compose the same action surface the
+// agent-chat plugin does. Without these, the only way to build one was to
+// hand-roll a copy — which is how a template ends up with a `tool-search` that
+// drifts from the framework's, and an MCP mount that silently ignores
+// `frameworkTools`.
+export {
+  attachToolSearch,
+  createToolSearchEntry,
+  searchToolRegistry,
+  TOOL_SEARCH_ACTION_NAME,
+} from "../agent/tool-search.js";
+export {
+  filterFrameworkToolGroups,
+  frameworkGroupEnabled,
+  resolveFrameworkTools,
+  FRAMEWORK_TOOL_GROUPS,
+  type FrameworkToolGroup,
+  type FrameworkToolsConfig,
+  type FrameworkToolsOption,
+  type ResolvedFrameworkTools,
+} from "../framework-tools.js";
 export {
   registerPromptContextProvider,
   type PromptContextProvider,
@@ -557,12 +601,16 @@ export {
   type BuilderDesignSystemSourceKind,
 } from "./builder-design-systems.js";
 export {
+  createBuilderProject,
+  ensureBuilderProject,
+  findBuilderProjectForRepo,
   getBuilderBranchProjectId,
   isBuilderBranchingEnabled,
   requestBuilderBrowserConnection,
   resolveBuilderBranchProjectId,
   resolveIsBuilderBranchingEnabled,
   runBuilderAgent,
+  type BuilderProjectResult,
   type RunBuilderAgentResult,
 } from "./builder-browser.js";
 export {

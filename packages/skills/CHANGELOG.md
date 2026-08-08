@@ -1,59 +1,123 @@
 # @agent-native/skills
 
-## 0.2.500-paul.0
+## 0.2.512
 
 ### Patch Changes
 
-- Updated dependencies [f2fe0b3]
-- Updated dependencies [1c13483]
-- Updated dependencies [e6cf9fa]
-- Updated dependencies [8693d39]
-- Updated dependencies [5c07988]
-- Updated dependencies [b9ae314]
-- Updated dependencies [2c2f66d]
-- Updated dependencies [e5d6c95]
-- Updated dependencies [a33bb80]
-- Updated dependencies [20a6b93]
-- Updated dependencies [a12f7f9]
-- Updated dependencies [bef7405]
-- Updated dependencies [0ebd8af]
+- Updated dependencies [a882a53]
+- Updated dependencies [a882a53]
+- Updated dependencies [a882a53]
+- Updated dependencies [a882a53]
+- Updated dependencies [a882a53]
+  - @agent-native/core@0.146.6
+
+## 0.2.511
+
+### Patch Changes
+
+- Updated dependencies [25f588e]
+  - @agent-native/core@0.146.5
+
+## 0.2.510
+
+### Patch Changes
+
+- Updated dependencies [e959709]
+- Updated dependencies [e959709]
+- Updated dependencies [e959709]
+- Updated dependencies [e959709]
+  - @agent-native/core@0.146.4
+
+## 0.2.509
+
+### Patch Changes
+
+- Updated dependencies [62f694b]
+  - @agent-native/core@0.146.3
+
+## 0.2.508
+
+### Patch Changes
+
+- Updated dependencies [a107169]
+  - @agent-native/core@0.146.2
+
+## 0.2.507
+
+### Patch Changes
+
+- Updated dependencies [6071f7d]
+- Updated dependencies [6071f7d]
+- Updated dependencies [6071f7d]
+  - @agent-native/core@0.146.1
+
+## 0.2.506
+
+### Patch Changes
+
+- Updated dependencies [c440e50]
+- Updated dependencies [c440e50]
+- Updated dependencies [c440e50]
+  - @agent-native/core@0.146.0
+
+## 0.2.505
+
+### Patch Changes
+
+- Updated dependencies [c497c85]
+- Updated dependencies [c497c85]
+  - @agent-native/core@0.145.8
+
+## 0.2.504
+
+### Patch Changes
+
+- Updated dependencies [25e1bcf]
+  - @agent-native/core@0.145.7
+
+## 0.2.503
+
+### Patch Changes
+
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+- Updated dependencies [1d5bab1]
+  - @agent-native/core@0.145.6
+
+## 0.2.502
+
+### Patch Changes
+
+- Updated dependencies [da40677]
+  - @agent-native/core@0.145.5
+
+## 0.2.501
+
+### Patch Changes
+
+- Updated dependencies [db62d66]
+- Updated dependencies [db62d66]
+- Updated dependencies [db62d66]
+  - @agent-native/core@0.145.4
+
+## 0.2.500
+
+### Patch Changes
+
 - Updated dependencies [c2b7f82]
-- Updated dependencies [a1311d7]
-- Updated dependencies [e517dcc]
-- Updated dependencies [834ac94]
-- Updated dependencies [f2fe0b3]
-- Updated dependencies [d583f7d]
-  - @agent-native/core@0.145.3-paul.0
-
-## 0.2.458-paul.2
-
-### Patch Changes
-
-- Updated dependencies [fe48d97]
-- Updated dependencies [df8bafe]
-- Updated dependencies [440e2ab]
-- Updated dependencies [bb7058f]
-- Updated dependencies [00fdc7f]
-- Updated dependencies [0e4ee8b]
-- Updated dependencies [0276138]
-  - @agent-native/core@0.134.0-paul.2
-
-## 0.2.458-paul.1
-
-### Patch Changes
-
-- 014813e: Fix `agent-native connect` reading a Codex config back as having no auth headers when `http_headers` is expressed as a `[mcp_servers.<name>.http_headers]` sub-table rather than an inline table. The block reader stopped at the sub-table header, so the headers were never even collected, and `connect dev`/`connect prod` silently dropped the bearer when saving and restoring the production entry. `connect.ts` now uses the shared MCP config readers in `mcp-config-writers.ts` instead of its own private near-duplicates, which read both header forms and preserve a server's whole TOML footprint (its table plus every sub-table) so a saved entry round-trips intact. As a result `connect` now reports a config file it cannot read or parse instead of treating it as a client with nothing connected.
-- Updated dependencies [014813e]
-  - @agent-native/core@0.134.0-paul.1
-
-## 0.2.458-paul.0
-
-### Patch Changes
-
-- Updated dependencies [f3a868b]
-- Updated dependencies [0c17835]
-- Updated dependencies [17b5fe8]
-  - @agent-native/core@0.134.0-paul.0
+  - @agent-native/core@0.145.3
 
 ## 0.2.499
 
