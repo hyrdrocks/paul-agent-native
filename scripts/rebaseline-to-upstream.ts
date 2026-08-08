@@ -15,6 +15,13 @@
 // each of which declares core as a peerDependency — as out of range and bump
 // every one of them to a new major, landing dispatch on 1.0.0.
 //
+// The changesets pre-mode baseline in .changeset/pre.json is rewritten by the
+// same pass, because it and the manifest versions are one fact. ADR 0008 makes
+// that baseline the name of the Upstream release the fork forks, and changesets
+// diffs against it when it computes a bump — so a stale one does not fail, it
+// produces a wrong number and reports success. Two places to write the fact is
+// what let it drift for three Syncs; there is now one.
+//
 // Every workspace member gets a line, including the ones nothing is done to. A
 // package missing from the report is indistinguishable from one that was
 // considered and left alone, and the difference is the whole point of reading it.
@@ -48,6 +55,26 @@ export interface RebaselineEntry {
   file: string;
   decision: RebaselineDecision;
 }
+
+export type BaselineDecision =
+  | { action: "rewrite"; from: string; to: string }
+  | { action: "current"; version: string }
+  | { action: "absent"; memberVersion: string }
+  | { action: "orphan"; baselineVersion: string };
+
+export interface BaselineEntry {
+  name: string;
+  decision: BaselineDecision;
+}
+
+export interface RebaselinePlan {
+  members: RebaselineEntry[];
+  // null means the workspace is not in changesets pre mode — a real state, not
+  // an empty baseline. An empty one would read as "nothing to rewrite".
+  baseline: BaselineEntry[] | null;
+}
+
+export const PRE_BASELINE_FILE = ".changeset/pre.json";
 
 export function parseRebaselineArgs(argv: string[]): RebaselineOptions {
   let upstreamRef: string | null = null;
@@ -210,36 +237,186 @@ export function rewriteVersion(
   return manifest.replace(needle, `"version": ${JSON.stringify(to)}`);
 }
 
+// The version each manifest holds once the plan is applied. `rebaseline` lands
+// on Upstream's number; every other action leaves the manifest exactly where it
+// was, and the baseline has to record that rather than Upstream's number — an
+// `ahead` package whose baseline claimed Upstream's version would recreate, for
+// that package, the drift this pass exists to remove.
+export function resultingVersion(decision: RebaselineDecision): string | null {
+  switch (decision.action) {
+    case "rebaseline":
+      return decision.to;
+    case "unchanged":
+      return decision.version;
+    case "ahead":
+      return decision.forkVersion;
+    case "fork-only":
+      return decision.forkVersion;
+    case "no-version":
+      return null;
+  }
+}
+
+export function planBaseline(
+  members: RebaselineEntry[],
+  initialVersions: Record<string, string>,
+): BaselineEntry[] {
+  const versions = new Map<string, string>();
+  for (const member of members) {
+    const version = resultingVersion(member.decision);
+    if (version === null) continue;
+    const seen = versions.get(member.name);
+    if (seen !== undefined) {
+      throw new Error(
+        `two workspace members are named '${member.name}'; the baseline records one version per name`,
+      );
+    }
+    versions.set(member.name, version);
+  }
+
+  const plan: BaselineEntry[] = [];
+  for (const [name, version] of versions) {
+    const recorded = initialVersions[name];
+    if (recorded === undefined) {
+      plan.push({
+        name,
+        decision: { action: "absent", memberVersion: version },
+      });
+    } else if (recorded === version) {
+      plan.push({ name, decision: { action: "current", version } });
+    } else {
+      plan.push({
+        name,
+        decision: { action: "rewrite", from: recorded, to: version },
+      });
+    }
+  }
+  // An entry with nothing to match is left in the file and reported. Deleting it
+  // would change what changesets diffs against on the strength of a guess about
+  // a package this script never saw.
+  for (const [name, baselineVersion] of Object.entries(initialVersions)) {
+    if (versions.has(name)) continue;
+    plan.push({ name, decision: { action: "orphan", baselineVersion } });
+  }
+  return plan.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Rewrites one `"<name>": "<version>"` entry in place, so the changesets list and
+// every untouched entry stay byte-identical. Same strictness as rewriteVersion:
+// absent and ambiguous both throw rather than silently doing nothing or picking.
+export function rewriteBaselineVersion(
+  baseline: string,
+  name: string,
+  from: string,
+  to: string,
+): string {
+  const needle = `${JSON.stringify(name)}: ${JSON.stringify(from)}`;
+  const first = baseline.indexOf(needle);
+  if (first === -1) {
+    throw new Error(`${needle} not found in ${PRE_BASELINE_FILE}`);
+  }
+  if (baseline.indexOf(needle, first + 1) !== -1) {
+    throw new Error(`${needle} appears twice in ${PRE_BASELINE_FILE}`);
+  }
+  return baseline.replace(
+    needle,
+    `${JSON.stringify(name)}: ${JSON.stringify(to)}`,
+  );
+}
+
+// Absent means the workspace is not in pre mode. Any other read failure means the
+// file is there and unreadable, which must not be reported as absence.
+function readPreBaseline(root: string): string | null {
+  try {
+    return readFileSync(path.join(root, PRE_BASELINE_FILE), "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw error;
+  }
+}
+
+function parseInitialVersions(raw: string): Record<string, string> {
+  const parsed = JSON.parse(raw);
+  const initialVersions = parsed?.initialVersions;
+  if (
+    initialVersions === null ||
+    typeof initialVersions !== "object" ||
+    Array.isArray(initialVersions)
+  ) {
+    throw new Error(
+      `${PRE_BASELINE_FILE} declares no initialVersions object; it is not a baseline this script can own`,
+    );
+  }
+  return initialVersions;
+}
+
 export function planRebaseline(
   root: string,
   files: string[],
   readUpstreamVersion: (file: string) => string | null,
-): RebaselineEntry[] {
-  const plan: RebaselineEntry[] = [];
+): RebaselinePlan {
+  const members: RebaselineEntry[] = [];
   for (const file of files) {
     const manifest = readManifest(path.join(root, file));
     if (manifest === null) {
       throw new Error(`${file} disappeared between the scan and the plan`);
     }
-    plan.push({
+    members.push({
       name: manifest.name ?? file,
       file,
       decision: decideRebaseline(manifest.version, readUpstreamVersion(file)),
     });
   }
-  return plan.sort((a, b) => a.name.localeCompare(b.name));
+  members.sort((a, b) => a.name.localeCompare(b.name));
+
+  const raw = readPreBaseline(root);
+  return {
+    members,
+    baseline:
+      raw === null ? null : planBaseline(members, parseInitialVersions(raw)),
+  };
 }
 
-export function applyRebaseline(root: string, plan: RebaselineEntry[]): void {
-  for (const entry of plan) {
+// Every rewrite is computed before anything is written, so a rewrite that cannot
+// be made stops the pass with the tree untouched. Writing manifests first and
+// discovering the baseline is unwritable afterwards would leave behind exactly
+// the tree this script exists to make impossible: versions and baseline
+// disagreeing, well-formed, with nothing to say so.
+export function applyRebaseline(root: string, plan: RebaselinePlan): void {
+  const writes: { file: string; content: string }[] = [];
+  for (const entry of plan.members) {
     if (entry.decision.action !== "rebaseline") continue;
     const file = path.join(root, entry.file);
-    const manifest = readFileSync(file, "utf8");
-    writeFileSync(
+    writes.push({
       file,
-      rewriteVersion(manifest, entry.decision.from, entry.decision.to),
-    );
+      content: rewriteVersion(
+        readFileSync(file, "utf8"),
+        entry.decision.from,
+        entry.decision.to,
+      ),
+    });
   }
+
+  const rewrites = (plan.baseline ?? []).filter(
+    (entry) => entry.decision.action === "rewrite",
+  );
+  if (rewrites.length > 0) {
+    const file = path.join(root, PRE_BASELINE_FILE);
+    let content = readFileSync(file, "utf8");
+    for (const entry of rewrites) {
+      if (entry.decision.action !== "rewrite") continue;
+      content = rewriteBaselineVersion(
+        content,
+        entry.name,
+        entry.decision.from,
+        entry.decision.to,
+      );
+    }
+    writes.push({ file, content });
+  }
+
+  for (const write of writes) writeFileSync(write.file, write.content);
 }
 
 function repoRoot(): string {
@@ -301,6 +478,21 @@ function describe(entry: RebaselineEntry): string {
   }
 }
 
+function describeBaseline(entry: BaselineEntry): string {
+  const { decision } = entry;
+  const name = entry.name.padEnd(44);
+  switch (decision.action) {
+    case "rewrite":
+      return `rewrite     ${name}  ${decision.from} -> ${decision.to}`;
+    case "current":
+      return `current     ${name}  ${decision.version}`;
+    case "absent":
+      return `absent      ${name}  ${decision.memberVersion} in the workspace, no baseline entry; this script will not invent one`;
+    case "orphan":
+      return `orphan      ${name}  ${decision.baselineVersion} in the baseline, no workspace member declaring it; left in place`;
+  }
+}
+
 function main(argv: string[]): void {
   const options = parseRebaselineArgs(argv);
   const root = repoRoot();
@@ -316,8 +508,10 @@ function main(argv: string[]): void {
   // Templates and examples legitimately carry no version, and one line each
   // buries the handful that matter. They are still named, one per line's worth,
   // so a package that LOST its version in a bad merge is still visible here.
-  const versionless = plan.filter((e) => e.decision.action === "no-version");
-  for (const entry of plan) {
+  const versionless = plan.members.filter(
+    (e) => e.decision.action === "no-version",
+  );
+  for (const entry of plan.members) {
     if (entry.decision.action === "no-version") continue;
     process.stdout.write(`${describe(entry)}\n`);
   }
@@ -327,15 +521,35 @@ function main(argv: string[]): void {
     );
   }
 
-  const changing = plan.filter((e) => e.decision.action === "rebaseline");
-  process.stdout.write(`\n${plan.length} workspace package(s) considered\n`);
+  process.stdout.write(`\n${PRE_BASELINE_FILE}\n`);
+  if (plan.baseline === null) {
+    process.stdout.write(
+      `absent      the workspace is not in changesets pre mode; no baseline to re-baseline\n`,
+    );
+  } else {
+    for (const entry of plan.baseline) {
+      process.stdout.write(`${describeBaseline(entry)}\n`);
+    }
+  }
+
+  const changing = plan.members.filter(
+    (e) => e.decision.action === "rebaseline",
+  );
+  const baselineChanging = (plan.baseline ?? []).filter(
+    (e) => e.decision.action === "rewrite",
+  );
+  process.stdout.write(
+    `\n${plan.members.length} workspace package(s) considered\n`,
+  );
   if (options.dryRun) {
-    process.stdout.write(`${changing.length} would be re-baselined\n`);
+    process.stdout.write(
+      `${changing.length} manifest(s) and ${baselineChanging.length} baseline entr(ies) would be rewritten\n`,
+    );
     return;
   }
-  applyRebaseline(root, changing);
+  applyRebaseline(root, plan);
   process.stdout.write(
-    `${changing.length} re-baselined — run \`pnpm changeset:version\` to re-apply the prerelease tag\n`,
+    `${changing.length} manifest(s) and ${baselineChanging.length} baseline entr(ies) rewritten — run \`pnpm changeset:version\` to re-apply the prerelease tag\n`,
   );
 }
 
