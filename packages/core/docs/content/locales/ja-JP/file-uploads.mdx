@@ -1,6 +1,6 @@
 ---
 title: "ファイルのアップロード"
-description: "ファイル アップロード ストレージを構成します — 開発用の SQL フォールバック、本番用の Builder.io またはカスタム プロバイダー。"
+description: "ファイル アップロード ストレージを構成します — Builder.io、Cloudflare R2、またはカスタム プロバイダー。開発専用の SQL フォールバックを許すかどうかはホストが決めます。"
 ---
 
 # ファイルのアップロード
@@ -15,7 +15,7 @@ description: "ファイル アップロード ストレージを構成します 
 
 1. **ユーザー登録プロバイダー** — `registerFileUploadProvider()` 経由で登録されたカスタムプロバイダー
 2. **Builder.io プロバイダー** — 組み込み、Builder.io が接続されると自動的にアクティブ化されます
-3. **SQL フォールバック** — ファイルをデータベースに Base64 として保存します (開発には問題ありませんが、運用には問題ありません)
+3. **SQL フォールバック** — ホストが許可する場合にかぎり、ファイルを Base64 としてデータベースに保存します (ローカル開発。Workers 上、永続データベース、運用環境では行われません)
 
 <Diagram id="doc-block-1bqg825" title={"プロバイダーの解決順序"} summary={"UploadFile() は、最初に構成されたプロバイダーを順番に選択します。 SQL フォールバックは常に存在するため、アップロードはセットアップなしで機能します。"}>
 
@@ -96,13 +96,33 @@ Dispatches to the first configured provider in resolution order. Check the activ
 
 ## デフォルト: SQL フォールバック {#sql-fallback}
 
-プロバイダーが構成されていない場合、ファイルはリソース システムを介して SQL データベースに Base64 データとして保存されます。これは、ローカル開発ではそのまま使用できますが、運用環境では推奨されません。ファイルが大きいとデータベースが肥大化し、CDN がありません。
+プロバイダーが構成されていない場合、ペイロードを別の場所に保存してよいかどうかを決めるのは呼び出し側のコードではなく**ホスト**です。ローカルデータベースに対するローカル実行では、リソースシステムを介してファイルを Base64 として SQL に保存し、1 回限りの警告を記録します。これは開発上の利便性であり、運用モードではありません。
 
-フォールバックが使用されると、1 回限りの警告がログに記録されます。
+それ以外の場所ではアップロードはフェイルクローズします。Cloudflare Workers 上、永続的な `DATABASE_URL` に対して、あるいは `NODE_ENV=production` では、`uploadFile()` は `FileUploadStorageNotConfiguredError` をスローし、その `.setup` が何を構成すべきかを示します。呼び出し側が保存済みファイルと取り違えうる値を返すことは決してありません。
+
+ホストは自身のポリシーを登録して宣言します:
+
+```ts
+import { registerFallbackStoragePolicy } from "@agent-native/core/hosts";
+
+registerFallbackStoragePolicy({
+  id: "my-host",
+  priority: 30,
+  decide() {
+    if (!runningOnMyHost()) return null; // このホストではない
+    return {
+      permitted: false,
+      policy: "my-host",
+      reason: "This app runs on a host with no store for a file body.",
+      setup: "Bind an object store and set MY_HOST_BUCKET.",
+    };
+  },
+});
+```
 
 ## Builder.io ホスティング {#builder-hosting}
 
-アプリが Builder.io に接続されている場合、ファイルのアップロードは Builder のアセット ホスティングに自動的にルーティングされます。ファイルは、構成を必要とせずに CDN から提供されます。これは推奨される運用環境設定です。
+アプリが Builder.io に接続されている場合（無料プランあり）、ファイルのアップロードは Builder のアセット ホスティングに自動的にルーティングされます。ファイルは、構成を必要とせずに CDN から提供されます。これは推奨される運用環境設定です。
 
 ## カスタムプロバイダー {#custom-providers}
 
@@ -174,6 +194,14 @@ const result = await uploadFile({
 if (result) {
   // Provider handled it — result.url is the public URL
 } else {
-  // No provider configured — handle SQL フォールバック yourself, or skip
+  // プロバイダー未構成で、かつこのホストがローカルフォールバックを許可している場合。
+  // それ以外では代わりに FileUploadStorageNotConfiguredError がスローされます。
 }
 ```
+
+`uploadFile()` が `null` を返すのはただ一つの条件です — プロバイダーが未構成で、かつホストがフォールバックを許可している場合。他の二つの条件は型付きのスローなので、保存済みファイルと取り違えられることはありません:
+
+| スロー                                | 意味                                                   | 修復                                                     |
+| ------------------------------------- | ------------------------------------------------------ | -------------------------------------------------------- |
+| `FileUploadStorageNotConfiguredError` | ストアがなく、このホストはフォールバックを拒否します。 | `.setup` を読んでください。                              |
+| `FileUploadProviderUnreadableError`   | ストアが構成済みかどうかを読めませんでした。           | 資格情報ストアを直してください。構成ミスではありません。 |

@@ -34,6 +34,12 @@ export interface ShortLivedTokenClaims {
   resourceId: string;
   /** Optional viewer email for audit / analytics — not used for authorisation. */
   viewerEmail?: string;
+  /**
+   * Optional display name of the agent the token was minted for. Signed so a
+   * reader cannot rename itself, but audit/display-only like `viewerEmail` —
+   * never consult it for authorisation.
+   */
+  agentLabel?: string;
   /** Override default TTL (seconds). */
   ttlSeconds?: number;
 }
@@ -41,6 +47,7 @@ export interface ShortLivedTokenClaims {
 interface DecodedClaims {
   resourceId: string;
   viewerEmail?: string;
+  agentLabel?: string;
   exp: number;
 }
 
@@ -49,7 +56,7 @@ interface DecodedClaims {
  * `ok` field so callers can `if (!result.ok) return …`.
  */
 export type VerifyResult =
-  | { ok: true; viewerEmail?: string }
+  | { ok: true; viewerEmail?: string; agentLabel?: string }
   | { ok: false; reason: string };
 
 let _devSigningKey: string | undefined;
@@ -102,6 +109,7 @@ export function signShortLivedToken(claims: ShortLivedTokenClaims): string {
     exp: Math.floor(Date.now() / 1000) + ttl,
   };
   if (claims.viewerEmail) payload.viewerEmail = claims.viewerEmail;
+  if (claims.agentLabel) payload.agentLabel = claims.agentLabel;
 
   const payloadStr = base64UrlEncode(JSON.stringify(payload));
   const sig = base64UrlEncode(
@@ -166,7 +174,11 @@ export function verifyShortLivedToken(
     return { ok: false, reason: "wrong_resource" };
   }
 
-  return { ok: true, viewerEmail: claims.viewerEmail };
+  return {
+    ok: true,
+    viewerEmail: claims.viewerEmail,
+    agentLabel: claims.agentLabel,
+  };
 }
 
 // ── Realtime subscribe tokens ────────────────────────────────────────────────
@@ -203,6 +215,13 @@ export interface RealtimeSubscribeClaims {
   orgId?: string;
   /** Override default TTL (seconds). */
   ttlSeconds?: number;
+  /**
+   * Absolute unix-seconds ceiling, independent of `exp`. The gateway re-signs a
+   * stream's token every few minutes without consulting the app, so `exp` alone
+   * lets one mint be extended forever and a revoked session keeps streaming.
+   * Rotation copies this verbatim and never extends it.
+   */
+  absExp?: number;
 }
 
 interface DecodedRealtimeClaims {
@@ -211,6 +230,7 @@ interface DecodedRealtimeClaims {
   owner?: string;
   orgId?: string;
   exp: number;
+  absExp?: number;
 }
 
 /**
@@ -224,6 +244,7 @@ export type RealtimeVerifyResult =
       owner?: string;
       orgId?: string;
       exp: number;
+      absExp?: number;
     }
   | { ok: false; reason: string };
 
@@ -271,6 +292,7 @@ export function signRealtimeSubscribeToken(
   };
   if (claims.owner) payload.owner = claims.owner;
   if (claims.orgId) payload.orgId = claims.orgId;
+  if (claims.absExp) payload.absExp = claims.absExp;
 
   const payloadStr = base64UrlEncode(JSON.stringify(payload));
   return `${payloadStr}.${hmacB64(payloadStr, key)}`;
@@ -312,6 +334,15 @@ export function verifyRealtimeSubscribeToken(
   if (claims.exp * 1000 < Date.now()) {
     return { ok: false, reason: "expired" };
   }
+  if (claims.absExp !== undefined) {
+    if (typeof claims.absExp !== "number") {
+      return { ok: false, reason: "bad_payload" };
+    }
+    // `<=`, not `<`: a ceiling is not valid at the instant it is reached.
+    if (claims.absExp * 1000 <= Date.now()) {
+      return { ok: false, reason: "session_expired" };
+    }
+  }
   if (claims.projectId !== expected.projectId) {
     return { ok: false, reason: "wrong_project" };
   }
@@ -322,6 +353,7 @@ export function verifyRealtimeSubscribeToken(
     owner: claims.owner,
     orgId: claims.orgId,
     exp: claims.exp,
+    absExp: claims.absExp,
   };
 }
 

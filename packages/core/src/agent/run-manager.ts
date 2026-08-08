@@ -11,6 +11,10 @@ import {
 } from "./engine/error-detail.js";
 import { EngineError } from "./engine/types.js";
 import {
+  RUN_HEARTBEAT_INTERVAL_MS,
+  resolveRunProducerState,
+} from "./run-producer-state.js";
+import {
   insertRun,
   insertRunEvent,
   updateRunStatusIfRunning,
@@ -41,6 +45,14 @@ import {
 import { isContinuationTerminalReason } from "./types.js";
 import type { AgentChatEvent, RunEvent, RunStatus } from "./types.js";
 
+export {
+  RUN_HEARTBEAT_INTERVAL_MS,
+  RUN_PRODUCER_SILENT_MS,
+  resolveRunProducerState,
+  type RunProducerSnapshot,
+  type RunProducerState,
+} from "./run-producer-state.js";
+
 export interface ActiveRun {
   runId: string;
   threadId: string;
@@ -62,6 +74,20 @@ export interface ActiveRun {
     { type: "auto_continue" }
   >;
   startedAt: number;
+  /**
+   * When the run's own periodic timer last fired, stamped from inside that
+   * timer's callback.
+   *
+   * This map is isolate-global but a run's EXECUTION belongs to the request
+   * context that started it: on Workers, when that request goes away workerd
+   * cancels its continuations and timers, and the entry is left here reading
+   * `status: "running"` forever. A number stamped by the timer is the only
+   * thing in the entry that stops being true when that happens — and unlike
+   * the run's promises it can be read from another request context, which is
+   * the same reason `server/cross-request-init.ts` polls a flag instead of
+   * awaiting a foreign promise.
+   */
+  lastProducerTickAt: number;
 }
 
 export interface StartedRun extends ActiveRun {
@@ -296,6 +322,41 @@ export const SQL_SUBSCRIPTION_ACTIVE_GRACE_MS = 2_000;
 /** Keep terminal/status probes at the historical cadence to bound DB work. */
 export const SQL_SUBSCRIPTION_STATUS_POLL_MS = 500;
 
+/**
+ * Consecutive empty polls before the IDLE cadence starts decaying toward
+ * `SQL_SUBSCRIPTION_IDLE_MAX_POLL_MS`.
+ *
+ * The active grace already covers a streaming producer, so decay only ever
+ * applies to a subscriber watching a run that is producing nothing: a long tool
+ * call, a slow first token, or a wedged producer. Those cost one poll per
+ * 500ms each, forever, per subscriber — the single largest source of idle
+ * `agent_run_events` reads.
+ */
+export const SQL_SUBSCRIPTION_IDLE_DECAY_AFTER_POLLS = 4;
+
+/**
+ * Ceiling for the decayed idle cadence. Bounds the WORST-CASE added latency to
+ * the next token a quiet run eventually produces; a row already waiting when the
+ * timer fires is delivered immediately, so this is not added to a streaming run.
+ */
+export const SQL_SUBSCRIPTION_IDLE_MAX_POLL_MS = 2_000;
+
+/**
+ * Cadence for the opportunistic `reapIfStale` probe inside the SSE poll loop,
+ * kept SEPARATE from (and much slower than) the status probe next to it.
+ *
+ * A reap can only ever act on a run whose liveness basis is older than the
+ * tightest staleness window any sweep enforces — `RUN_STALE_MS`, 15s — so
+ * running it on the 500ms status cadence issued ~30 rounds of
+ * `reconcileTerminalRunFromEvents` + reap-eligibility queries (2-4 round trips
+ * each) before the first one could possibly match a row. This cadence still
+ * detects a stale producer well inside the client's own idle timeout while
+ * cutting that probe traffic ~10x. `getRunById` deliberately stays on the fast
+ * status cadence: it is one indexed read and it is what closes the stream on a
+ * NORMAL finish, which must stay prompt.
+ */
+export const SQL_SUBSCRIPTION_REAP_POLL_MS = 5_000;
+
 /** Initial retry delay after a transient cross-isolate SQL polling failure. */
 export const SQL_SUBSCRIPTION_RETRY_BASE_MS = 250;
 
@@ -308,10 +369,44 @@ export const SQL_SUBSCRIPTION_RETRY_MAX_MS = 2_000;
 export function resolveSqlSubscriptionPollMs(
   now: number,
   activePollUntil: number,
+  consecutiveEmptyPolls = 0,
 ): number {
-  return now < activePollUntil
-    ? SQL_SUBSCRIPTION_ACTIVE_POLL_MS
-    : SQL_SUBSCRIPTION_IDLE_POLL_MS;
+  if (now < activePollUntil) return SQL_SUBSCRIPTION_ACTIVE_POLL_MS;
+  // Clamped before exponentiation: an unbounded `2 ** steps` reaches Infinity
+  // and would make the cap the only thing keeping this finite.
+  const steps = Math.min(
+    16,
+    Math.max(
+      0,
+      Math.floor(consecutiveEmptyPolls) -
+        SQL_SUBSCRIPTION_IDLE_DECAY_AFTER_POLLS,
+    ),
+  );
+  return Math.min(
+    SQL_SUBSCRIPTION_IDLE_MAX_POLL_MS,
+    SQL_SUBSCRIPTION_IDLE_POLL_MS * 2 ** steps,
+  );
+}
+
+/**
+ * Advance the empty-poll counter that drives `resolveSqlSubscriptionPollMs`'s
+ * decay.
+ *
+ * Only IDLE polls count. Counting the ~16 fast polls inside the active grace
+ * window would push the ladder to its cap the instant the grace expired, so a
+ * producer that pauses a few seconds between tokens would resume at the 2s cap
+ * instead of 500ms — a visible mid-stream stutter rather than the intended
+ * "this run has gone quiet" backoff.
+ */
+export function nextSqlSubscriptionEmptyPolls(
+  current: number,
+  hadEvents: boolean,
+  now: number,
+  activePollUntil: number,
+): number {
+  if (hadEvents) return 0;
+  if (now < activePollUntil) return current;
+  return current + 1;
 }
 
 export function resolveSqlSubscriptionRetryMs(
@@ -722,6 +817,7 @@ export function startRun(
     subscribers: new Set(),
     abort,
     startedAt: Date.now(),
+    lastProducerTickAt: Date.now(),
     finalized,
   };
 
@@ -735,6 +831,7 @@ export function startRun(
   ) => {
     captureError(error, {
       route: "/_agent-native/agent-chat",
+      aiTraceId: runId,
       tags: {
         source: "agent-run-manager",
         phase,
@@ -1022,6 +1119,7 @@ export function startRun(
               phase: "abort-check",
               consecutiveFailures: String(consecutiveAbortCheckFailures),
             },
+            aiTraceId: runId,
             extra: { runId, threadId },
           });
           if (!abort.signal.aborted) {
@@ -1046,6 +1144,11 @@ export function startRun(
   // still run every tick (they don't touch the DB on the hot path).
   let heartbeatInFlight = false;
   const heartbeatTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    // Stamped before the DB write, not after it: this records that the
+    // producing context is still executing, which stays true through a
+    // database outage. Deriving it from a successful write instead would make
+    // a slow pooler look identical to a cancelled request.
+    run.lastProducerTickAt = Date.now();
     if (!heartbeatInFlight) {
       heartbeatInFlight = true;
       updateRunHeartbeat(runId)
@@ -1065,6 +1168,7 @@ export function startRun(
                 phase: "heartbeat",
                 consecutiveFailures: String(consecutiveHeartbeatFailures),
               },
+              aiTraceId: runId,
               extra: { runId, threadId },
             });
           }
@@ -1075,7 +1179,7 @@ export function startRun(
     }
     checkSqlAbort();
     checkNoProgressBackstop();
-  }, 1500);
+  }, RUN_HEARTBEAT_INTERVAL_MS);
   const softTimeoutMs = resolveRunSoftTimeoutMs(options?.softTimeoutMs, {
     useHostedDefault: options?.useHostedSoftTimeoutDefault === true,
     backgroundFunction: options?.backgroundFunction === true,
@@ -1108,6 +1212,7 @@ export function startRun(
     const errorCode = getRunErrorCode(error);
     captureError(error, {
       route: "/_agent-native/agent-chat",
+      aiTraceId: runId,
       tags: {
         source: "agent-run-manager",
         phase,
@@ -1560,7 +1665,14 @@ export function subscribeToRun(
   fromSeq: number,
 ): ReadableStream<Uint8Array> | null {
   const run = activeRuns.get(runId);
-  if (run) {
+  // A producer-lost entry has a buffer that will never grow and a terminal
+  // event that will never be sent, so an in-memory subscriber waits forever on
+  // a run nothing is executing. Route it to the durable path instead, which
+  // observes whatever actually becomes of the row (the stale reaper's terminal
+  // write, or a successor claiming the turn). Deliberately NOT a synthesized
+  // terminal event here: this isolate knows the producer is gone, which is not
+  // the same as knowing how the run ended.
+  if (run && resolveRunProducerState(run) !== "producer-lost") {
     return subscribeInMemory(run, fromSeq);
   }
   // Not in local memory — try SQL (cross-isolate path)
@@ -1653,7 +1765,9 @@ function subscribeFromSQL(
       let lastSeq = fromSeq;
       let activePollUntil = 0;
       let lastStatusCheckAt = 0;
+      let lastReapCheckAt = 0;
       let consecutivePollFailures = 0;
+      let consecutiveEmptyPolls = 0;
       const ping = () => {
         try {
           controller.enqueue(encoder.encode(`: ping ${Date.now()}\n\n`));
@@ -1686,6 +1800,7 @@ function subscribeFromSQL(
         };
         captureError(error, {
           route: "/_agent-native/agent-chat/runs/:id/events",
+          aiTraceId: runId,
           tags: {
             source: "agent-run-manager",
             phase: "sql-subscription-poll",
@@ -1713,6 +1828,12 @@ function subscribeFromSQL(
         try {
           // Read new events from SQL
           const events = await getRunEventsSince(runId, lastSeq);
+          consecutiveEmptyPolls = nextSqlSubscriptionEmptyPolls(
+            consecutiveEmptyPolls,
+            events.length > 0,
+            Date.now(),
+            activePollUntil,
+          );
           if (events.length > 0) {
             activePollUntil = Date.now() + SQL_SUBSCRIPTION_ACTIVE_GRACE_MS;
           }
@@ -1756,6 +1877,7 @@ function subscribeFromSQL(
                 const pollMs = resolveSqlSubscriptionPollMs(
                   now,
                   activePollUntil,
+                  consecutiveEmptyPolls,
                 );
                 pollTimer = setTimeout(poll, pollMs);
               }
@@ -1764,8 +1886,14 @@ function subscribeFromSQL(
             lastStatusCheckAt = now;
             // Opportunistically reap a stale producer before trusting SQL's
             // "running" status — otherwise a crashed server leaves us polling
-            // forever.
-            await reapIfStale(runId).catch(() => {});
+            // forever. Throttled independently of the status probe below: a reap
+            // cannot match a row younger than RUN_STALE_MS, so running it at the
+            // status cadence was ~30 rounds of wasted round trips per run before
+            // the first one could do anything. See SQL_SUBSCRIPTION_REAP_POLL_MS.
+            if (now - lastReapCheckAt >= SQL_SUBSCRIPTION_REAP_POLL_MS) {
+              lastReapCheckAt = now;
+              await reapIfStale(runId).catch(() => {});
+            }
             const run = await getRunById(runId);
             if (!run || run.status !== "running") {
               // Run ended — do one final event read, then close
@@ -1901,6 +2029,7 @@ function subscribeFromSQL(
             const pollMs = resolveSqlSubscriptionPollMs(
               Date.now(),
               activePollUntil,
+              consecutiveEmptyPolls,
             );
             pollTimer = setTimeout(poll, pollMs);
           }
@@ -1930,6 +2059,10 @@ function subscribeFromSQL(
 }
 
 /** Get the active run for a thread (if any) — checks memory then SQL */
+/**
+ * The in-memory entry for a thread, unclassified — see `getRun` on why that
+ * matters. `getActiveRunForThreadAsync` is the reader that applies the policy.
+ */
 export function getActiveRunForThread(threadId: string): ActiveRun | null {
   const runId = threadToRun.get(threadId);
   if (runId) {
@@ -2024,7 +2157,18 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
   // that still have events in memory. This allows sub-agent tabs to replay
   // the full conversation from completed runs via SSE.
   const memRun = getActiveRunForThread(threadId);
-  if (memRun && (memRun.status === "running" || memRun.events.length > 0)) {
+  // Every answer this branch gives rests on "in-memory means this isolate is
+  // the producer" — most visibly `heartbeatAt: Date.now()`, which is not read
+  // from anywhere, it is asserted. For a producer-lost entry that assertion
+  // manufactures a heartbeat fresher than the durable one and disarms both the
+  // client's stuck-detector and the reaper that was about to terminalize the
+  // row. Fall through to SQL, which is still being written for this run.
+  const memProducerState = memRun ? resolveRunProducerState(memRun) : null;
+  if (
+    memRun &&
+    memProducerState !== "producer-lost" &&
+    (memRun.status === "running" || memRun.events.length > 0)
+  ) {
     const sqlSnapshot = await fetchRunThreadSnapshot(memRun.runId, threadId);
 
     // FIX 1 (durable-background incident): a terminal in-memory run (chunk
@@ -2272,20 +2416,39 @@ async function fetchNewerNonTerminalRunForSameTurn(
   }
 }
 
-/** Get a run by ID */
+/**
+ * Get a run by ID.
+ *
+ * A raw registry lookup: the entry may be one whose producing request context
+ * has gone away. Callers reading it for identity (which thread, which turn) are
+ * fine; callers reading it for LIVENESS must classify it with
+ * `resolveRunProducerState` first.
+ */
 export function getRun(runId: string): ActiveRun | null {
   return activeRuns.get(runId) ?? null;
 }
 
 function abortRunInMemory(runId: string, reason: string): boolean {
   const run = activeRuns.get(runId);
-  if (run) {
-    abortInMemoryRun(run, reason);
-  }
-  return !!run;
+  if (!run) return false;
+  // Clean the entry up either way — it is this isolate's to drop. But a
+  // producer-lost entry had nothing executing behind it, so reporting that we
+  // stopped a run here would be the same presence-means-liveness answer the
+  // readers above were giving. What actually stops such a run is the durable
+  // marker the callers below write.
+  const wasProducing = resolveRunProducerState(run) === "in-flight";
+  abortInMemoryRun(run, reason);
+  return wasProducing;
 }
 
-/** Explicitly abort a run (e.g. Stop button). */
+/**
+ * Explicitly abort a run (e.g. Stop button).
+ *
+ * The boolean says a LIVE run was stopped in this isolate, not that an entry
+ * was found — a producer-lost entry answers false. Either way the durable
+ * marker below is what a run in another isolate, or one nothing is executing,
+ * is actually stopped by.
+ */
 export function abortRun(runId: string, reason: string = "user"): boolean {
   const abortedInMemory = abortRunInMemory(runId, reason);
   // Also mark as aborted in SQL (for cross-isolate abort on Workers)
@@ -2313,6 +2476,7 @@ export async function abortRunDurably(
     // the request report the abort it did complete.
     captureError(error, {
       route: "/_agent-native/agent-chat/runs/:id/abort",
+      aiTraceId: runId,
       tags: {
         source: "agent-run-manager",
         phase: "abort-run",
@@ -2356,6 +2520,7 @@ export async function abortTurnDurably(
     // visible rather than silent.
     captureError(error, {
       route: "/_agent-native/agent-chat/runs/:id/abort",
+      aiTraceId: runId,
       tags: { source: "agent-run-manager", phase: "abort-turn" },
       extra: { runId, reason, ...ref },
     });

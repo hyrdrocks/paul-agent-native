@@ -1,5 +1,5 @@
 import type { H3Event } from "h3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   BUILDER_CONNECT_PARAM,
@@ -681,6 +681,29 @@ describe("runDbHealthProbe", () => {
     expect(result.ms).toBeGreaterThanOrEqual(0);
   });
 
+  it("answers within a deadline when the query HANGS, and says so distinctly", async () => {
+    // The docs site's health route hung 20-40s on an unbounded `SELECT 1`
+    // until the CDN 502'd. Its keep-warm cron then failed every minute, the
+    // function stayed permanently cold, and every cache miss paid a ~10x cold
+    // start. The contract says "always resolves"; this pins it.
+    vi.useFakeTimers();
+    try {
+      const probe = runDbHealthProbe(() => ({
+        execute: () => new Promise<never>(() => {}), // never settles
+      }));
+      await vi.advanceTimersByTimeAsync(6_000);
+      const result = await probe;
+      expect(result.ok).toBe(true);
+      expect(result.db).toBe(false);
+      // A hang is NOT the same as "no database" — folding them together is the
+      // coercion this repo bans, and it is why nobody could tell the docs site
+      // apart from an app that simply has no DB.
+      expect(result.dbTimedOut).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("stays live with db:false when the query throws (no DB / unreachable)", async () => {
     const result = await runDbHealthProbe(() => ({
       execute: async () => {
@@ -689,5 +712,45 @@ describe("runDbHealthProbe", () => {
     }));
     expect(result.ok).toBe(true);
     expect(result.db).toBe(false);
+  });
+});
+
+describe("createCoreRoutesPlugin speculation-rules mount", () => {
+  afterEach(() => {
+    delete (globalThis as any).__cf_env;
+    vi.unstubAllEnvs();
+  });
+
+  function createNitroApp() {
+    return {
+      h3: { "~middleware": [] as Array<{ route?: string }> },
+      hooks: { hook: () => {}, callHook: () => {} },
+    };
+  }
+
+  function mountedRoutes(nitroApp: any): string[] {
+    return [
+      ...((nitroApp._agentNativeFrameworkMountPaths as Set<string>) ?? []),
+    ];
+  }
+
+  it("mounts speculation-rules before init runs, on Workers", async () => {
+    // `framework-request-handler` short-circuits this path to "ready" without
+    // waiting for anything, on the stated invariant that core-routes has
+    // already mounted it. On Workers the rest of this plugin's body is deferred
+    // into the first request (`trackPluginInit` returns early there), so a
+    // mount that lives inside that body does not exist when the short-circuit
+    // fires — and the one fetch that must not wait 404s instead. Registering an
+    // h3 handler is not I/O, so the mount is safe at isolate scope where
+    // workerd refuses I/O outright; this pins it there.
+    (globalThis as any).__cf_env = {};
+    const { createCoreRoutesPlugin } = await import("./core-routes-plugin.js");
+    const nitroApp = createNitroApp();
+
+    (createCoreRoutesPlugin() as any)(nitroApp);
+
+    expect(mountedRoutes(nitroApp)).toContain(
+      "/_agent-native/speculation-rules.json",
+    );
   });
 });

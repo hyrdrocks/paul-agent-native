@@ -2,19 +2,22 @@ import crypto from "node:crypto";
 
 import { setResponseHeader, setResponseStatus } from "h3";
 
+import { isDurableBackgroundTarget } from "../agent/background-transports.js";
 import {
   AGENT_BACKGROUND_PROCESSOR_A2A,
   AGENT_BACKGROUND_PROCESSOR_FIELD,
-  dispatchPathTargetsNetlifyBackgroundFunction,
   isAgentChatDurableBackgroundEnabled,
-  resolveAgentChatProcessRunDispatchPath,
+  resolveBackgroundDispatchTarget,
 } from "../agent/durable-background.js";
 import { trackingIdentityProperties } from "../observability/tracking-identity.js";
 import { getA2ASecretByDomain } from "../org/context.js";
 import { findWorkspaceDispatchAgent } from "../server/agent-discovery.js";
 import { withConfiguredAppBasePath } from "../server/app-base-path.js";
 import { getOrigin, isConfiguredAppOrigin } from "../server/google-oauth.js";
-import { fireInternalDispatch } from "../server/self-dispatch.js";
+import {
+  fireBackgroundDispatch,
+  fireInternalDispatch,
+} from "../server/self-dispatch.js";
 import { agentChat } from "../shared/agent-chat.js";
 import { track } from "../tracking/registry.js";
 import {
@@ -293,11 +296,14 @@ async function fireProcessTaskDispatch(
   taskId: string,
   config: A2AConfig,
 ): Promise<void> {
-  const backgroundPath = resolveAgentChatProcessRunDispatchPath();
+  // The durable worker is reachable on whichever registered transport this host
+  // has; the in-process route is the portable one this function already falls
+  // back to.
+  const backgroundTarget = resolveBackgroundDispatchTarget();
   const useBackgroundWorker =
     isAgentChatDurableBackgroundEnabled({
       appOptIn: config.durableBackgroundRuns,
-    }) && dispatchPathTargetsNetlifyBackgroundFunction(backgroundPath);
+    }) && isDurableBackgroundTarget(backgroundTarget);
 
   if (!useBackgroundWorker) {
     await fireInternalDispatch({
@@ -312,9 +318,9 @@ async function fireProcessTaskDispatch(
     // A real Netlify background function acknowledges the enqueue quickly.
     // Await that acknowledgement so a missing or rejected worker can fall
     // back before the task is left in `working` with no processor.
-    await fireInternalDispatch({
+    await fireBackgroundDispatch({
       event,
-      path: backgroundPath,
+      target: backgroundTarget,
       taskId,
       body: {
         [AGENT_BACKGROUND_PROCESSOR_FIELD]: AGENT_BACKGROUND_PROCESSOR_A2A,
@@ -795,20 +801,19 @@ async function handleSend(
   if (!asyncMode) idempotencyKey = undefined;
 
   if (asyncMode) {
-    // Refuse async mode entirely when no auth is configured in production.
-    // The async dispatch path self-fires the `_process-task` route, which
-    // accepts unsigned dispatches when A2A_SECRET is unset — that combined
-    // with the lack of caller identity here would let any unauthenticated
-    // attacker queue and trigger handler runs. In production, require some
-    // form of auth so the verifiedEmail is bound to the task.
-    const hasA2ASecret = hasConfiguredA2ASecret();
-    const hasApiKey = !!(config.apiKeyEnv && process.env[config.apiKeyEnv]);
-    if (isA2AProductionRuntime() && !hasA2ASecret && !hasApiKey) {
+    // Refuse async mode entirely without the shared secret in production.
+    // The async dispatch path self-fires the `_process-task` route, which is
+    // authenticated with an internal HMAC signed by A2A_SECRET. A legacy
+    // apiKeyEnv can authenticate the JSON-RPC request, but it cannot
+    // authenticate that internal handoff. Accepting it here would create a
+    // working task that can never start and leaves the caller polling until
+    // its timeout.
+    if (isA2AProductionRuntime() && !hasConfiguredA2ASecret()) {
       return {
         ...jsonRpcError(
           0,
           -32001,
-          "A2A async mode is not available — A2A_SECRET or apiKeyEnv must be configured.",
+          "A2A async mode requires A2A_SECRET for internal processor dispatch; apiKeyEnv only supports synchronous A2A.",
         ),
         _id: 0,
       };

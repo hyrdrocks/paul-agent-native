@@ -21,6 +21,10 @@ describe("db/client dialect detection", () => {
       globalThis as Record<string, unknown>,
       "__AGENT_NATIVE_BACKGROUND_RUNTIME_EXPECTED__",
     );
+    Reflect.deleteProperty(
+      globalThis as Record<string, unknown>,
+      "__AGENT_NATIVE_LOW_CONNECTION_BACKGROUND_RUNTIME__",
+    );
     Reflect.deleteProperty(globalThis as Record<string, unknown>, "__env__");
     vi.resetModules();
   });
@@ -102,23 +106,33 @@ describe("db/client dialect detection", () => {
 
   it("keeps the Neon foreground pool small on serverless", async () => {
     vi.stubEnv("NETLIFY", "true");
-    const { neonPoolMax, pgPoolOptions, isBackgroundFunctionPoolContext } =
-      await import("./client.js");
+    const {
+      neonPoolMax,
+      neonPoolOptions,
+      pgPoolOptions,
+      isBackgroundFunctionPoolContext,
+    } = await import("./client.js");
 
     expect(isBackgroundFunctionPoolContext()).toBe(false);
     // Small enough that many warm instances stay under the provider's cap, but
     // above 1 so a request's concurrent reads don't serialize behind one slot.
-    expect(neonPoolMax()).toBe(4);
-    expect(neonPoolMax()).toBeLessThan(8);
-    expect(pgPoolOptions("postgres://example.test/db").max).toBe(4);
+    expect(neonPoolMax()).toBe(2);
+    expect(neonPoolMax()).toBeLessThan(4);
+    expect(pgPoolOptions("postgres://example.test/db").max).toBe(2);
+    expect(neonPoolOptions()).toMatchObject({
+      max: 2,
+      idle_in_transaction_session_timeout: 30_000,
+    });
+    expect(pgPoolOptions("postgres://example.test/db").connection).toEqual({
+      idle_in_transaction_session_timeout: 30_000,
+    });
   });
 
   it("keeps the foreground pool when only the dispatch marker (expected, not landed) is set", async () => {
     // The marker records which URL the foreground TARGETED, not where the
-    // request landed. A misrouted worker on the ~60s sync function must NOT
-    // take the 8-connection background pool (it runs as one of many warm
-    // instances and would exhaust the Neon pooler → connection terminated →
-    // failed heartbeat → stale_run). Only proof-of-landing unlocks the big pool.
+    // request landed. A misrouted worker on the ~60s sync function must not
+    // change its pool policy before the runtime proves that it landed on the
+    // dedicated worker.
     vi.stubEnv("NETLIFY", "true");
     (
       globalThis as Record<string, unknown>
@@ -128,10 +142,10 @@ describe("db/client dialect detection", () => {
       await import("./client.js");
 
     expect(isBackgroundFunctionPoolContext()).toBe(false);
-    expect(neonPoolMax()).toBe(4);
+    expect(neonPoolMax()).toBe(2);
   });
 
-  it("uses the background Neon pool when the -background function marked the runtime at cold start", async () => {
+  it("keeps the background Neon pool bounded when the worker proves its runtime", async () => {
     vi.stubEnv("NETLIFY", "true");
     (
       globalThis as Record<string, unknown>
@@ -141,7 +155,163 @@ describe("db/client dialect detection", () => {
       await import("./client.js");
 
     expect(isBackgroundFunctionPoolContext()).toBe(true);
-    expect(neonPoolMax()).toBe(8);
+    expect(neonPoolMax()).toBe(4);
+  });
+
+  it("uses one connection for scheduled background workers", async () => {
+    vi.stubEnv("NETLIFY", "true");
+    const runtime = globalThis as Record<string, unknown>;
+    runtime.__AGENT_NATIVE_BACKGROUND_RUNTIME__ = true;
+    runtime.__AGENT_NATIVE_LOW_CONNECTION_BACKGROUND_RUNTIME__ = true;
+
+    const { neonPoolMax, pgPoolOptions } = await import("./client.js");
+
+    expect(neonPoolMax()).toBe(1);
+    expect(pgPoolOptions("postgres://example.test/db").max).toBe(1);
+  });
+});
+
+describe("db/client dialect capabilities", () => {
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    Reflect.deleteProperty(globalThis as Record<string, unknown>, "__env__");
+    Reflect.deleteProperty(globalThis as Record<string, unknown>, "__cf_env");
+    vi.resetModules();
+  });
+
+  it("reports interactive transaction support for URL-configured dialects", async () => {
+    vi.stubEnv("DATABASE_URL", "postgres://user:pass@host:5432/db");
+    const { supportsInteractiveTransactions } = await import("./client.js");
+    expect(supportsInteractiveTransactions()).toBe(true);
+  });
+
+  it("reports interactive transaction support for a local SQLite file", async () => {
+    vi.stubEnv("DATABASE_URL", "file:./data/app.db");
+    const { supportsInteractiveTransactions } = await import("./client.js");
+    expect(supportsInteractiveTransactions()).toBe(true);
+  });
+
+  it("reports no interactive transaction support on D1", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    (globalThis as Record<string, unknown>).__env__ = {
+      DB: { prepare: vi.fn() },
+    };
+    const { getDialect, supportsInteractiveTransactions } =
+      await import("./client.js");
+
+    expect(getDialect()).toBe("d1");
+    // Named for the interactive form only: D1 still runs a fixed statement
+    // list atomically through batch().
+    expect(supportsInteractiveTransactions()).toBe(false);
+  });
+
+  it("carries a human-readable label on the dialect", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    (globalThis as Record<string, unknown>).__env__ = {
+      DB: { prepare: vi.fn() },
+    };
+    const { getDialectLabel } = await import("./client.js");
+    expect(getDialectLabel()).toBe("Cloudflare D1");
+  });
+
+  it("labels a URL-less local database as the SQLite file it is", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    const { getDialectLabel } = await import("./client.js");
+    expect(getDialectLabel()).toBe("SQLite (local file)");
+  });
+
+  it("separates a platform-bound dialect from one whose url came from elsewhere", async () => {
+    // Netlify's managed url is not on DATABASE_URL, so "no DATABASE_URL" and
+    // "configured by a binding" are different facts.
+    vi.stubEnv("DATABASE_URL", "");
+    vi.stubEnv("NETLIFY_DATABASE_URL", "postgres://netlify.example/db");
+    const { isPlatformBoundDialect } = await import("./client.js");
+    expect(isPlatformBoundDialect()).toBe(false);
+  });
+
+  it("reports a binding-configured dialect as platform-bound", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    (globalThis as Record<string, unknown>).__env__ = {
+      DB: { prepare: vi.fn() },
+    };
+    const { isPlatformBoundDialect } = await import("./client.js");
+    expect(isPlatformBoundDialect()).toBe(true);
+  });
+});
+
+describe("createPlatformBoundDbClient", () => {
+  const runtime = globalThis as Record<string, any>;
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    delete runtime.__cf_env;
+    delete runtime.__env__;
+    vi.resetModules();
+  });
+
+  it("returns nothing when the dialect is configured by a URL", async () => {
+    vi.stubEnv("DATABASE_URL", "file:./data/app.db");
+    const { createPlatformBoundDbClient } = await import("./client.js");
+    await expect(createPlatformBoundDbClient({})).resolves.toBeUndefined();
+  });
+
+  it("refuses to hand back a binding on a URL-configured dialect", async () => {
+    vi.stubEnv("DATABASE_URL", "file:./data/app.db");
+    const { platformBoundDbBinding } = await import("./client.js");
+    // Reaching for the binding here would report a product this process is
+    // not running on.
+    expect(() => platformBoundDbBinding()).toThrow(
+      /no platform binding to resolve/,
+    );
+  });
+
+  it("builds a client for a binding-configured dialect", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    runtime.__cf_env = { DB: { prepare: vi.fn(() => ({})) } };
+    const { createPlatformBoundDbClient } = await import("./client.js");
+
+    const client = await createPlatformBoundDbClient({});
+    expect(client?.drizzleProvider).toBe("sqlite");
+    expect(client?.db).toBeTruthy();
+  });
+
+  it("names the missing binding instead of failing inside a native stub", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    runtime.__cf_env = { DB: { prepare: vi.fn(() => ({})) } };
+    const { platformBoundDbBinding } = await import("./client.js");
+    const binding = platformBoundDbBinding() as { prepare?: unknown };
+    delete runtime.__cf_env;
+
+    expect(() => binding.prepare).toThrow(
+      /no D1 database is bound to `env.DB`/,
+    );
+  });
+
+  it("follows the binding of the invocation making the call", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    const first = { prepare: vi.fn(() => "first") };
+    const second = { prepare: vi.fn(() => "second") };
+    runtime.__cf_env = { DB: first };
+    const { platformBoundDbBinding } = await import("./client.js");
+
+    // Resolved once, as a cached client does when it is built.
+    const binding = platformBoundDbBinding() as { prepare: () => string };
+    expect(binding.prepare()).toBe("first");
+
+    runtime.__cf_env = { DB: second };
+    expect(binding.prepare()).toBe("second");
+    expect(first.prepare).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1056,6 +1226,49 @@ describe("Neon foreground statement budgets", () => {
       "COMMIT",
     ]);
     expect(client.release).toHaveBeenCalledWith(undefined);
+  });
+
+  it("discards a connection when transaction rollback fails", async () => {
+    vi.stubEnv("NETLIFY", "true");
+    const transactionError = Object.assign(new Error("lock timeout"), {
+      code: "55P03",
+    });
+    const rollbackError = new Error("connection closed");
+    const query = vi.fn(async (sql: string) => {
+      if (sql === "ROLLBACK") throw rollbackError;
+      return { rows: [], rowCount: 0 };
+    });
+    const client = {
+      query,
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn(async () => client),
+      end: vi.fn(async () => {}),
+      on: vi.fn(),
+    };
+    const Pool = vi.fn(function MockPool() {
+      return pool;
+    });
+    vi.doMock("@neondatabase/serverless", () => ({
+      Pool,
+      neon: vi.fn(),
+      neonConfig: {},
+    }));
+
+    const { createDbExec } = await import("./client.js");
+    const exec = await createDbExec({
+      url: "postgresql://user:pass@ep-test.us-east-1.aws.neon.tech/db",
+    });
+
+    await expect(
+      exec.transaction?.(async () => {
+        throw transactionError;
+      }),
+    ).rejects.toBe(transactionError);
+
+    expect(query.mock.calls.map(([sql]) => sql)).toEqual(["BEGIN", "ROLLBACK"]);
+    expect(client.release).toHaveBeenCalledWith(true);
   });
 });
 

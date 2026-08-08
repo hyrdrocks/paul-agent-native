@@ -19,13 +19,16 @@
  * GUARDRAIL: when `isAgentChatDurableBackgroundEnabled()` returns false, the
  * agent-chat handler must behave byte-for-byte like the current synchronous
  * path. The gate is true only when ALL of these hold:
- *   1. The runtime is a deployed Netlify app and
- *      `AGENT_CHAT_DURABLE_BACKGROUND` is not explicitly disabled, or the
+ *   1. The runtime is a deployed Netlify app or the Cloudflare Workers runtime
+ *      and `AGENT_CHAT_DURABLE_BACKGROUND` is not explicitly disabled, or the
  *      existing env/app opt-in path is used on another hosted platform. Netlify
- *      deploys emit the background function by default; `false`, `0`, `no`, or
- *      `off` disables it.
- *   2. The runtime is hosted/serverless (local dev keeps the inline path so SSE
- *      stays a single live stream and no second function is needed).
+ *      deploys emit the background function by default and Workers is default-on
+ *      for the same reason it is hosted; `false`, `0`, `no`, or `off` disables
+ *      it.
+ *   2. The runtime is hosted/serverless (Node local dev keeps the inline path so
+ *      SSE stays a single live stream and no second function is needed; the
+ *      LOCAL Worker runtime is hosted, because it is the real Worker runtime
+ *      under the same constraints).
  *   3. `A2A_SECRET` is configured (the HMAC handoff is required to authenticate
  *      the background dispatch; without it the dispatch can't be trusted).
  *
@@ -45,6 +48,18 @@ import {
   extractBearerToken,
   verifyInternalToken,
 } from "../integrations/internal-token.js";
+import { isCloudflareRuntime } from "../shared/runtime.js";
+import {
+  type BackgroundDispatchTarget,
+  INLINE_ROUTE_TRANSPORT_ID,
+  resolveRegisteredBackgroundTarget,
+} from "./background-transports.js";
+// Side-effect import: the transports must be registered before the resolver
+// below can ask them anything. Nothing this module answers may depend on
+// whether some *other* importer happened to load the barrel first — see
+// `hosts/index.ts`. Adapters import back into this module for shared
+// constants, so nothing there may read one at module-evaluation time.
+import "../hosts/index.js";
 
 /**
  * Framework route the background function actually runs — sibling to
@@ -99,7 +114,7 @@ export const AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD =
  * dispatch to the right per-app function url. Returns `null` when no workspace
  * app id is configured (single-template deploy).
  */
-function resolveWorkspaceBackgroundFunctionUrlPath(): string | null {
+export function resolveWorkspaceBackgroundFunctionUrlPath(): string | null {
   const raw = process.env.AGENT_NATIVE_WORKSPACE_APP_ID;
   if (typeof raw !== "string") return null;
   // Mirror the workspace app-id normalization (resources/store.ts): take the
@@ -110,73 +125,116 @@ function resolveWorkspaceBackgroundFunctionUrlPath(): string | null {
   return `/.netlify/functions/${candidate}-agent-background`;
 }
 
-function isNetlifyHostedRuntimeForDispatch(): boolean {
-  if (process.env.NETLIFY_LOCAL === "true") return false;
-  if (process.env.NETLIFY === "false") return false;
-  if (process.env.NETLIFY && process.env.NETLIFY !== "false") return true;
-  // NETLIFY is a build-only read-only variable. In deployed Functions Netlify
-  // documents URL, SITE_NAME, and SITE_ID as the runtime read-only variables;
-  // SITE_ID is the unambiguous host marker. Lambda compatibility mode also
-  // exposes AWS runtime variables, so keep the function-name fallback for older
-  // deploys. Without either check a modern Netlify Function silently selects the
-  // portable framework route even though the emitted background function exists.
-  if (process.env.SITE_ID) return true; // guard:allow-env-credential - Netlify's read-only public site identifier is a runtime host marker, not a user credential.
-  // Non-Netlify AWS falls back inline if the /.netlify/functions dispatch
-  // fast-fails.
-  return Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+export type { BackgroundDispatchTarget } from "./background-transports.js";
+
+/**
+ * Resolve where the foreground POST should self-dispatch the chat background
+ * worker — the single resolver for that decision.
+ *
+ * `durableBackground: false` is a caller opt-out, not a host fact: the
+ * continuation self-chain runs on the regular function unless the run was
+ * already handed to the durable worker, so it resolves here, before any
+ * transport is consulted, and never reaches the registry at all.
+ *
+ * Everything else is the registry's answer: each registered transport is asked,
+ * in its own declared priority order, whether it is available in this process.
+ * A host that has one gets it; a process where none is gets the portable
+ * in-process route, which is the same isolate and the same clamp — no long
+ * budget is implied. `fallbackPath` belongs to that route alone: it is the
+ * caller's own processor route, not something a host can supply, which is why
+ * an available transport ignores it.
+ */
+export function resolveBackgroundDispatchTarget(options?: {
+  fallbackPath?: string;
+  durableBackground?: boolean;
+}): BackgroundDispatchTarget {
+  const inlineRoute: BackgroundDispatchTarget = {
+    kind: INLINE_ROUTE_TRANSPORT_ID,
+    path: options?.fallbackPath ?? AGENT_CHAT_PROCESS_RUN_PATH,
+    expectsBackgroundRuntime: false,
+  };
+  if (options?.durableBackground === false) return inlineRoute;
+  return resolveRegisteredBackgroundTarget() ?? inlineRoute;
+}
+
+export const WORKERS_QUEUE_TRANSPORT_MISSING_NOTICE_KEY =
+  "__AGENT_NATIVE_WORKERS_QUEUE_TRANSPORT_MISSING_NOTICE__";
+
+export const WORKERS_QUEUE_UNCLAIMED_NOTICE_KEY =
+  "__AGENT_NATIVE_WORKERS_QUEUE_UNCLAIMED_NOTICE__";
+
+/**
+ * The queue accepted the message and no consumer ever claimed the run.
+ *
+ * This is NOT the same condition as a failed send, and must never be collapsed
+ * into it: a send that fails is a known state with a working fallback, while a
+ * send that succeeds into a void is an undiagnosable deploy defect — the
+ * consumer registration missing from the deployed Worker, or a consumer wired
+ * to a different queue than the producer. The circuit breaker still recovers
+ * the run inline (so the user gets a working turn), which is exactly why
+ * nothing else would ever surface this. Announce it once per isolate.
+ */
+export function reportUnclaimedQueueBackgroundRunOnce(detail: string): void {
+  const scope = globalThis as Record<string, unknown>;
+  if (scope[WORKERS_QUEUE_UNCLAIMED_NOTICE_KEY] === true) return;
+  scope[WORKERS_QUEUE_UNCLAIMED_NOTICE_KEY] = true;
+  console.error(
+    "[agent-chat] the durable background run was accepted by the Cloudflare queue but NO " +
+      "consumer claimed it within grace, so it was recovered inline under the foreground " +
+      "clamp — the long budget was lost. The producer binding works, so this is a consumer " +
+      "problem: check that the deployed Worker declares the queue consumer registration " +
+      `emitted by the build and that it names the same queue as the producer. ${detail}`,
+  );
 }
 
 /**
- * Resolve the path the foreground POST should self-dispatch the chat background
- * worker to.
+ * Entry point the generated Cloudflare Worker consumer uses to enter the
+ * per-invocation background scope.
  *
- * GROUNDED IN THE REAL NETLIFY BUILD OUTPUT + THE NETLIFY DOCS DEFAULT-URL RULE:
- * the background function is emitted INTO the scanned dir
- * (`.netlify/functions-internal/server-agent-background`, or per-app
- * `<app>-agent-background` for workspaces) with `export const config = {
- * background: true, ... }` and NO custom `config.path`. Because it has no custom
- * path, Netlify keeps its DEFAULT function url `/.netlify/functions/<name>`, and
- * `background: true` makes any invocation of that url ASYNC (immediate 202,
- * 15-min budget). The Nitro `server` function already excludes `/.netlify/*`
- * from its `/*` catch-all, so the default-url namespace is NEVER shadowed by the
- * synchronous function.
- *
- * Therefore on hosted Netlify the foreground dispatches to the function's DEFAULT
- * url (`/.netlify/functions/<name>`); the function entry then rewrites the
- * incoming pathname to `AGENT_CHAT_PROCESS_RUN_PATH` (base-path-prefixed for
- * workspaces) before delegating to the Nitro router, so the `_process-run`
- * plugin runs with the async 15-min budget. Everywhere else (local dev, `netlify
- * dev`, non-Netlify hosts where no second function exists) there is no second
- * function, so the foreground dispatches to the framework route
- * `AGENT_CHAT_PROCESS_RUN_PATH` and the same in-process catch-all handles it
- * inline. The HMAC token (signed over the runId) is unchanged either way.
- *
- * NOTE: this is the DOC-CORRECT approach. An earlier attempt gave the function a
- * custom `config.path` + a catch-all `excludedPath` patch; the custom path was
- * NOT honored as a route in prod (probe → 404). Using the default function url
- * (no custom path) is what Netlify documents and is simpler — there is nothing
- * to shadow because `/.netlify/*` is already excluded from the `server` catch-all.
+ * The consumer is emitted next to Nitro's bundle by `deploy/build.ts` and is
+ * therefore OUTSIDE this module graph, yet it must enter the very same
+ * AsyncLocalStorage instance this module reads — a second instance would leave
+ * `isInBackgroundFunctionRuntime()` false inside the consumer, and the run
+ * would quietly take the foreground clamp it was handed to the queue to
+ * escape. Publishing the function on `globalThis` is what bridges the two
+ * graphs; the consumer refuses to run the message if it is missing.
  */
-export function resolveAgentChatProcessRunDispatchPath(): string {
-  if (isNetlifyHostedRuntimeForDispatch()) {
-    return (
-      resolveWorkspaceBackgroundFunctionUrlPath() ??
-      AGENT_BACKGROUND_FUNCTION_URL_PATH
+export const BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY =
+  "__AGENT_NATIVE_ENTER_BACKGROUND_INVOCATION_SCOPE__";
+
+(globalThis as Record<string, unknown>)[
+  BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY
+] = runInBackgroundInvocationScope;
+
+/**
+ * Path of a target for the callers still typed on a plain string. A transport
+ * that is not addressed by a url has no path by construction, so throw rather
+ * than substitute one: a caller handed the framework route here would run the
+ * turn inline while reporting a durable handoff — the exact silent degrade this
+ * type exists to make impossible.
+ */
+export function backgroundDispatchPathOrThrow(
+  target: BackgroundDispatchTarget,
+): string {
+  if (target.path == null) {
+    throw new Error(
+      `[agent-chat] durable background resolved to the "${target.kind}" transport, which has no ` +
+        "dispatch path — this caller must consume BackgroundDispatchTarget instead of a path string.",
     );
   }
-  return AGENT_CHAT_PROCESS_RUN_PATH;
+  return target.path;
+}
+
+export function resolveAgentChatProcessRunDispatchPath(): string {
+  return backgroundDispatchPathOrThrow(resolveBackgroundDispatchTarget());
 }
 
 export function resolveDurableBackgroundDispatchPath(
   fallbackPath: string,
 ): string {
-  if (isNetlifyHostedRuntimeForDispatch()) {
-    return (
-      resolveWorkspaceBackgroundFunctionUrlPath() ??
-      AGENT_BACKGROUND_FUNCTION_URL_PATH
-    );
-  }
-  return fallbackPath;
+  return backgroundDispatchPathOrThrow(
+    resolveBackgroundDispatchTarget({ fallbackPath }),
+  );
 }
 
 export function dispatchPathTargetsNetlifyBackgroundFunction(
@@ -208,6 +266,12 @@ export const AGENT_CHAT_BACKGROUND_RUN_FIELD = "__backgroundRun";
  * what "hosted" means.
  */
 export function isHostedRuntimeForDurableBackground(): boolean {
+  // Cloudflare Workers, INCLUDING the local runtime. `NETLIFY_LOCAL` carves out
+  // `netlify dev` because that emulator is a Node server and genuinely is not
+  // the hosted runtime; `wrangler dev` runs the real Worker runtime under the
+  // same constraints, so there is nothing here to carve out. A developer who
+  // wants the inline streaming loop opts out with AGENT_CHAT_DURABLE_BACKGROUND.
+  if (isCloudflareRuntime()) return true;
   if (process.env.NETLIFY_LOCAL === "true") return false;
   if (process.env.NETLIFY === "false") return false;
   if (process.env.SITE_ID) return true; // guard:allow-env-credential -- Netlify's read-only public site identifier is a runtime host marker, not a user credential.
@@ -248,6 +312,71 @@ export function isNetlifyHostedRuntimeForDurableBackground(): boolean {
   );
 }
 
+type AsyncLocalStorageLike<T> = {
+  getStore(): T | undefined;
+  run<R>(store: T, callback: () => R): R;
+};
+
+/**
+ * The store value itself carries nothing: presence IS the signal. Kept as a
+ * frozen singleton so a nested re-entry cannot smuggle a different budget in.
+ */
+const BACKGROUND_INVOCATION_SCOPE = Object.freeze({});
+
+let backgroundInvocationStorage:
+  | AsyncLocalStorageLike<object>
+  | null
+  | undefined;
+
+function getBackgroundInvocationStorage(): AsyncLocalStorageLike<object> | null {
+  if (backgroundInvocationStorage !== undefined) {
+    return backgroundInvocationStorage;
+  }
+  // Resolved through `getBuiltinModule` rather than a static import so this
+  // module stays evaluable in a browser graph.
+  const ctor =
+    typeof process !== "undefined" &&
+    typeof process.getBuiltinModule === "function"
+      ? (process.getBuiltinModule("node:async_hooks")?.AsyncLocalStorage as
+          | (new <T>() => AsyncLocalStorageLike<T>)
+          | undefined)
+      : undefined;
+  backgroundInvocationStorage = ctor ? new ctor<object>() : null;
+  return backgroundInvocationStorage;
+}
+
+/**
+ * Run a background invocation with the long budget scoped to it alone.
+ *
+ * Everything inside this call — and nothing outside it — may take the durable
+ * background budget. Needed on a runtime where one isolate serves concurrent
+ * invocations, because there an isolate-wide marker is readable by a
+ * foreground turn that never earned the long budget.
+ *
+ * Throws when `node:async_hooks` is unavailable. A synchronous stack fallback
+ * would be indistinguishable from success at the call site while leaking the
+ * signal to every concurrent invocation in the isolate: the wrong result this
+ * scope exists to prevent, wearing the shape of a working one. On Workers the
+ * module is available under the `nodejs_compat` flag, which the generated
+ * Worker configuration already forces.
+ */
+export function runInBackgroundInvocationScope<R>(callback: () => R): R {
+  const storage = getBackgroundInvocationStorage();
+  if (!storage) {
+    throw new Error(
+      "[agent-chat] cannot scope the durable background budget to this invocation: " +
+        "node:async_hooks is unavailable. On Cloudflare Workers this means the " +
+        "nodejs_compat compatibility flag is not enabled for this Worker.",
+    );
+  }
+  return storage.run(BACKGROUND_INVOCATION_SCOPE, callback);
+}
+
+/** True when the CURRENT invocation was entered through the scope above. */
+export function isInBackgroundInvocationScope(): boolean {
+  return getBackgroundInvocationStorage()?.getStore() !== undefined;
+}
+
 /**
  * True when THIS process is actually executing inside a Netlify *background*
  * function (the long, 15-min-budget async function whose deployed name ends in
@@ -273,6 +402,13 @@ export function isNetlifyHostedRuntimeForDurableBackground(): boolean {
  * additional signals — the latter an operator escape hatch. Off by default.
  */
 export function isInBackgroundFunctionRuntime(): boolean {
+  // Per-invocation first: on a runtime where one isolate serves concurrent
+  // invocations, the scope is the ONLY thing that can prove THIS invocation has
+  // the long budget.
+  if (isInBackgroundInvocationScope()) return true;
+  // ...and on that runtime every isolate-wide signal below is unsafe, because a
+  // foreground turn sharing the isolate would read it as its own.
+  if (isCloudflareRuntime()) return false;
   // Set by the emitted `-background` function entry at cold start (the primary,
   // most reliable signal — see the emit in deploy/build.ts).
   if (
@@ -320,6 +456,7 @@ export function backgroundRuntimeDiagnosticDetail(marker: unknown): string {
   const detail = [
     `markerExpected=${backgroundRunMarkerExpectsBackgroundRuntime(marker)}`,
     `runtimeDetected=${isInBackgroundFunctionRuntime()}`,
+    `invocationScope=${isInBackgroundInvocationScope()}`,
     `globalMarker=${(globalThis as Record<string, unknown>).__AGENT_NATIVE_BACKGROUND_RUNTIME__ === true}`,
     `lambdaNameEndsBackground=${typeof process.env.AWS_LAMBDA_FUNCTION_NAME === "string" && process.env.AWS_LAMBDA_FUNCTION_NAME.toLowerCase().endsWith("-background")}`,
     `forceEnv=${typeof process.env.AGENT_CHAT_FORCE_BACKGROUND_RUNTIME === "string" && process.env.AGENT_CHAT_FORCE_BACKGROUND_RUNTIME.trim().length > 0}`,
@@ -383,8 +520,17 @@ export function isDurableBackgroundFlagEnabled(): boolean {
   );
 }
 
-export function isDurableBackgroundFlagExplicitlyDisabled(): boolean {
-  const raw = process.env.AGENT_CHAT_DURABLE_BACKGROUND;
+/**
+ * `env` exists for the deploy-time gates, which are handed the build
+ * environment rather than reading the ambient one. It must stay the SAME parse
+ * the runtime uses: a build deciding "this app opted out" against different
+ * words than the Worker reads is how an app is refused, or emitted, for a
+ * reason its operator never wrote.
+ */
+export function isDurableBackgroundFlagExplicitlyDisabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const raw = env.AGENT_CHAT_DURABLE_BACKGROUND;
   if (raw == null) return false;
   const normalized = raw.trim().toLowerCase();
   return (
@@ -414,12 +560,21 @@ export function isAgentChatDurableBackgroundEnabled(options?: {
   const netlifyDefaultOptIn =
     isNetlifyHostedRuntimeForDurableBackground() &&
     !isDurableBackgroundFlagExplicitlyDisabled();
+  // Workers gets the same default-on/explicit-opt-out shape Netlify has,
+  // because on this runtime the gate is a fact about the host rather than a
+  // per-app choice. Until a durable transport for it exists the run is still
+  // recovered inline — loudly, see the queue transport's missing-transport notice.
+  const workersDefaultOptIn =
+    isCloudflareRuntime() && !isDurableBackgroundFlagExplicitlyDisabled();
   const workspaceAppOptIn =
     options?.appOptIn === true &&
     !isDurableBackgroundFlagExplicitlyDisabled() &&
     resolveWorkspaceBackgroundFunctionUrlPath() !== null;
   return (
-    (envOptIn || netlifyDefaultOptIn || workspaceAppOptIn) &&
+    (envOptIn ||
+      netlifyDefaultOptIn ||
+      workersDefaultOptIn ||
+      workspaceAppOptIn) &&
     isHostedRuntimeForDurableBackground() &&
     hasConfiguredA2ASecret()
   );

@@ -30,11 +30,14 @@ import {
 
 import { getSession } from "../server/auth.js";
 import { readBody } from "../server/h3-helpers.js";
+import { getRequestContext } from "../server/request-context.js";
 import { track } from "../tracking/registry.js";
+import { emitAiFeedbackSurveyEvent } from "./posthog-ai.js";
 import {
   getObservabilityOverview,
   getTraceSummaries,
   getTraceSummary,
+  ensureObservabilityTables,
   getTraceSpansForRun,
   getEvalsForRun,
   insertFeedback,
@@ -103,6 +106,10 @@ function parseLimit(q: Record<string, any>, fallback = 100): number {
 
 export function createObservabilityHandler() {
   return defineEventHandler(async (event: H3Event) => {
+    // Pass the event: on a runtime that cancels a promise when its creating
+    // request answers, only this request's own keep-alive can hold the init
+    // open for the callers polling it.
+    await ensureObservabilityTables(event);
     const rawMethod = getMethod(event);
     const method = rawMethod === "HEAD" ? "GET" : rawMethod;
     const pathname = (event.url?.pathname || "")
@@ -207,11 +214,11 @@ export function createObservabilityHandler() {
         userId: owner,
         createdAt: Date.now(),
       });
-      // Emit one content-free analytics event for the explicit thumb itself.
-      // Category follow-ups intentionally do not emit: a thumbs-down followed
-      // by a category would otherwise double-count the same negative signal.
-      if (feedbackType === "thumbs_up" || feedbackType === "thumbs_down") {
+      {
         const runId = body.runId ? String(body.runId) : null;
+        const threadId = body.threadId ? String(body.threadId) : null;
+        const isThumb =
+          feedbackType === "thumbs_up" || feedbackType === "thumbs_down";
         let model: string | undefined;
         if (runId) {
           try {
@@ -223,13 +230,21 @@ export function createObservabilityHandler() {
           }
         }
 
-        const threadId = body.threadId ? String(body.threadId) : null;
+        // Every submission is reported, including `category` and `text`, which
+        // previously emitted nothing at all. Only thumbs carry `sentiment` —
+        // a category follow-up to a thumbs-down is extra detail about the same
+        // vote, so counting it as a second negative would inflate the metric.
         track(
           "$ai_feedback",
           {
             ...trackingIdentityProperties(),
             source: "agent_observability",
-            sentiment: feedbackType === "thumbs_up" ? "positive" : "negative",
+            ...(isThumb
+              ? {
+                  sentiment:
+                    feedbackType === "thumbs_up" ? "positive" : "negative",
+                }
+              : {}),
             feedback_type: feedbackType,
             run_id: runId,
             thread_id: threadId,
@@ -240,6 +255,19 @@ export function createObservabilityHandler() {
           },
           { userId: owner },
         );
+
+        // PostHog shows feedback in LLM analytics only via `survey sent`.
+        // No-ops unless a survey id is configured.
+        emitAiFeedbackSurveyEvent({
+          runId,
+          threadId,
+          userId: owner,
+          feedbackType,
+          value: isThumb ? feedbackType : value,
+          submissionId: id,
+          model,
+          browserSessionId: getRequestContext()?.browserSessionId,
+        });
       }
       // Fire-and-forget: recompute satisfaction score for the thread.
       if (body.threadId) {

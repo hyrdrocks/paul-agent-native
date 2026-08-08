@@ -1,4 +1,13 @@
+import { registerCloudflareFallbackStorage } from "../hosts/cloudflare/fallback-storage.js";
+import { resolveFallbackStorageDecision } from "../hosts/fallback-storage.js";
 import { builderFileUploadProvider } from "./builder.js";
+import { cloudflareR2FileUploadProvider } from "./cloudflare-r2.js";
+import {
+  FileUploadProviderUnreadableError,
+  FileUploadStorageNotConfiguredError,
+  type FileUploadProviderLookupFailure,
+} from "./errors.js";
+import { registerPortableFallbackStoragePolicy } from "./fallback-storage-baseline.js";
 import type {
   FileUploadInput,
   FileUploadProvider,
@@ -22,6 +31,34 @@ const providers: Map<string, FileUploadProvider> =
 const warnedFallbackRef: { value: boolean } =
   (globals.__agentNativeFileUploadWarnedFallback ??= { value: false });
 
+// Registered HERE, by value, rather than through the `hosts/index.js` barrel.
+// The barrel is a side-effect-only import, and this package declares
+// `sideEffects` as an allow-list that does not name it — so a bundler drops it,
+// and the seam silently resolves as though no host claimed the process. That
+// failure is invisible until a payload lands in a database. Value imports
+// cannot be dropped.
+//
+// The edge runs registry -> host and never the reverse: an adapter that
+// imported this module back would be evaluated before its own provider map
+// exists.
+registerPortableFallbackStoragePolicy();
+registerCloudflareFallbackStorage();
+
+/**
+ * Built-in providers, consulted after every user-registered one and in this
+ * order. Not entries in `providers`: an app that registers its own provider
+ * has made a deliberate choice, and a builtin inserted ahead of it in map
+ * order would quietly win.
+ *
+ * R2 before Builder because R2 reports itself configured only when a bucket is
+ * actually bound to this Worker, which is as deliberate as connecting Builder
+ * and is the host's own store.
+ */
+const BUILTIN_PROVIDERS: FileUploadProvider[] = [
+  cloudflareR2FileUploadProvider,
+  builderFileUploadProvider,
+];
+
 /**
  * Register a file upload provider. Call from a server plugin or app
  * bootstrap. Idempotent per id — later calls with the same id replace.
@@ -41,57 +78,106 @@ export function listFileUploadProviders(): FileUploadProvider[] {
 /**
  * Returns the first configured provider, checking user-registered ones first
  * and falling back to the built-in Builder.io provider when its env is set.
- * Returns `null` when nothing is configured — callers should then use the
- * SQL fallback.
+ * Returns `null` when nothing is configured. Whether that permits storing the
+ * payload elsewhere is not this function's answer — see
+ * `resolveFallbackStorageDecision`.
  */
 export function getActiveFileUploadProvider(): FileUploadProvider | null {
   for (const provider of providers.values()) {
     if (provider.isConfigured()) return provider;
   }
-  if (builderFileUploadProvider.isConfigured()) {
-    return builderFileUploadProvider;
-  }
-  return null;
-}
-
-export async function getActiveFileUploadProviderForRequest(): Promise<FileUploadProvider | null> {
-  for (const provider of providers.values()) {
+  for (const provider of BUILTIN_PROVIDERS) {
     if (provider.isConfigured()) return provider;
-    if (provider.isConfiguredForRequest) {
-      try {
-        if (await provider.isConfiguredForRequest()) return provider;
-      } catch {
-        // Treat failed scoped credential lookups as unavailable. The upload
-        // call will surface real provider errors after a provider is selected.
-      }
-    }
-  }
-  if (builderFileUploadProvider.isConfigured()) {
-    return builderFileUploadProvider;
-  }
-  try {
-    const { resolveHasBuilderPrivateKey } =
-      await import("../server/credential-provider.js");
-    if (await resolveHasBuilderPrivateKey()) {
-      return builderFileUploadProvider;
-    }
-  } catch {
-    // Treat failed scoped credential lookups as unavailable.
   }
   return null;
 }
 
 /**
- * Upload a file via the active provider, or `null` if no provider is
- * configured. Callers use `null` as the signal to fall back to SQL
- * storage. On the first fallback we log a one-time warning because
- * storing files in SQL is not optimal for production.
+ * What the provider lookup actually learned.
+ *
+ * `absent` and `unreadable` are separate cases because their repairs are: one
+ * is "configure a bucket", the other is "the credential store is down". A
+ * lookup that threw says nothing at all about whether a provider exists, so
+ * collapsing it into `absent` reports an outage as a setup mistake — and, at
+ * the call site below, turns it into a payload written somewhere else.
+ */
+export type FileUploadProviderResolution =
+  | { status: "provider"; provider: FileUploadProvider }
+  | { status: "absent" }
+  | { status: "unreadable"; failures: FileUploadProviderLookupFailure[] };
+
+export async function resolveFileUploadProviderForRequest(): Promise<FileUploadProviderResolution> {
+  const failures: FileUploadProviderLookupFailure[] = [];
+  for (const provider of providers.values()) {
+    if (provider.isConfigured()) return { status: "provider", provider };
+    if (provider.isConfiguredForRequest) {
+      try {
+        if (await provider.isConfiguredForRequest())
+          return { status: "provider", provider };
+      } catch (error) {
+        failures.push({ providerId: provider.id, error });
+      }
+    }
+  }
+  for (const provider of BUILTIN_PROVIDERS) {
+    if (provider.isConfigured()) return { status: "provider", provider };
+  }
+  try {
+    const { resolveHasBuilderPrivateKey } =
+      await import("../server/credential-provider.js");
+    if (await resolveHasBuilderPrivateKey()) {
+      return { status: "provider", provider: builderFileUploadProvider };
+    }
+  } catch (error) {
+    failures.push({ providerId: builderFileUploadProvider.id, error });
+  }
+  if (failures.length > 0) return { status: "unreadable", failures };
+  return { status: "absent" };
+}
+
+/**
+ * The first provider configured for this request, or `null` when none is.
+ *
+ * Throws `FileUploadProviderUnreadableError` when a configuration check could
+ * not be completed: `null` here means "no provider is configured", and it must
+ * not also mean "we could not find out".
+ */
+export async function getActiveFileUploadProviderForRequest(): Promise<FileUploadProvider | null> {
+  const resolution = await resolveFileUploadProviderForRequest();
+  if (resolution.status === "provider") return resolution.provider;
+  if (resolution.status === "unreadable") {
+    throw new FileUploadProviderUnreadableError(resolution.failures);
+  }
+  return null;
+}
+
+/**
+ * Upload a file via the active provider.
+ *
+ * Returns `null` for EXACTLY ONE condition: no provider is configured AND this
+ * host permits the caller to store the payload somewhere else. That is the
+ * whole contract, and it is deliberately narrow — `null` used to also cover a
+ * credential store that could not be read and a host where a SQL fallback is
+ * forbidden, so every caller resolved all three by writing the body into SQL.
+ *
+ * The other two conditions are typed throws:
+ *  - `FileUploadProviderUnreadableError` — whether a provider exists is unknown.
+ *  - `FileUploadStorageNotConfiguredError` — none exists and this host refuses
+ *    the fallback, carrying the setup step that fixes it.
+ *
+ * Whether a fallback is permitted is NOT decided here. It is a property of the
+ * host, answered once by `resolveFallbackStorageDecision`.
  */
 export async function uploadFile(
   input: FileUploadInput,
 ): Promise<FileUploadResult | null> {
-  const provider = await getActiveFileUploadProviderForRequest();
-  // User-registered providers (S3, etc.) may be configured by sync runtime
+  const resolution = await resolveFileUploadProviderForRequest();
+  if (resolution.status === "unreadable") {
+    throw new FileUploadProviderUnreadableError(resolution.failures);
+  }
+  const provider =
+    resolution.status === "provider" ? resolution.provider : null;
+  // User-registered providers (S3, R2, etc.) may be configured by sync runtime
   // state or request-scoped DB secrets. Builder still gets an explicit async
   // credential check below because its sync isConfigured() only checks env.
   if (provider && provider !== builderFileUploadProvider) {
@@ -100,20 +186,21 @@ export async function uploadFile(
 
   // Resolve credentials asynchronously (works when request context is set
   // via runWithRequestContext — actions always have one via action-routes.ts).
-  // Two separate try-catch blocks ensure a real upload failure is never
-  // silently swallowed as a "no credentials" case.
+  // Kept separate from the upload call so a real upload failure is never
+  // swallowed as a "no credentials" case.
   let builderKey: string | null = null;
   try {
     const { resolveBuilderPrivateKey } =
       await import("../server/credential-provider.js");
     builderKey = await resolveBuilderPrivateKey();
   } catch (err) {
-    // DB unavailable or credential store not ready — can't resolve key.
-    // Log and fall through to the SQL fallback below.
-    console.warn(
-      "[agent-native] Builder credential check failed:",
-      err instanceof Error ? err.message : String(err),
-    );
+    // The credential store could not be read. Whether Builder is connected is
+    // now unknown, which is not the same fact as it being unconnected —
+    // reporting it as unconfigured would send the payload to the fallback on
+    // the strength of a database blip.
+    throw new FileUploadProviderUnreadableError([
+      { providerId: builderFileUploadProvider.id, error: err },
+    ]);
   }
 
   if (builderKey) {
@@ -122,11 +209,16 @@ export async function uploadFile(
     return await builderFileUploadProvider.upload(input);
   }
 
+  const decision = resolveFallbackStorageDecision();
+  if (!decision.permitted) {
+    throw new FileUploadStorageNotConfiguredError(decision);
+  }
+
   if (!warnedFallbackRef.value) {
     warnedFallbackRef.value = true;
     console.warn(
       "[agent-native] No file upload provider configured. " +
-        "Connect or reconnect Builder.io in Settings → File uploads, " +
+        "Connect or reconnect Builder.io (free tier available) in Settings → File uploads, " +
         "or register a custom provider (S3, R2, GCS, …) via registerFileUploadProvider().",
     );
   }

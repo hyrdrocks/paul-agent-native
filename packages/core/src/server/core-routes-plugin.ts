@@ -60,8 +60,10 @@ import {
 import { ssrfSafeFetch } from "../extensions/url-safety.js";
 import {
   uploadFile,
-  getActiveFileUploadProviderForRequest,
   listFileUploadProviders,
+  resolveFileUploadProviderForRequest,
+  describeFileUploadRefusal,
+  FileUploadProviderUnreadableError,
 } from "../file-upload/index.js";
 import { handleMcpConnect } from "../mcp/connect-route.js";
 import {
@@ -105,6 +107,7 @@ import { registerBuiltinProviders } from "../tracking/providers.js";
 import { validateTrackPayload } from "../tracking/route.js";
 import { createAutomationsHandler } from "../triggers/routes.js";
 import { createAgentEngineApiKeyHandler } from "./agent-engine-api-key-route.js";
+import { readBrowserSessionIdHeader } from "./agent-run-context.js";
 import { getConfiguredAppBasePath, stripAppBasePath } from "./app-base-path.js";
 import { getAppName } from "./app-name.js";
 import { getSession, type AuthSession } from "./auth.js";
@@ -157,7 +160,12 @@ import {
   readDeployCredentialEnv,
   resolveSecret,
 } from "./credential-provider.js";
+import {
+  resolveDeployEnvironment,
+  resolveServerRelease,
+} from "./deploy-environment.js";
 import { createEmbedStartRouteHandler } from "./embed-route.js";
+import { shouldReportError } from "./error-noise-filter.js";
 import {
   getH3App,
   awaitBootstrap,
@@ -178,13 +186,18 @@ import { createOpenRouteHandler } from "./open-route.js";
 import { createPollEventsHandler } from "./poll-events.js";
 import { createPollHandler } from "./poll.js";
 import { createRealtimeTokenHandler } from "./realtime-token.js";
-import { runWithRequestContext } from "./request-context.js";
+import {
+  getRequestContext,
+  hasRequestContext,
+  runWithRequestContext,
+} from "./request-context.js";
 import {
   findUnsupportedScopedKeyNames,
   saveKeyValuesToScopedSecrets,
   ScopedKeyStorageError,
   type ScopedKeySaveRequestScope,
 } from "./scoped-key-storage.js";
+import { shouldDisableInProcessSweeps } from "./sweep-runtime.js";
 import { createTranscribeVoiceHandler } from "./transcribe-voice.js";
 import { createVoiceProvidersStatusHandler } from "./voice-providers-status.js";
 import { createWorkspaceProviderOAuthHandler } from "./workspace-provider-oauth.js";
@@ -442,6 +455,13 @@ export function getFrameworkEnvKeys(): EnvKeyConfig[] {
 }
 
 /** Result of the `/_agent-native/health` liveness + DB-warmup probe. */
+/**
+ * Deliberately generous: a genuinely cold Neon compute can take seconds to
+ * accept its first connection, and reporting a slow-but-working database as
+ * timed out would flap. This is a ceiling on hanging, not a latency budget.
+ */
+const DB_HEALTH_PROBE_DEADLINE_MS = 5_000;
+
 export interface DbHealthProbeResult {
   /** The serverless function is live and served the request. */
   ok: true;
@@ -449,6 +469,14 @@ export interface DbHealthProbeResult {
   ready: boolean;
   /** A trivial `SELECT 1` reached the database (false = no DB or unreachable). */
   db: boolean;
+  /**
+   * The probe hit its deadline instead of answering. Reported SEPARATELY from
+   * `db: false`, because "the database said no" and "the database never
+   * replied" are different failures and folding them together is exactly the
+   * coercion this repo bans — a monitor cannot tell an app with no database
+   * from one whose database is hanging.
+   */
+  dbTimedOut?: boolean;
   /** Round-trip time of the probe in milliseconds. */
   ms: number;
   /** Redacted database routing details useful for deploy/runtime checks. */
@@ -483,11 +511,29 @@ export async function runDbHealthProbe(
   let db = false;
   let schema: DatabaseSchemaHealthResult | undefined;
   const dbExec = exec();
+  let dbTimedOut = false;
   try {
-    await dbExec.execute("SELECT 1");
-    db = true;
-  } catch {
+    // An UNBOUNDED await here is what took the docs site down: the health route
+    // hung for 20-40s until the CDN returned 502, the keep-warm cron failed
+    // every minute, and the function stayed permanently cold — a ~10x penalty
+    // on every cache miss. This function's own contract says "Always
+    // resolves"; without a deadline it did not.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("db probe deadline")),
+        DB_HEALTH_PROBE_DEADLINE_MS,
+      );
+    });
+    try {
+      await Promise.race([dbExec.execute("SELECT 1"), deadline]);
+      db = true;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  } catch (err) {
     // Live even when the DB is unreachable or the app has no database.
+    dbTimedOut = (err as Error)?.message === "db probe deadline";
   }
   if (db && options.schema) {
     schema = await runDatabaseSchemaHealthCheck({
@@ -499,6 +545,7 @@ export async function runDbHealthProbe(
     ok: true,
     ready: db && (!schema || schema.ok),
     db,
+    ...(dbTimedOut ? { dbTimedOut: true } : {}),
     ms: Date.now() - startedAt,
     database: {
       configured: database.configured,
@@ -1298,6 +1345,53 @@ export async function readLegacyCoreRouteInitSettings(
  *   PUT    /_agent-native/application-state/compose/:id — upsert compose draft
  *   DELETE /_agent-native/application-state/compose/:id — delete compose draft
  */
+/**
+ * Route every Nitro route error through the provider-agnostic `captureError()`
+ * registry, filtered by the shared noise rules.
+ *
+ * This lives here rather than in `sentry-plugin.ts` because that plugin bails
+ * out when no `SENTRY_DSN` is configured — wiring the hook there meant an app
+ * running PostHog (or any other backend) with no Sentry project reported no
+ * route errors at all, while still looking configured.
+ */
+function wireRouteErrorCapture(nitroApp: any): void {
+  nitroApp.hooks?.hook?.(
+    "error",
+    (error: unknown, ctx?: { event?: H3Event }) => {
+      try {
+        const event = ctx?.event;
+        const route = (() => {
+          try {
+            return event?.url?.pathname;
+            // coercion-ok: a missing route tag must not suppress the error
+          } catch {
+            return undefined;
+          }
+        })();
+        const userAgent = (() => {
+          try {
+            return event ? getHeader(event, "user-agent") : undefined;
+            // coercion-ok: a missing UA tag must not suppress the error
+          } catch {
+            return undefined;
+          }
+        })();
+
+        if (!shouldReportError(error, { tags: { route } })) return;
+
+        captureError(error, {
+          route,
+          method: event ? getMethod(event) : undefined,
+          userAgent,
+        });
+        // coercion-ok: rethrowing here would replace the app's real error
+      } catch {
+        // Error reporting must never escape into Nitro's error path.
+      }
+    },
+  );
+}
+
 export function createCoreRoutesPlugin(
   options: CoreRoutesPluginOptions = {},
 ): NitroPluginDef {
@@ -1373,22 +1467,34 @@ export function createCoreRoutesPlugin(
       // already registered the same key win.
       registerFrameworkSecrets();
       registerBuiltinProviders();
-      registerErrorCaptureProvider("agent-native-analytics", (error, context) =>
+      // Named for the destination it actually reaches: every configured
+      // tracking provider (PostHog, Mixpanel, Amplitude, Agent Native
+      // Analytics, webhook), not just one of them.
+      registerErrorCaptureProvider("tracking", (error, context) => {
+        // Attribute to the in-flight request's user so server exceptions and
+        // that same person's browser events share one `distinct_id`.
+        const requestContext = hasRequestContext()
+          ? getRequestContext()
+          : undefined;
         captureException(error, {
           ...context,
           handled: false,
           runtime: "node",
           source: "server",
-        }),
-      );
+          release: resolveServerRelease(),
+          environment: resolveDeployEnvironment(),
+          ...(requestContext?.userEmail
+            ? { userId: requestContext.userEmail }
+            : {}),
+          ...(requestContext?.orgId ? { orgId: requestContext.orgId } : {}),
+        });
+      });
+      wireRouteErrorCapture(nitroApp);
       registerBuiltinNotificationChannels();
 
       try {
         const { createObservabilityHandler } =
           await import("../observability/routes.js");
-        const { ensureObservabilityTables } =
-          await import("../observability/store.js");
-        ensureObservabilityTables().catch(() => {});
         getH3App(nitroApp).use(
           `${FRAMEWORK_ROUTE_PREFIX}/observability`,
           createObservabilityHandler(),
@@ -1399,13 +1505,12 @@ export function createCoreRoutesPlugin(
 
       // Audit log — durable, append-only record of who mutated what app data,
       // when, and (for the agent) in which run. Capture is automatic at the
-      // action seam; here we just ensure the table exists and start the
-      // retention purge. Best-effort so a missing DB never crashes boot.
+      // action seam; here we just start the retention purge. The store creates
+      // its tables lazily on first use. Best-effort so a missing DB never
+      // crashes boot.
       try {
-        const { ensureAuditTables } = await import("../audit/store.js");
         const { startAuditCleanupJob } =
           await import("../audit/cleanup-job.js");
-        ensureAuditTables().catch(() => {});
         startAuditCleanupJob();
       } catch {
         // Audit module not available — skip
@@ -1768,6 +1873,7 @@ export function createCoreRoutesPlugin(
       // poll-time drain in run-code covers deployments where warm-instance
       // timers rarely fire.
       (() => {
+        if (shouldDisableInProcessSweeps()) return;
         let lastSweep = 0;
         const SWEEP_INTERVAL_MS = 2 * 60 * 1000;
 
@@ -1839,27 +1945,6 @@ export function createCoreRoutesPlugin(
             runtime: getRuntimeDebugFingerprint(),
             schema,
           };
-        }),
-      );
-
-      getH3App(nitroApp).use(
-        `${P}/speculation-rules.json`,
-        defineEventHandler((event) => {
-          // `createH3SSRHandler` points the Speculation-Rules response header
-          // here to prevent Cloudflare Speed Brain from injecting its own
-          // edge prefetch rules. Keep this route public and side-effect free:
-          // browsers may request it while parsing any SSR HTML document.
-          setResponseHeader(
-            event,
-            "content-type",
-            "application/speculationrules+json; charset=utf-8",
-          );
-          for (const [name, value] of Object.entries(
-            resolveSsrCacheHeaders(),
-          )) {
-            setResponseHeader(event, name, value);
-          }
-          return EMPTY_SPECULATION_RULES;
         }),
       );
 
@@ -3247,7 +3332,7 @@ export function createCoreRoutesPlugin(
                 setResponseStatus(event, 400);
                 return {
                   error:
-                    "Builder not connected. Connect Builder in Setup to use background agent.",
+                    "Builder not connected. Connect Builder (free tier available) in Setup to use background agent.",
                 };
               }
               const body = (await readBody(event)) as {
@@ -3482,6 +3567,7 @@ export function createCoreRoutesPlugin(
           try {
             track(validation.name as string, properties, {
               userId: userEmail,
+              sessionId: readBrowserSessionIdHeader(event),
             });
           } catch {
             // best-effort
@@ -3652,7 +3738,22 @@ export function createCoreRoutesPlugin(
           const session = await getSession(event).catch(() => null);
           const userEmail = session?.email;
           const resolveStatus = async () => {
-            const active = await getActiveFileUploadProviderForRequest();
+            const resolution = await resolveFileUploadProviderForRequest();
+            if (resolution.status === "unreadable") {
+              // We could not read the configuration, so we do not know whether
+              // storage is configured. Reporting `configured: false` here is
+              // what turns a database blip into "you never set this up", and
+              // sends the operator to fix the wrong thing.
+              setResponseStatus(event, 503);
+              return {
+                error: new FileUploadProviderUnreadableError(
+                  resolution.failures,
+                ).message,
+                storageStatusUnknown: true,
+              };
+            }
+            const active =
+              resolution.status === "provider" ? resolution.provider : null;
             let builderConfigured = !!process.env.BUILDER_PRIVATE_KEY;
             try {
               const { resolveBuilderPrivateKey } =
@@ -3747,16 +3848,28 @@ export function createCoreRoutesPlugin(
             return { error: "Unauthorized" };
           }
           const userEmail = session.email;
-          const result = await runWithRequestContext(
-            { userEmail, orgId: session.orgId },
-            () =>
-              uploadFile({
-                data: filePart.data,
-                filename: filePart.filename,
-                mimeType: filePart.type,
-                ownerEmail: userEmail,
-              }),
-          );
+          let result: Awaited<ReturnType<typeof uploadFile>>;
+          try {
+            result = await runWithRequestContext(
+              { userEmail, orgId: session.orgId },
+              () =>
+                uploadFile({
+                  data: filePart.data,
+                  filename: filePart.filename,
+                  mimeType: filePart.type,
+                  ownerEmail: userEmail,
+                }),
+            );
+          } catch (err) {
+            // The host refused the fallback, or we could not tell whether a
+            // store exists. Either way the payload is NOT stored anywhere, and
+            // the response says so and names the setup step — a 201 with a
+            // fabricated url is the failure this path exists to remove.
+            const refusal = describeFileUploadRefusal(err);
+            if (!refusal) throw err;
+            setResponseStatus(event, 503);
+            return refusal;
+          }
 
           if (result) {
             setResponseStatus(event, 201);
@@ -3766,7 +3879,7 @@ export function createCoreRoutesPlugin(
           setResponseStatus(event, 503);
           return {
             error:
-              "No file upload provider configured. Connect Builder.io in Settings → File uploads, or register a provider.",
+              "No file upload provider configured. Connect Builder.io (free tier available) in Settings → File uploads, or register a provider.",
           };
         }),
       );
@@ -3850,11 +3963,10 @@ export function createCoreRoutesPlugin(
 
       // ─── Extensions (sandboxed mini-app runtime + proxy) ────────────────
       try {
-        const { ensureExtensionsTables, registerExtensionsShareable } =
+        const { registerExtensionsShareable } =
           await import("../extensions/store.js");
         const { createExtensionsHandler } =
           await import("../extensions/routes.js");
-        ensureExtensionsTables().catch(() => {});
         registerExtensionsShareable();
         const extensionsHandler = createExtensionsHandler({
           extensionTools: options.extensionTools,
@@ -3866,11 +3978,8 @@ export function createCoreRoutesPlugin(
         getH3App(nitroApp).use(`${P}/tools`, extensionsHandler);
 
         // Extension-point slots — sub-system of extensions.
-        const { ensureSlotTables } =
-          await import("../extensions/slots/store.js");
         const { createSlotsHandler } =
           await import("../extensions/slots/routes.js");
-        ensureSlotTables().catch(() => {});
         getH3App(nitroApp).use(`${P}/slots`, createSlotsHandler());
       } catch {
         // Extensions module not available — skip
@@ -3878,9 +3987,8 @@ export function createCoreRoutesPlugin(
 
       // ─── Data programs (stored server-side JS scripts + run cache) ─────
       try {
-        const { ensureDataProgramTables, registerDataProgramsShareable } =
+        const { registerDataProgramsShareable } =
           await import("../data-programs/store.js");
-        ensureDataProgramTables().catch(() => {});
         registerDataProgramsShareable();
       } catch {
         // Data programs module not available — skip
@@ -4278,6 +4386,32 @@ export function createCoreRoutesPlugin(
 
   return (nitroApp: any) => {
     markDefaultPluginProvided(nitroApp, "core-routes");
+
+    // Mounted here rather than inside `runInit`: this response is a
+    // side-effect-free static contract the SSR shell points at, and the
+    // request handler answers it without waiting for readiness. Deferring the
+    // mount with the rest of init would make a cold isolate 404 the very fetch
+    // that must not wait. Registering a handler is not I/O, so it is safe at
+    // isolate scope where workerd refuses I/O outright.
+    getH3App(nitroApp).use(
+      `${FRAMEWORK_ROUTE_PREFIX}/speculation-rules.json`,
+      defineEventHandler((event) => {
+        // `createH3SSRHandler` points the Speculation-Rules response header
+        // here to prevent Cloudflare Speed Brain from injecting its own edge
+        // prefetch rules. Keep this route public and side-effect free:
+        // browsers may request it while parsing any SSR HTML document.
+        setResponseHeader(
+          event,
+          "content-type",
+          "application/speculationrules+json; charset=utf-8",
+        );
+        for (const [name, value] of Object.entries(resolveSsrCacheHeaders())) {
+          setResponseHeader(event, name, value);
+        }
+        return EMPTY_SPECULATION_RULES;
+      }),
+    );
+
     // A rejection here is not rethrown into Nitro: it invokes plugins as
     // `try { plugin(app) } catch`, which cannot catch an async rejection, so a
     // throw would surface as an unhandledRejection — Node exits, the serverless

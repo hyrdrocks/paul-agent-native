@@ -13,132 +13,131 @@ import {
   ensureTableExists,
   ensureIndexExists,
 } from "../db/ddl-guard.js";
+import { createInitMemo, type InitMemo } from "../db/init-memo.js";
 import type {
   AuditEvent,
   AuditQueryFilters,
   AuditVisibility,
 } from "./types.js";
 
-let _initPromise: Promise<void> | undefined;
+async function initAuditTables(): Promise<void> {
+  const client = getDbExec();
+  const createSql = `
+    CREATE TABLE IF NOT EXISTS agent_audit_log (
+      id TEXT PRIMARY KEY,
+      created_at ${intType()} NOT NULL,
+      action TEXT NOT NULL,
+      caller TEXT NOT NULL,
+      actor_kind TEXT NOT NULL,
+      actor_email TEXT,
+      org_id TEXT,
+      thread_id TEXT,
+      turn_id TEXT,
+      target_type TEXT,
+      target_id TEXT,
+      status TEXT NOT NULL DEFAULT 'success',
+      summary TEXT,
+      input TEXT,
+      error_code TEXT,
+      owner_email TEXT,
+      visibility TEXT NOT NULL DEFAULT 'private'
+      ,run_id TEXT
+      ,task_id TEXT
+      ,parent_task_id TEXT
+      ,source_kind TEXT
+      ,source_platform TEXT
+      ,source_id TEXT
+      ,source_url TEXT
+      ,network_protocol TEXT
+      ,network_id TEXT
+      ,network_peer TEXT
+    )
+  `;
+  const lineageColumns = [
+    "run_id",
+    "task_id",
+    "parent_task_id",
+    "source_kind",
+    "source_platform",
+    "source_id",
+    "source_url",
+    "network_protocol",
+    "network_id",
+    "network_peer",
+  ];
 
-export async function ensureAuditTables(): Promise<void> {
-  if (!_initPromise) {
-    _initPromise = (async () => {
-      const client = getDbExec();
-      const createSql = `
-        CREATE TABLE IF NOT EXISTS agent_audit_log (
-          id TEXT PRIMARY KEY,
-          created_at ${intType()} NOT NULL,
-          action TEXT NOT NULL,
-          caller TEXT NOT NULL,
-          actor_kind TEXT NOT NULL,
-          actor_email TEXT,
-          org_id TEXT,
-          thread_id TEXT,
-          turn_id TEXT,
-          target_type TEXT,
-          target_id TEXT,
-          status TEXT NOT NULL DEFAULT 'success',
-          summary TEXT,
-          input TEXT,
-          error_code TEXT,
-          owner_email TEXT,
-          visibility TEXT NOT NULL DEFAULT 'private'
-          ,run_id TEXT
-          ,task_id TEXT
-          ,parent_task_id TEXT
-          ,source_kind TEXT
-          ,source_platform TEXT
-          ,source_id TEXT
-          ,source_url TEXT
-          ,network_protocol TEXT
-          ,network_id TEXT
-          ,network_peer TEXT
-        )
-      `;
-      const lineageColumns = [
-        "run_id",
-        "task_id",
-        "parent_task_id",
-        "source_kind",
-        "source_platform",
-        "source_id",
-        "source_url",
-        "network_protocol",
-        "network_id",
-        "network_peer",
-      ];
-
-      if (isPostgres()) {
-        // PG-guard: probe information_schema / pg_indexes before issuing DDL to
-        // avoid ACCESS EXCLUSIVE lock contention in fresh background-worker processes.
-        await ensureTableExists("agent_audit_log", createSql);
-        for (const column of lineageColumns) {
-          await ensureColumnExists(
-            "agent_audit_log",
-            column,
-            `ALTER TABLE agent_audit_log ADD COLUMN IF NOT EXISTS ${column} TEXT`,
-          );
-        }
-        await ensureIndexExists(
-          "idx_audit_owner",
-          `CREATE INDEX IF NOT EXISTS idx_audit_owner ON agent_audit_log (owner_email, created_at)`,
-        );
-        await ensureIndexExists(
-          "idx_audit_org",
-          `CREATE INDEX IF NOT EXISTS idx_audit_org ON agent_audit_log (org_id, created_at)`,
-        );
-        await ensureIndexExists(
-          "idx_audit_target",
-          `CREATE INDEX IF NOT EXISTS idx_audit_target ON agent_audit_log (target_type, target_id, created_at)`,
-        );
-        await ensureIndexExists(
-          "idx_audit_turn",
-          `CREATE INDEX IF NOT EXISTS idx_audit_turn ON agent_audit_log (turn_id)`,
-        );
-        await ensureIndexExists(
-          "idx_audit_actor",
-          `CREATE INDEX IF NOT EXISTS idx_audit_actor ON agent_audit_log (actor_email, created_at)`,
-        );
-        await ensureIndexExists(
-          "idx_audit_created",
-          `CREATE INDEX IF NOT EXISTS idx_audit_created ON agent_audit_log (created_at)`,
-        );
-        return;
-      }
-
-      // SQLite (local dev): no lock problem — keep the original behaviour.
-      await client.execute(createSql);
-      for (const column of lineageColumns) {
-        try {
-          await client.execute(
-            `ALTER TABLE agent_audit_log ADD COLUMN ${column} TEXT`,
-          );
-        } catch {}
-      }
-      const indexes = [
-        `CREATE INDEX IF NOT EXISTS idx_audit_owner ON agent_audit_log (owner_email, created_at)`,
-        `CREATE INDEX IF NOT EXISTS idx_audit_org ON agent_audit_log (org_id, created_at)`,
-        `CREATE INDEX IF NOT EXISTS idx_audit_target ON agent_audit_log (target_type, target_id, created_at)`,
-        `CREATE INDEX IF NOT EXISTS idx_audit_turn ON agent_audit_log (turn_id)`,
-        `CREATE INDEX IF NOT EXISTS idx_audit_actor ON agent_audit_log (actor_email, created_at)`,
-        `CREATE INDEX IF NOT EXISTS idx_audit_created ON agent_audit_log (created_at)`,
-      ];
-      for (const sql of indexes) {
-        try {
-          await client.execute(sql);
-        } catch {
-          // Index creation is best-effort; a racing boot may have created it.
-        }
-      }
-    })().catch((err) => {
-      // Allow a later call to retry if the first init failed.
-      _initPromise = undefined;
-      throw err;
-    });
+  if (isPostgres()) {
+    // PG-guard: probe information_schema / pg_indexes before issuing DDL to
+    // avoid ACCESS EXCLUSIVE lock contention in fresh background-worker processes.
+    await ensureTableExists("agent_audit_log", createSql);
+    for (const column of lineageColumns) {
+      await ensureColumnExists(
+        "agent_audit_log",
+        column,
+        `ALTER TABLE agent_audit_log ADD COLUMN IF NOT EXISTS ${column} TEXT`,
+      );
+    }
+    await ensureIndexExists(
+      "idx_audit_owner",
+      `CREATE INDEX IF NOT EXISTS idx_audit_owner ON agent_audit_log (owner_email, created_at)`,
+    );
+    await ensureIndexExists(
+      "idx_audit_org",
+      `CREATE INDEX IF NOT EXISTS idx_audit_org ON agent_audit_log (org_id, created_at)`,
+    );
+    await ensureIndexExists(
+      "idx_audit_target",
+      `CREATE INDEX IF NOT EXISTS idx_audit_target ON agent_audit_log (target_type, target_id, created_at)`,
+    );
+    await ensureIndexExists(
+      "idx_audit_turn",
+      `CREATE INDEX IF NOT EXISTS idx_audit_turn ON agent_audit_log (turn_id)`,
+    );
+    await ensureIndexExists(
+      "idx_audit_actor",
+      `CREATE INDEX IF NOT EXISTS idx_audit_actor ON agent_audit_log (actor_email, created_at)`,
+    );
+    await ensureIndexExists(
+      "idx_audit_created",
+      `CREATE INDEX IF NOT EXISTS idx_audit_created ON agent_audit_log (created_at)`,
+    );
+    return;
   }
-  return _initPromise;
+
+  // SQLite (local dev): no lock problem — keep the original behaviour.
+  await client.execute(createSql);
+  for (const column of lineageColumns) {
+    try {
+      await client.execute(
+        `ALTER TABLE agent_audit_log ADD COLUMN ${column} TEXT`,
+      );
+    } catch {
+      // coercion-ok: pre-existing idempotent DDL swallow; only reindented here.
+    }
+  }
+  const indexes = [
+    `CREATE INDEX IF NOT EXISTS idx_audit_owner ON agent_audit_log (owner_email, created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_org ON agent_audit_log (org_id, created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_target ON agent_audit_log (target_type, target_id, created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_turn ON agent_audit_log (turn_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_actor ON agent_audit_log (actor_email, created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_created ON agent_audit_log (created_at)`,
+  ];
+  for (const sql of indexes) {
+    try {
+      await client.execute(sql);
+    } catch {
+      // coercion-ok: pre-existing idempotent DDL swallow; only reindented here.
+      // Index creation is best-effort; a racing boot may have created it.
+    }
+  }
 }
+
+// Wrapped rather than restructured: the memo is what keeps a request that ends
+// mid-init from leaving behind a promise later callers await forever. It also
+// takes the h3 event of the request that starts the work, which is the only
+// thing that can hold that work open — see `createInitMemo`.
+export const ensureAuditTables: InitMemo = createInitMemo(initAuditTables);
 
 export async function insertAuditEvent(event: AuditEvent): Promise<void> {
   await ensureAuditTables();
@@ -357,5 +356,5 @@ export async function deleteOldAuditEvents(cutoffMs: number): Promise<number> {
 
 /** Test-only: reset the cached init promise so a fresh DB re-creates tables. */
 export function __resetAuditInitForTests(): void {
-  _initPromise = undefined;
+  ensureAuditTables.reset();
 }

@@ -1,6 +1,6 @@
 ---
 title: "Téléchargements de fichiers"
-description: "Configurer le stockage de téléchargement de fichiers : solution de secours SQL pour le développement, Builder.io ou fournisseurs personnalisés pour la production."
+description: "Configurer le stockage de téléchargement de fichiers : Builder.io, Cloudflare R2 ou fournisseurs personnalisés ; c'est l'hôte qui décide si un repli SQL réservé au développement est seulement autorisé."
 ---
 
 # Téléchargements de fichiers
@@ -15,7 +15,7 @@ L'ordre de résolution du fournisseur est :
 
 1. **Fournisseurs enregistrés par l'utilisateur** : fournisseurs personnalisés enregistrés via `registerFileUploadProvider()`
 2. **Fournisseur Builder.io** — intégré, s'active automatiquement lorsque Builder.io est connecté
-3. **secours SQL** — stocke les fichiers en base64 dans la base de données (bien pour le développement, pas pour la production)
+3. **secours SQL** — stocke les fichiers en base64 dans la base de données, uniquement là où l'hôte l'autorise (développement local ; jamais sur Workers, avec une base de données persistante, ni en production)
 
 <Diagram id="doc-block-1msczw9" title={"Ordre de résolution du fournisseur"} summary={"uploadFile() sélectionne le premier fournisseur configuré dans l'ordre. La solution de secours SQL existe toujours, donc les téléchargements fonctionnent sans configuration."}>
 
@@ -96,13 +96,33 @@ Dispatches to the first configured provider in resolution order. Check the activ
 
 ## Par défaut : Retour SQL {#sql-fallback}
 
-Lorsqu'aucun fournisseur n'est configuré, les fichiers sont stockés sous forme de données base64 dans la base de données SQL via le système de ressources. Cela fonctionne immédiatement pour le développement local, mais n'est pas recommandé pour la production : les fichiers volumineux gonflent la base de données et il n'y a pas de CDN.
+Lorsqu'aucun fournisseur n'est configuré, c'est l'**hôte** qui décide si la charge utile peut être stockée ailleurs, et non le code appelant. Une exécution locale sur une base de données locale stocke le fichier en base64 dans SQL via le système de ressources et enregistre un avertissement unique : c'est une commodité de développement, pas un mode de production.
 
-Un avertissement unique est enregistré lorsque la solution de secours est utilisée.
+Partout ailleurs, l'envoi échoue de manière fermée. Sur Cloudflare Workers, avec une `DATABASE_URL` persistante ou avec `NODE_ENV=production`, `uploadFile()` lève `FileUploadStorageNotConfiguredError`, dont le champ `.setup` nomme ce qu'il faut configurer. Elle ne renvoie jamais une valeur que l'appelant pourrait confondre avec un fichier stocké.
+
+Un hôte déclare sa propre politique en en enregistrant une :
+
+```ts
+import { registerFallbackStoragePolicy } from "@agent-native/core/hosts";
+
+registerFallbackStoragePolicy({
+  id: "my-host",
+  priority: 30,
+  decide() {
+    if (!runningOnMyHost()) return null; // pas cet hôte
+    return {
+      permitted: false,
+      policy: "my-host",
+      reason: "This app runs on a host with no store for a file body.",
+      setup: "Bind an object store and set MY_HOST_BUCKET.",
+    };
+  },
+});
+```
 
 ## Hébergement Builder.io {#builder-hosting}
 
-Lorsque votre application est connectée à Builder.io, les téléchargements de fichiers sont automatiquement acheminés vers l'hébergement d'actifs de Builder. Les fichiers sont servis à partir d'un CDN sans aucune configuration nécessaire. Il s'agit de la configuration de production recommandée.
+Lorsque votre application est connectée à Builder.io (offre gratuite disponible), les téléchargements de fichiers sont automatiquement acheminés vers l'hébergement d'actifs de Builder. Les fichiers sont servis à partir d'un CDN sans aucune configuration nécessaire. Il s'agit de la configuration de production recommandée.
 
 ## Fournisseurs personnalisés {#custom-providers}
 
@@ -174,6 +194,14 @@ const result = await uploadFile({
 if (result) {
   // Provider handled it — result.url is the public URL
 } else {
-  // No provider configured — handle secours SQL yourself, or skip
+  // Aucun fournisseur configuré ET cet hôte autorise un repli local.
+  // Partout ailleurs, FileUploadStorageNotConfiguredError est levée à la place.
 }
 ```
+
+`uploadFile()` renvoie `null` pour exactement une condition : aucun fournisseur configuré et l'hôte autorise un repli. Les deux autres conditions sont des exceptions typées, donc elles ne peuvent jamais être confondues avec un fichier stocké :
+
+| Levée                                 | Signifie                                         | Réparation                                                                    |
+| ------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------- |
+| `FileUploadStorageNotConfiguredError` | Aucun stockage, et cet hôte refuse un repli.     | Lisez `.setup`.                                                               |
+| `FileUploadProviderUnreadableError`   | Impossible de lire si un stockage est configuré. | Réparez le magasin d'identifiants ; ce n'est pas une erreur de configuration. |

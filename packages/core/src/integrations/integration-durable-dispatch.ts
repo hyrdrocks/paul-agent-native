@@ -1,11 +1,14 @@
 import { hasConfiguredA2ASecret } from "../a2a/auth-policy.js";
+import { isDurableBackgroundTarget } from "../agent/background-transports.js";
 import {
   AGENT_BACKGROUND_PROCESSOR_FIELD,
   AGENT_BACKGROUND_PROCESSOR_INTEGRATION,
-  dispatchPathTargetsNetlifyBackgroundFunction,
-  resolveDurableBackgroundDispatchPath,
+  resolveBackgroundDispatchTarget,
 } from "../agent/durable-background.js";
-import { fireInternalDispatch } from "../server/self-dispatch.js";
+import {
+  fireBackgroundDispatch,
+  fireInternalDispatch,
+} from "../server/self-dispatch.js";
 import {
   INTEGRATION_DURABLE_DISPATCH_ENV,
   INTEGRATION_DURABLE_DISPATCH_SCOPES_ENV,
@@ -102,13 +105,12 @@ export function isIntegrationDurableDispatchEnabledForTask(
   ) {
     return false;
   }
-  const path = resolveDurableBackgroundDispatchPath(
-    INTEGRATION_PROCESS_TASK_PATH,
-  );
-  return (
-    dispatchPathTargetsNetlifyBackgroundFunction(path) &&
-    hasConfiguredA2ASecret()
-  );
+  // Any registered transport counts: they all carry their own budget. The
+  // in-process route is the portable one the non-durable path already uses.
+  const target = resolveBackgroundDispatchTarget({
+    fallbackPath: INTEGRATION_PROCESS_TASK_PATH,
+  });
+  return isDurableBackgroundTarget(target) && hasConfiguredA2ASecret();
 }
 
 async function recordDispatch(
@@ -157,14 +159,14 @@ export async function dispatchPendingIntegrationTask(input: {
     return "failed";
   }
   if (durable) {
-    const backgroundPath = resolveDurableBackgroundDispatchPath(
-      INTEGRATION_PROCESS_TASK_PATH,
-    );
+    const backgroundTarget = resolveBackgroundDispatchTarget({
+      fallbackPath: INTEGRATION_PROCESS_TASK_PATH,
+    });
     try {
-      await fireInternalDispatch({
+      await fireBackgroundDispatch({
         event: input.event,
         baseUrl: input.baseUrl,
-        path: backgroundPath,
+        target: backgroundTarget,
         taskId: input.taskId,
         body: {
           [AGENT_BACKGROUND_PROCESSOR_FIELD]:

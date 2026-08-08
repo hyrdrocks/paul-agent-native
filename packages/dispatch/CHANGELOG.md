@@ -1,6 +1,41 @@
 # @agent-native/dispatch
 
-## 1.0.0-paul.0
+## 0.19.1-paul.0
+
+### Patch Changes
+
+- 35958d1: Renumber the five packages that entering changesets pre mode bumped to `1.0.0`
+  back onto the `0.x` line, so a Fork version is the Upstream version it forks
+  advanced by its own changesets, plus the `-paul.N` prerelease suffix. No
+  changeset ever asked for that major: it is what changesets does to a package
+  declaring `@agent-native/core` as a `>=` peer dependency once core's version
+  carries a prerelease, because a prerelease satisfies no plain `>=` range.
+  `@agent-native/dispatch` goes to `0.17.0-paul.0`, and `creative-context`,
+  `frame`, `pinpoint` and `scheduling` to a patch above their baselines. A
+  vendored tarball name therefore moves backwards without the build inside it
+  moving backwards; `docs/adr/0008` says why.
+- Updated dependencies [f2fe0b3]
+- Updated dependencies [1c13483]
+- Updated dependencies [e6cf9fa]
+- Updated dependencies [8693d39]
+- Updated dependencies [5c07988]
+- Updated dependencies [b9ae314]
+- Updated dependencies [2c2f66d]
+- Updated dependencies [e5d6c95]
+- Updated dependencies [a33bb80]
+- Updated dependencies [20a6b93]
+- Updated dependencies [a12f7f9]
+- Updated dependencies [bef7405]
+- Updated dependencies [0ebd8af]
+- Updated dependencies [c2b7f82]
+- Updated dependencies [a1311d7]
+- Updated dependencies [e517dcc]
+- Updated dependencies [834ac94]
+- Updated dependencies [f2fe0b3]
+- Updated dependencies [d583f7d]
+  - @agent-native/core@0.145.3-paul.0
+
+## 0.17.0-paul.0
 
 ### Minor Changes
 
@@ -42,6 +77,83 @@
 - Updated dependencies [0c17835]
 - Updated dependencies [17b5fe8]
   - @agent-native/core@0.134.0-paul.0
+
+## 0.19.0
+
+### Minor Changes
+
+- 8f10ada: Move Dispatch management and operator tools into a dedicated Admin control plane.
+
+## 0.18.0
+
+### Minor Changes
+
+- d3f8794: Add a compact workspace app rail to Dispatch navigation for ready workspace apps.
+
+### Patch Changes
+
+- d3f8794: Restrict shared Vault values and mutations to workspace owners and admins while keeping safe key requests available to members.
+- Updated dependencies [d3f8794]
+  - @agent-native/toolkit@0.13.3
+
+## 0.17.6
+
+### Patch Changes
+
+- abb0cf5: Use canonical semantic settings routes for Dispatch team navigation.
+
+## 0.17.5
+
+### Patch Changes
+
+- 158965b: Report unauthorized thread-debug source access as a client-safe 403 instead of a server error.
+
+## 0.17.4
+
+### Patch Changes
+
+- 2765110: Restore the transactional email catalog and Brand Kit named-token public surfaces.
+
+## 0.17.3
+
+### Patch Changes
+
+- 277be3f: Clarify that a free Builder tier is available when connecting Dispatch app creation.
+- Updated dependencies [277be3f]
+- Updated dependencies [277be3f]
+  - @agent-native/toolkit@0.13.2
+
+## 0.17.2
+
+### Patch Changes
+
+- c71d383: Keep connected messaging chats out of app history by default, with an opt-in all-sources view and stable Dispatch branding.
+- Updated dependencies [c71d383]
+  - @agent-native/toolkit@0.13.1
+
+## 0.17.1
+
+### Patch Changes
+
+- Updated dependencies [106af0e]
+  - @agent-native/toolkit@0.13.0
+
+## 0.17.0
+
+### Minor Changes
+
+- 2b6fea3: Show connected apps alongside mounted workspace apps in the Dispatch control plane.
+
+## 0.16.7
+
+### Patch Changes
+
+- f499dff: Add `@agent-native/core/vitest-config`, a base vitest config that caps a suite's
+  worker pool so concurrent test runs no longer oversubscribe the CPU. Defaults to
+  25% of cores; override with `VITEST_CONCURRENCY`. Every template and package
+  config merges it in.
+- Updated dependencies [f499dff]
+  - @agent-native/toolkit@0.12.2
 
 ## 0.16.6
 

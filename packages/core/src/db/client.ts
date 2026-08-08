@@ -10,6 +10,7 @@
  */
 import path from "path";
 
+import { isCloudflareRuntime } from "../shared/runtime.js";
 import {
   beginDatabaseOperation,
   recordDatabaseRetry,
@@ -473,6 +474,123 @@ export function getDialect(): Dialect {
 
 export function isPostgres(): boolean {
   return getDialect() === "postgres";
+}
+
+// ---------------------------------------------------------------------------
+// Dialect capabilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the active dialect can hold a transaction open across round trips —
+ * `BEGIN`, then read, decide, write, `COMMIT`.
+ *
+ * Read the name literally. This is NOT "can this dialect write atomically":
+ * every supported dialect can, and the one that answers `false` here does so
+ * through a batched statement list submitted as a single implicit transaction.
+ * Only the *interactive* form is missing, because there is no session to hold
+ * a `BEGIN` open on. A caller that reads this as "no atomicity available" will
+ * reach for a weaker workaround — a non-transactional write loop — and lose a
+ * guarantee it could have kept. Branch on it to choose *which* atomic shape to
+ * use, never to decide whether atomicity is possible.
+ */
+export function supportsInteractiveTransactions(): boolean {
+  return getDialect() !== "d1";
+}
+
+/**
+ * The human-readable name of a dialect, for surfaces that show a user which
+ * database they are connected to. Lives with the dialect so a product name is
+ * not assembled inside an unrelated HTML builder.
+ */
+const DIALECT_LABELS: Record<Dialect, string> = {
+  sqlite: "SQLite (local file)",
+  postgres: "Postgres",
+  d1: "Cloudflare D1",
+};
+
+export function getDialectLabel(): string {
+  return DIALECT_LABELS[getDialect()];
+}
+
+/**
+ * Whether the active dialect is configured by a platform binding rather than by
+ * a connection URL. Distinct from "no URL is set": a URL-configured dialect can
+ * still resolve its URL from an env var a given caller does not read.
+ */
+export function isPlatformBoundDialect(): boolean {
+  return getDialect() === "d1";
+}
+
+/**
+ * The platform binding the active dialect reads, resolved per property access.
+ *
+ * The binding arrives on `globalThis.__cf_env` once per Worker invocation,
+ * while a client built over it is typically cached for the isolate's lifetime.
+ * Capturing the binding at build time would pin every later request to the
+ * first invocation's I/O context; this proxy defers the lookup to the call, so
+ * each request uses its own.
+ *
+ * Throws when nothing is bound rather than returning an inert object: a caller
+ * that fell through to the local-SQLite path would reach the fail-closed
+ * `better-sqlite3` stub and report "is not a constructor", which names neither
+ * the missing binding nor the dialect that asked for it.
+ */
+export function platformBoundDbBinding(): object {
+  if (!isPlatformBoundDialect()) {
+    // The message below would name a product this process is not on. Callers
+    // reach the binding through `createPlatformBoundDbClient`, which asks first.
+    throw new Error(
+      "[db] platformBoundDbBinding() was called on a dialect configured by a " +
+        "connection URL, which has no platform binding to resolve.",
+    );
+  }
+  const resolve = (): Record<string | symbol, unknown> => {
+    const binding = getCloudflareD1Binding();
+    if (!binding) {
+      throw new Error(
+        "[agent-native] Database dialect resolved to Cloudflare D1 but no D1 database is bound to `env.DB`. " +
+          'Add a `d1_databases` entry with binding "DB" to the Worker\'s Wrangler config, or set DATABASE_URL to use an external database.',
+      );
+    }
+    return binding as Record<string | symbol, unknown>;
+  };
+  return new Proxy(
+    {},
+    {
+      get(_target, property) {
+        const binding = resolve();
+        const value = binding[property];
+        return typeof value === "function" ? value.bind(binding) : value;
+      },
+    },
+  );
+}
+
+export interface PlatformBoundDbClient {
+  /** A Drizzle instance over the platform binding, bound to `schema`. */
+  db: ReturnType<typeof import("drizzle-orm/d1").drizzle>;
+  /** The SQL flavour a Drizzle adapter must be told this client speaks. */
+  drizzleProvider: "sqlite" | "pg";
+}
+
+/**
+ * A Drizzle client for dialects configured by a platform binding rather than a
+ * connection URL, or `undefined` when the active dialect is URL-configured and
+ * the caller should build its own client from that URL.
+ *
+ * `undefined` means "this dialect has no platform binding to resolve", which is
+ * a different answer from "the binding is missing" — that case throws on first
+ * use through `platformBoundDbBinding`.
+ */
+export async function createPlatformBoundDbClient(
+  schema: Record<string, unknown>,
+): Promise<PlatformBoundDbClient | undefined> {
+  if (!isPlatformBoundDialect()) return undefined;
+  const { drizzle } = await import("drizzle-orm/d1");
+  return {
+    db: drizzle(platformBoundDbBinding() as never, { schema }),
+    drizzleProvider: "sqlite",
+  };
 }
 
 function dialectForConfig(config: DbExecConfig): Dialect {
@@ -966,13 +1084,37 @@ export function pgPoolOptions(url: string): Record<string, unknown> {
   const serverless = isServerlessRuntime();
   return {
     onnotice: () => {},
-    max: serverless ? 4 : 20,
+    max: serverless ? serverlessPoolMax() : 20,
     idle_timeout: serverless ? 20 : 240,
     max_lifetime: 60 * 30,
     connect_timeout: 10,
+    ...(serverless
+      ? {
+          connection: {
+            idle_in_transaction_session_timeout: 30_000,
+          },
+        }
+      : {}),
     // Supabase's connection pooler (Transaction mode) requires prepare:false.
     // Only disable for Supabase URLs to avoid degrading other deployments.
     ...(url.includes("supabase") ? { prepare: false } : {}),
+  };
+}
+
+/**
+ * Shared options for every Neon serverless pool. The startup parameter is
+ * applied by Postgres before the first transaction, so a killed function
+ * cannot return a connection that remains idle in transaction indefinitely.
+ */
+export function neonPoolOptions(): {
+  max: number;
+  idle_in_transaction_session_timeout?: number;
+} {
+  return {
+    max: neonPoolMax(),
+    ...(isServerlessRuntime()
+      ? { idle_in_transaction_session_timeout: 30_000 }
+      : {}),
   };
 }
 
@@ -992,19 +1134,29 @@ export function pgPoolOptions(url: string): Record<string, unknown> {
  */
 export function neonPoolMax(): number {
   if (!isServerlessRuntime()) return 20;
-  // The durable background-function worker is a SINGLE process per run (unlike
-  // the many warm request-instances the foreground serverless has), so it can
-  // safely hold a larger pool without risking Neon's connection cap. The agent's
-  // pre-send setup fires ~6 concurrent DB reads in parallel; with only 2
-  // connections that burst exhausts the pool and a single stalled connection
-  // freezes the worker before it can claim — observed on analytics' heavier
-  // action surface, where the worker froze right after `model_done` and never
-  // recorded `env_config`/`presend`, while the foreground (10-connection pool)
-  // ran the identical code in ~2s. Give the bg worker enough connections for the
-  // burst; keep the foreground serverless pool tiny to avoid "Max client
-  // connections reached" across many warm instances.
-  if (isBackgroundFunctionPoolContext()) return 8;
-  return 4;
+  return serverlessPoolMax();
+}
+
+function serverlessPoolMax(): number {
+  // Scheduled Analytics workers run independently and may overlap across
+  // invocations. They process work sequentially, so one connection prevents
+  // a slow sweep from multiplying Neon connections while foreground requests
+  // retain two slots for their concurrent reads.
+  if (isLowConnectionBackgroundRuntime()) return 1;
+  // Netlify can run several background workers concurrently. Keep their four
+  // slots: the agent pre-send setup fires ~6 concurrent DB reads, and two
+  // connections previously froze the worker before it could claim. Foreground
+  // requests use two slots instead, leaving more headroom across warm
+  // instances where the user-facing routes are the pressure source.
+  if (isBackgroundFunctionPoolContext()) return 4;
+  return 2;
+}
+
+function isLowConnectionBackgroundRuntime(): boolean {
+  return (
+    (globalThis as Record<string, unknown>)
+      .__AGENT_NATIVE_LOW_CONNECTION_BACKGROUND_RUNTIME__ === true
+  );
 }
 
 /**
@@ -1345,7 +1497,7 @@ async function createDbExecInternal(
       // The foreground and transaction surface keep the WebSocket pool.
       const bgHttp = isBackgroundFunctionPoolContext();
       const makePool = () =>
-        new Pool({ connectionString: url, max: neonPoolMax() });
+        new Pool({ connectionString: url, ...neonPoolOptions() });
       // The singleton exec shares the process pool; `createDbExec()` callers own
       // a `close()` and so must not be handed it.
       const pool = trackSingletonResources
@@ -1572,8 +1724,17 @@ async function createDbExecInternal(
               releaseClient();
               return result;
             } catch (err) {
-              await queryNeonClient(client, "ROLLBACK").catch(() => {});
-              releaseClient(isConnectionError(err) ? true : undefined);
+              let rollbackFailed = false;
+              try {
+                await queryNeonClient(client, "ROLLBACK");
+              } catch {
+                rollbackFailed = true;
+              }
+              // A failed rollback can leave the backend inside the transaction.
+              // Do not return that client to PgBouncer as if it were clean.
+              releaseClient(
+                isConnectionError(err) || rollbackFailed ? true : undefined,
+              );
               throw err;
             }
           }, 1);
@@ -1586,12 +1747,11 @@ async function createDbExecInternal(
     }
 
     const { default: postgres } = await import("postgres");
-    const isWorkers =
-      "__cf_env" in globalThis ||
-      (typeof navigator !== "undefined" &&
-        navigator.userAgent === "Cloudflare-Workers");
-
-    if (isWorkers) {
+    // Detected in exactly one place. The copy that used to live here omitted
+    // the `__env__` branch, so on a Workers deploy that sets only that global
+    // this fell through to the pooled Node path and shared a connection across
+    // requests — which Workers forbids.
+    if (isCloudflareRuntime()) {
       // Workers: fresh connection per query — I/O can't be shared across requests
       return {
         async execute(sql) {

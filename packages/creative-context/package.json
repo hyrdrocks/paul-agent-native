@@ -1,6 +1,6 @@
 {
   "name": "@agent-native/creative-context",
-  "version": "1.0.0-paul.0",
+  "version": "0.6.3-paul.0",
   "description": "Shared creative context ingestion, versioning, search, brand DNA, and context-pack primitives for agent-native apps.",
   "homepage": "https://github.com/BuilderIO/agent-native#readme",
   "bugs": {
@@ -69,7 +69,7 @@
     "vitest": "catalog:"
   },
   "peerDependencies": {
-    "@agent-native/core": ">=0.134.0-paul.0",
+    "@agent-native/core": ">=0.145.3-paul.0",
     "@agent-native/toolkit": ">=0.1.0",
     "@tabler/icons-react": ">=3.41.1",
     "@tanstack/react-query": ">=5.101.4",
@@ -92,6 +92,7 @@
     }
   },
   "optionalDependencies": {
+    "@sparticuz/chromium": "149.0.0",
     "officeparser": "^7.3.0",
     "playwright": "^1.61.1"
   },

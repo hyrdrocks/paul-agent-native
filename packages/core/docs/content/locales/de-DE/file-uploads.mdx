@@ -1,6 +1,6 @@
 ---
 title: "Datei-Uploads"
-description: "Datei-Upload-Speicher konfigurieren – SQL-Fallback für Entwickler, Builder.io oder benutzerdefinierte Anbieter für die Produktion."
+description: "Datei-Upload-Speicher konfigurieren – Builder.io, Cloudflare R2 oder eigene Anbieter; ob ein reiner Entwicklungs-SQL-Fallback überhaupt erlaubt ist, entscheidet der Host."
 ---
 
 # Datei-Uploads
@@ -15,7 +15,7 @@ Die Reihenfolge der Anbieterauflösung lautet:
 
 1. **Vom Benutzer registrierte Anbieter** – benutzerdefinierte Anbieter, die über `registerFileUploadProvider()` registriert wurden
 2. **Builder.io-Anbieter** – integriert, wird automatisch aktiviert, wenn Builder.io verbunden ist
-3. **SQL Fallback** – speichert Dateien als Base64 in der Datenbank (gut für Entwickler, nicht für Produktion)
+3. **SQL Fallback** – speichert Dateien als Base64 in der Datenbank, nur wo der Host es erlaubt (lokale Entwicklung; nie auf Workers, mit einer dauerhaften Datenbank oder in der Produktion)
 
 <Diagram id="doc-block-1f4e9e3" title={"Anordnung zur Lösung des Anbieters"} summary={"uploadFile() wählt den ersten konfigurierten Anbieter der Reihe nach aus. Der SQL-Fallback ist immer vorhanden, sodass Uploads ohne Setup funktionieren."}>
 
@@ -96,13 +96,33 @@ Dispatches to the first configured provider in resolution order. Check the activ
 
 ## Standard: SQL Fallback {#sql-fallback}
 
-Wenn kein Anbieter konfiguriert ist, werden Dateien über das Ressourcensystem als Base64-Daten in der SQL-Datenbank gespeichert. Dies funktioniert sofort für die lokale Entwicklung, wird jedoch nicht für die Produktion empfohlen – große Dateien blähen die Datenbank auf und es gibt kein CDN.
+Wenn kein Anbieter konfiguriert ist, entscheidet der **Host**, ob die Nutzlast überhaupt woanders gespeichert werden darf — nicht der aufrufende Code. Ein lokaler Lauf gegen eine lokale Datenbank speichert die Datei als Base64 in SQL über das Ressourcensystem und protokolliert eine einmalige Warnung; das ist eine Entwicklungshilfe, kein Produktionsmodus.
 
-Eine einmalige Warnung wird protokolliert, wenn der Fallback verwendet wird.
+Überall sonst schlägt der Upload geschlossen fehl. Auf Cloudflare Workers, gegen ein dauerhaftes `DATABASE_URL` oder mit `NODE_ENV=production` wirft `uploadFile()` einen `FileUploadStorageNotConfiguredError` mit einem `.setup`-Text, der benennt, was zu konfigurieren ist. Es gibt nie einen Wert zurück, den der Aufrufer mit einer gespeicherten Datei verwechseln könnte.
+
+Ein Host deklariert seine eigene Richtlinie, indem er eine registriert:
+
+```ts
+import { registerFallbackStoragePolicy } from "@agent-native/core/hosts";
+
+registerFallbackStoragePolicy({
+  id: "my-host",
+  priority: 30,
+  decide() {
+    if (!runningOnMyHost()) return null; // nicht dieser Host
+    return {
+      permitted: false,
+      policy: "my-host",
+      reason: "This app runs on a host with no store for a file body.",
+      setup: "Bind an object store and set MY_HOST_BUCKET.",
+    };
+  },
+});
+```
 
 ## Builder.io Hosting {#builder-hosting}
 
-Wenn Ihre App mit Builder.io verbunden ist, werden Datei-Uploads automatisch an das Asset-Hosting von Builder weitergeleitet. Dateien werden von einem CDN bereitgestellt, ohne dass eine Konfiguration erforderlich ist. Dies ist die empfohlene Produktionskonfiguration.
+Wenn Ihre App mit Builder.io verbunden ist (kostenloser Tarif verfügbar), werden Datei-Uploads automatisch an das Asset-Hosting von Builder weitergeleitet. Dateien werden von einem CDN bereitgestellt, ohne dass eine Konfiguration erforderlich ist. Dies ist die empfohlene Produktionskonfiguration.
 
 ## Benutzerdefinierte Anbieter {#custom-providers}
 
@@ -174,6 +194,14 @@ const result = await uploadFile({
 if (result) {
   // Provider handled it — result.url is the public URL
 } else {
-  // No provider configured — handle SQL-Fallback yourself, or skip
+  // Kein Anbieter konfiguriert UND dieser Host erlaubt einen lokalen Fallback.
+  // Überall sonst wird stattdessen FileUploadStorageNotConfiguredError geworfen.
 }
 ```
+
+`uploadFile()` gibt `null` für genau eine Bedingung zurück — kein Anbieter konfiguriert und der Host erlaubt einen Fallback. Die beiden anderen Bedingungen sind typisierte Throws und können daher nie mit einer gespeicherten Datei verwechselt werden:
+
+| Geworfen                              | Bedeutet                                                       | Behebung                                                        |
+| ------------------------------------- | -------------------------------------------------------------- | --------------------------------------------------------------- |
+| `FileUploadStorageNotConfiguredError` | Kein Speicher, und dieser Host lehnt einen Fallback ab.        | `.setup` lesen.                                                 |
+| `FileUploadProviderUnreadableError`   | Ob ein Speicher konfiguriert ist, konnte nicht gelesen werden. | Credential-Store reparieren; das ist kein Konfigurationsfehler. |

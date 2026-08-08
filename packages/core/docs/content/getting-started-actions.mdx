@@ -1,0 +1,84 @@
+---
+title: "Add an Action"
+description: "Define your first action and render its result as a chart directly inside the chat."
+---
+
+# Add an Action
+
+This is part two of the Getting Started series. In [Getting Started](/docs/getting-started)
+you created a Chat app. Here you'll define a typed text analyzer and render its
+result in the chat.
+
+## Add an action {#add-an-action}
+
+An action is a typed operation that both the agent and your UI can call. Actions
+live in the `actions/` directory and are the shared operation surface for chat,
+React components, the CLI, and other callers.
+
+Create `actions/analyze-text.ts`:
+
+```ts filename="actions/analyze-text.ts"
+import { defineAction } from "@agent-native/core/action";
+import { ACTION_CHAT_UI_DATA_CHART_RENDERER } from "@agent-native/core/action-ui";
+import {
+  createDataChartWidgetResult,
+  dataChartWidgetResultSchema,
+} from "@agent-native/core/data-widgets";
+import { z } from "zod";
+
+export default defineAction({
+  description: "Count words, sentences, and paragraphs in a block of text.",
+  schema: z.object({
+    text: z.string().default("The quick brown fox jumps over the lazy dog."),
+  }),
+  outputSchema: dataChartWidgetResultSchema,
+  chatUI: {
+    renderer: ACTION_CHAT_UI_DATA_CHART_RENDERER,
+    title: "Text stats",
+  },
+  readOnly: true,
+  run: async ({ text }) => {
+    const points = [
+      { label: "Characters", value: text.length },
+      { label: "Words", value: text.split(/\s+/).filter(Boolean).length },
+      {
+        label: "Sentences",
+        value: text.split(/[.!?]+/).filter(Boolean).length,
+      },
+      {
+        label: "Paragraphs",
+        value: text.split(/\n\n+/).filter(Boolean).length,
+      },
+    ];
+
+    return createDataChartWidgetResult({
+      title: "Text statistics",
+      chartSeries: {
+        type: "bar",
+        xKey: "label",
+        series: [{ key: "value", label: "Count" }],
+        data: points,
+      },
+    });
+  },
+});
+```
+
+Run it from the terminal:
+
+```bash
+pnpm action analyze-text --text "Hello world. How are you today?"
+```
+
+Or ask the agent in chat:
+
+> Run the analyze-text action on "Hello world. How are you today?"
+
+The built-in `data-chart` renderer turns the structured result into a chart in
+the transcript. There is no renderer file or `app/root.tsx` import to add. For
+custom native components, see [Native Chat UI](/docs/native-chat-ui).
+
+## Continue
+
+Continue with [Persist Data in SQL](/docs/getting-started-database) to save
+analysis results for later.

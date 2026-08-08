@@ -3,6 +3,7 @@ import { z } from "zod";
 import { defineAction } from "../../action.js";
 import { ssrfSafeFetch } from "../../extensions/url-safety.js";
 import { getRequestUserEmail } from "../../server/request-context.js";
+import { describeFileUploadRefusal } from "../errors.js";
 import { uploadFile } from "../registry.js";
 
 const MAX_REMOTE_FETCH_BYTES = 25 * 1024 * 1024;
@@ -134,7 +135,7 @@ async function fetchRemote(url: string): Promise<{
 function uploadNotConfiguredError(): string {
   return [
     "Image uploads are not configured for this app.",
-    "Connect or reconnect Builder.io in Settings → File uploads, or register a custom provider (S3, R2, GCS, etc.) via registerFileUploadProvider().",
+    "Connect or reconnect Builder.io (free tier available) in Settings → File uploads, or register a custom provider (S3, R2, GCS, etc.) via registerFileUploadProvider().",
   ].join(" ");
 }
 
@@ -189,12 +190,22 @@ export default defineAction({
     const filename = (args.filename || defaultFilename(mimeType)).trim();
     const ownerEmail = getRequestUserEmail() ?? undefined;
 
-    const result = await uploadFile({
-      data: bytes,
-      filename,
-      mimeType,
-      ownerEmail,
-    });
+    let result: Awaited<ReturnType<typeof uploadFile>>;
+    try {
+      result = await uploadFile({
+        data: bytes,
+        filename,
+        mimeType,
+        ownerEmail,
+      });
+    } catch (err) {
+      // Report the store's own setup step rather than the generic connect-
+      // Builder line: on a host with no fallback the missing piece is a
+      // bucket, and naming Builder there sends the agent somewhere useless.
+      const refusal = describeFileUploadRefusal(err);
+      if (!refusal) throw err;
+      return { ...refusal, configured: false };
+    }
 
     if (!result) {
       return {

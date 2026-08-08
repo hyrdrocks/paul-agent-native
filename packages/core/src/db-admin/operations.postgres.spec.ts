@@ -92,6 +92,8 @@ vi.mock("../db/client.js", () => {
   return {
     getDbExec: () => ({ execute }),
     getDialect: () => "postgres",
+    isPlatformBoundDialect: () => false,
+    getDialectLabel: () => "Postgres",
     isPostgres: () => true,
   };
 });

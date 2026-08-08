@@ -22,6 +22,11 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 import {
+  AGENT_BACKGROUND_QUEUE_BINDING,
+  agentBackgroundQueueName,
+  BACKGROUND_QUEUE_MESSAGE_KIND,
+} from "../agent/background-queue.js";
+import {
   AGENT_BACKGROUND_FUNCTION_NAME,
   AGENT_BACKGROUND_FUNCTION_URL_PATH,
   AGENT_BACKGROUND_PROCESSOR_A2A,
@@ -29,15 +34,27 @@ import {
   AGENT_BACKGROUND_PROCESSOR_INTEGRATION,
   AGENT_BACKGROUND_PROCESSOR_ROUTE,
   AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD,
+  AGENT_CHAT_DURABLE_BACKGROUND_ENV,
   AGENT_CHAT_PROCESS_RUN_PATH,
+  BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY,
   isDurableBackgroundFlagExplicitlyDisabled,
 } from "../agent/durable-background.js";
+import {
+  CLOUDFLARE_BROWSER_BINDING_NAME,
+  CLOUDFLARE_BROWSER_RENDERING_ENV,
+} from "../browser-rendering/cloudflare-browser.js";
+import { CLOUDFLARE_R2_BINDING_NAME } from "../file-upload/cloudflare-r2.js";
 import {
   INTEGRATION_RECOVERY_RUNTIME_MARKER,
   INTEGRATION_RETRY_SWEEP_PATH,
   INTEGRATION_RETRY_SWEEP_TOKEN_SUBJECT,
   isIntegrationDurableDispatchConfigured,
 } from "../integrations/integration-durable-dispatch-config.js";
+import { isValidCron } from "../jobs/cron.js";
+import {
+  RECURRING_JOBS_SWEEP_PATH,
+  RECURRING_JOBS_SWEEP_TOKEN_SUBJECT,
+} from "../jobs/scheduler-dispatch.js";
 import { normalizeAppBasePath } from "../server/app-base-path.js";
 import {
   DEFAULT_SPECULATION_RULES_PATH,
@@ -53,10 +70,14 @@ import {
   AGENT_NATIVE_SOCIAL_IMAGE_WIDTH,
 } from "../shared/social-meta.js";
 import { generateActionRegistryForProject } from "../vite/action-types-plugin.js";
+import { cloneServerBundleForFunction, copyDir } from "./function-bundle.js";
 import {
   collectImmutableAssetPaths,
+  collectMutableAssetPaths,
+  hasAssetsDir,
   IMMUTABLE_ASSET_CACHE_CONTROL,
   IMMUTABLE_ASSET_CACHE_HEADERS,
+  IMMUTABLE_ASSET_ROUTE_GLOB,
   prefixAssetPath,
 } from "./immutable-assets.js";
 import {
@@ -88,6 +109,62 @@ export function isCloudflareModulePreset(targetPreset: string): boolean {
 
 export const CLOUDFLARE_MODULE_WORKER_ENTRY = "worker.mjs";
 
+/**
+ * Source for the queue consumer's processor-selection routing.
+ *
+ * The Netlify background function makes the same decision from the same body
+ * field and deliberately keeps its own inlined copy (see
+ * `emitSingleTemplateNetlifyBackgroundFunction`): that host's emitted bytes are
+ * a regression surface this work must not touch. The two therefore CAN drift on
+ * the allow-list — if you change one, change the other, and prefer collapsing
+ * them into this generator the next time the Netlify emit is in scope.
+ */
+function backgroundProcessorRoutingSource(): string {
+  return `// The framework route the router dispatches to (the _process-run plugin).
+const PROCESS_RUN_PATH = ${JSON.stringify(AGENT_CHAT_PROCESS_RUN_PATH)};
+const A2A_PROCESS_TASK_PATH = ${JSON.stringify("/_agent-native/a2a/_process-task")};
+const INTEGRATION_PROCESS_TASK_PATH = ${JSON.stringify("/_agent-native/integrations/process-task")};
+const BACKGROUND_PROCESSOR_FIELD = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_FIELD)};
+const BACKGROUND_PROCESSOR_A2A = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_A2A)};
+const BACKGROUND_PROCESSOR_INTEGRATION = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_INTEGRATION)};
+const BACKGROUND_PROCESSOR_ROUTE = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_ROUTE)};
+const BACKGROUND_PROCESSOR_ROUTE_FIELD = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD)};
+
+function processorPathFromParsedBody(parsed) {
+  if (!parsed) return null;
+  if (parsed[BACKGROUND_PROCESSOR_FIELD] === BACKGROUND_PROCESSOR_A2A) {
+    return A2A_PROCESS_TASK_PATH;
+  }
+  if (parsed[BACKGROUND_PROCESSOR_FIELD] === BACKGROUND_PROCESSOR_INTEGRATION) {
+    return INTEGRATION_PROCESS_TASK_PATH;
+  }
+  const route = parsed[BACKGROUND_PROCESSOR_ROUTE_FIELD];
+  if (
+    parsed[BACKGROUND_PROCESSOR_FIELD] === BACKGROUND_PROCESSOR_ROUTE &&
+    typeof route === "string" &&
+    route.startsWith("/") &&
+    route.includes("/api/_agent-native-background/") &&
+    !route.includes("?") &&
+    !route.includes("#")
+  ) {
+    return route;
+  }
+  return null;
+}`;
+}
+
+/**
+ * The generated Worker entry: Nitro's request handler plus the durable
+ * background queue consumer.
+ *
+ * The consumer is the Cloudflare half of the durable background path. Per
+ * message it enters the per-invocation background scope, synthesises a POST to
+ * the processor route the message selects — carrying the signed internal token
+ * the producer minted — and delegates to the SAME handler that serves fetch.
+ * Structurally the move the Netlify wrapper makes when it rewrites an incoming
+ * pathname; the difference is only that there is no inbound request to rewrite,
+ * so the envelope carries the origin.
+ */
 export function generateCloudflareModuleWorkerEntry(): string {
   return `let handler;
 
@@ -109,6 +186,66 @@ function initializeBindings(env) {
   }
 }
 
+${backgroundProcessorRoutingSource()}
+
+const BACKGROUND_QUEUE_MESSAGE_KIND = ${JSON.stringify(BACKGROUND_QUEUE_MESSAGE_KIND)};
+const ENTER_BACKGROUND_SCOPE_KEY = ${JSON.stringify(BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY)};
+
+function isBackgroundRunMessage(body) {
+  return Boolean(body) && body.kind === BACKGROUND_QUEUE_MESSAGE_KIND;
+}
+
+// A body carrying NO processor field is an agent-chat turn — that is the
+// documented default. A body that DECLARES a processor this entry cannot route
+// is a different fact entirely, and running it as an agent-chat turn would
+// execute the wrong processor and report success. Refuse it.
+function processorPathForEnvelope(body) {
+  const routed = processorPathFromParsedBody(body);
+  if (routed) return routed;
+  const declared = body && body[BACKGROUND_PROCESSOR_FIELD];
+  if (declared != null) {
+    throw new Error(
+      "[agent-background] queued message declares processor " +
+        JSON.stringify(declared) +
+        " which does not resolve to a processor route — refusing to run it as an agent-chat turn.",
+    );
+  }
+  return PROCESS_RUN_PATH;
+}
+
+// One durable background run, on this consumer invocation's 15-minute budget.
+// The scope entered here is what proves to the framework that THIS invocation
+// may take the long budget — an isolate-wide marker cannot, because one isolate
+// serves concurrent fetch and queue invocations. A missing bridge means the run
+// would silently take the foreground clamp instead, so refuse the message.
+async function runBackgroundQueueMessage(message, env, ctx) {
+  const envelope = message.body;
+  const enterBackgroundScope = globalThis[ENTER_BACKGROUND_SCOPE_KEY];
+  if (typeof enterBackgroundScope !== "function") {
+    throw new Error(
+      "[agent-background] the framework bundle did not publish " +
+        ENTER_BACKGROUND_SCOPE_KEY +
+        " — refusing to run this message under the foreground clamp it was queued to escape.",
+    );
+  }
+  const url = new URL(processorPathForEnvelope(envelope.body), envelope.origin);
+  const headers = { "Content-Type": "application/json" };
+  // The signed internal token the producer minted, carried verbatim: the queue
+  // handoff authenticates exactly like the HTTP handoff the processor routes
+  // already verify.
+  if (envelope.authorization) headers["Authorization"] = envelope.authorization;
+  const request = new Request(url.toString(), {
+    method: "POST",
+    headers,
+    body: JSON.stringify(envelope.body ?? {}),
+  });
+  if (typeof ctx?.waitUntil === "function") {
+    request.waitUntil = ctx.waitUntil.bind(ctx);
+  }
+  const loaded = await loadHandler();
+  return await enterBackgroundScope(() => loaded.fetch(request, env, ctx));
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (typeof ctx?.waitUntil === "function") {
@@ -127,7 +264,79 @@ export default {
   },
   async queue(batch, env, ctx) {
     initializeBindings(env);
-    return (await loadHandler()).queue?.(batch, env, ctx);
+    const ours = [];
+    const foreign = [];
+    for (const message of batch.messages) {
+      (isBackgroundRunMessage(message.body) ? ours : foreign).push(message);
+    }
+    for (const message of ours) {
+      try {
+        const response = await runBackgroundQueueMessage(message, env, ctx);
+        // A 5xx is the processor failing, not the message being bad: retry it
+        // and let the queue's own retry/dead-letter policy bound that. Any
+        // other status means the route made a decision (ran it, or refused the
+        // token) and redelivering would only repeat it. NO response at all is
+        // neither — it means the handler did not answer, and acknowledging that
+        // would drop the run while reporting it delivered.
+        if (!response || typeof response.status !== "number") {
+          console.error(
+            "[agent-background] the request handler returned no response for queued run " +
+              message.body.taskId +
+              " — retrying the message rather than acknowledging an unrun turn.",
+          );
+          message.retry();
+        } else if (response.status >= 500) {
+          console.error(
+            "[agent-background] processor returned HTTP " +
+              response.status +
+              " for queued run " +
+              message.body.taskId +
+              " — retrying the message.",
+          );
+          message.retry();
+        } else {
+          message.ack();
+        }
+      } catch (err) {
+        console.error(
+          "[agent-background] queue consumer failed before the processor answered for run " +
+            (message.body && message.body.taskId) + ":",
+          (err && err.stack) || err,
+        );
+        message.retry();
+      }
+    }
+    if (foreign.length === 0) return;
+    // Another consumer's queue shares this Worker's single queue handler. Hand
+    // those messages to Nitro's own handler if it has one; never ack a message
+    // this entry did not understand.
+    const nitroQueue = (await loadHandler()).queue;
+    if (typeof nitroQueue !== "function") {
+      console.error(
+        "[agent-background] " +
+          foreign.length +
+          " message(s) on queue " +
+          batch.queue +
+          " are not durable background runs and no application queue handler is registered — " +
+          "retrying them rather than acknowledging work nothing consumed.",
+      );
+      for (const message of foreign) message.retry();
+      return;
+    }
+    return nitroQueue(
+      {
+        queue: batch.queue,
+        messages: foreign,
+        ackAll: () => {
+          for (const message of foreign) message.ack();
+        },
+        retryAll: (options) => {
+          for (const message of foreign) message.retry(options);
+        },
+      },
+      env,
+      ctx,
+    );
   },
   async tail(traces, env, ctx) {
     initializeBindings(env);
@@ -202,7 +411,339 @@ export function patchCloudflareModuleNitroEntry(code: string): string {
   return patched;
 }
 
-export function configureCloudflareModuleWorkerOutput(serverDir: string): void {
+/**
+ * The D1 binding name the database layer reads. `getCloudflareD1Binding()`
+ * looks at `env.DB` and nothing else, so this is fixed rather than
+ * configurable — a renameable binding would be configuration no reader honours.
+ */
+export const CLOUDFLARE_D1_BINDING_NAME = "DB";
+
+export interface CloudflareD1BindingConfig {
+  binding: string;
+  database_name: string;
+  database_id: string;
+}
+
+/**
+ * Resolve the Worker's D1 binding from the build environment.
+ *
+ * Absent means "this Worker uses an external DATABASE_URL" — emitting a
+ * binding with a placeholder id would break its deploy. Half-configured
+ * throws: a dropped binding leaves the Worker resolving the SQLite dialect and
+ * hitting the fail-closed `better-sqlite3` stub at the first query, which reads
+ * as a missing native module rather than as missing configuration.
+ */
+export function resolveCloudflareD1Binding(
+  env: NodeJS.ProcessEnv = process.env,
+): CloudflareD1BindingConfig | null {
+  const databaseName = env.CLOUDFLARE_D1_DATABASE_NAME?.trim();
+  const databaseId = env.CLOUDFLARE_D1_DATABASE_ID?.trim();
+  if (!databaseName && !databaseId) return null;
+  if (!databaseName) {
+    throw new Error(
+      "[deploy] CLOUDFLARE_D1_DATABASE_ID is set without CLOUDFLARE_D1_DATABASE_NAME — set both to bind D1, or neither to use DATABASE_URL",
+    );
+  }
+  if (!databaseId) {
+    throw new Error(
+      "[deploy] CLOUDFLARE_D1_DATABASE_NAME is set without CLOUDFLARE_D1_DATABASE_ID — set both to bind D1, or neither to use DATABASE_URL",
+    );
+  }
+  return {
+    binding: CLOUDFLARE_D1_BINDING_NAME,
+    database_name: databaseName,
+    database_id: databaseId,
+  };
+}
+
+/**
+ * Re-exported beside `CLOUDFLARE_D1_BINDING_NAME` so both binding names a
+ * generated Worker config carries are reachable from one place. It is DEFINED
+ * next to the provider that reads it — a constant that lives apart from its
+ * only reader is how a rename produces a binding nothing reads.
+ */
+export { CLOUDFLARE_R2_BINDING_NAME };
+
+export interface CloudflareR2BindingConfig {
+  binding: string;
+  bucket_name: string;
+}
+
+/**
+ * Resolve the Worker's R2 binding from the build environment.
+ *
+ * Absent means "this Worker has no object storage", and no binding is emitted
+ * — the upload path then fails closed at runtime with setup guidance rather
+ * than reaching SQL. Conditional on purpose: an unconditional binding makes a
+ * bucket a prerequisite for every deploy, including apps that never upload a
+ * file, and they find out from a `wrangler deploy` failure rather than from
+ * anything they configured.
+ */
+export function resolveCloudflareR2Binding(
+  env: NodeJS.ProcessEnv = process.env,
+): CloudflareR2BindingConfig | null {
+  const bucketName = env.CLOUDFLARE_R2_BUCKET_NAME?.trim();
+  if (!bucketName) return null;
+  return { binding: CLOUDFLARE_R2_BINDING_NAME, bucket_name: bucketName };
+}
+
+/**
+ * Re-exported beside the D1 and R2 binding names, and DEFINED next to the code
+ * that reads it (`browser-rendering/cloudflare-browser.ts`) for the same reason
+ * — a constant that lives apart from its only reader is how a rename produces a
+ * binding nothing reads.
+ */
+export { CLOUDFLARE_BROWSER_BINDING_NAME, CLOUDFLARE_BROWSER_RENDERING_ENV };
+
+export interface CloudflareBrowserBindingConfig {
+  binding: string;
+}
+
+const CLOUDFLARE_TOGGLE_ON = new Set(["1", "true", "yes", "on"]);
+const CLOUDFLARE_TOGGLE_OFF = new Set(["", "0", "false", "no", "off"]);
+
+/**
+ * Shared parse for the deploy-time toggles that DECLARE a Cloudflare capability
+ * rather than naming a resource. An unrecognised value throws rather than being
+ * read as either answer: `=maybe` silently meaning "on" (JS truthiness) or
+ * "off" (a strict `=== "1"`) are both a deploy that does not match what its
+ * operator wrote down.
+ */
+function parseCloudflareDeployToggle(
+  name: string,
+  raw: string | undefined,
+  guidance: string,
+): boolean {
+  if (raw === undefined) return false;
+  const value = raw.trim().toLowerCase();
+  if (CLOUDFLARE_TOGGLE_OFF.has(value)) return false;
+  if (CLOUDFLARE_TOGGLE_ON.has(value)) return true;
+  throw new Error(
+    `[deploy] ${name}="${raw}" is not a recognised value — ${guidance}`,
+  );
+}
+
+/**
+ * Resolve the Worker's Browser Rendering binding from the build environment.
+ *
+ * Conditional, like D1 and R2 and unlike the background queue. Browser
+ * Rendering is an account entitlement rather than a resource, but that makes it
+ * MORE of a deploy prerequisite, not less: `wrangler deploy` rejects a binding
+ * the account is not entitled to, so emitting it unconditionally would make
+ * every app that never renders anything fail its deploy — and find out from
+ * wrangler rather than from anything it configured.
+ *
+ * With no resource to name, the variable declares intent rather than pointing
+ * at something. What stops it being a switch nobody ever flips is the other
+ * half of this seam: on a Worker with no binding the render path refuses by
+ * name, quoting this variable and `BROWSER`. An app that wanted rendering and
+ * forgot the variable is told so the first time it renders, in the words it
+ * needs — not left with an empty artifact.
+ *
+ * An unrecognised value throws rather than being read as either answer.
+ * `CLOUDFLARE_BROWSER_RENDERING=maybe` silently meaning "on" (JS truthiness) or
+ * "off" (a strict `=== "1"`) are both a deploy that does not match what its
+ * operator wrote down.
+ */
+export function resolveCloudflareBrowserBinding(
+  env: NodeJS.ProcessEnv = process.env,
+): CloudflareBrowserBindingConfig | null {
+  const enabled = parseCloudflareDeployToggle(
+    CLOUDFLARE_BROWSER_RENDERING_ENV,
+    env[CLOUDFLARE_BROWSER_RENDERING_ENV],
+    `use 1/true/yes/on to bind ${CLOUDFLARE_BROWSER_BINDING_NAME}, or 0/false/no/off to leave it unbound`,
+  );
+  if (!enabled) return null;
+  return { binding: CLOUDFLARE_BROWSER_BINDING_NAME };
+}
+
+/**
+ * Raised CPU ceiling for the generated Worker: 300,000 ms (5 minutes) is the
+ * documented maximum on Workers Paid, against a 30,000 ms default. A long agent
+ * turn spends most of its wall clock waiting on model I/O, which does not count
+ * as CPU time — but the turn's own work (tool dispatch, SQL, serialisation)
+ * accumulates across a 15-minute consumer invocation and overruns the default.
+ */
+export const CLOUDFLARE_MODULE_WORKER_CPU_MS = 300_000;
+
+/** One message per invocation: a run owns its consumer invocation's budget. */
+export const CLOUDFLARE_BACKGROUND_QUEUE_MAX_BATCH_SIZE = 1;
+
+/**
+ * Declares that the background queue and its dead-letter queue EXIST for this
+ * Worker. Like `CLOUDFLARE_BROWSER_RENDERING` and unlike the D1 and R2
+ * variables it names nothing: the queue name is derived from the Worker's own
+ * name, so there is no id to carry — only the fact that the resources were
+ * created.
+ */
+export const CLOUDFLARE_BACKGROUND_QUEUE_ENV = "CLOUDFLARE_BACKGROUND_QUEUE";
+
+/** Suffix wrangler requires to already exist before it accepts the consumer. */
+function agentBackgroundDeadLetterQueueName(queueName: string): string {
+  return `${queueName}-dlq`;
+}
+
+/**
+ * Write the durable background queue into the generated Worker configuration:
+ * the producer binding the framework resolves, the consumer registration that
+ * makes this same Worker claim those messages, and the raised CPU ceiling.
+ *
+ * Emitted rather than hand-authored because the binding name and the queue name
+ * are framework internals — a hand-maintained copy drifting from them is a
+ * producer that sends into a queue no consumer reads, which is the silent
+ * lost-budget failure this whole path exists to make impossible.
+ *
+ * Conditional, like D1, R2 and Browser Rendering: `wrangler deploy` rejects a
+ * producer or a consumer whose queue does not exist, so an unconditional emit
+ * makes a queue and a DLQ a prerequisite for EVERY Cloudflare deploy, including
+ * apps that never hand a run to the background.
+ *
+ * Conditional does NOT mean optional. This host's durable gate is default-on,
+ * so a Worker built with no queue and no opt-out accepts background work and
+ * runs it inline under the foreground clamp while looking healthy. Every path
+ * out of here therefore leaves the two facts agreeing: a queue, or a declared
+ * opt-out that reaches the runtime, or a refusal.
+ */
+export function configureCloudflareModuleBackgroundQueue(
+  config: {
+    name?: unknown;
+    queues?: unknown;
+    limits?: unknown;
+    [key: string]: unknown;
+  },
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const workerName = typeof config.name === "string" ? config.name.trim() : "";
+  if (!workerName) {
+    throw new Error(
+      "[deploy] The generated Worker configuration has no `name`, so the durable " +
+        "background queue cannot be named. Set a name for this Worker — emitting a " +
+        "shared or guessed queue name would let one app's consumer claim another's run.",
+    );
+  }
+  const queueName = agentBackgroundQueueName(workerName);
+  const deadLetterQueueName = agentBackgroundDeadLetterQueueName(queueName);
+  const queueProvisioned = parseCloudflareDeployToggle(
+    CLOUDFLARE_BACKGROUND_QUEUE_ENV,
+    env[CLOUDFLARE_BACKGROUND_QUEUE_ENV],
+    `use 1/true/yes/on once "${queueName}" and "${deadLetterQueueName}" exist, or 0/false/no/off to build a Worker with no background queue`,
+  );
+  if (!queueProvisioned) {
+    // The same gate the Netlify emit reads. A second parse of the flag here is
+    // how the two hosts would come to disagree about what "requests durable
+    // background" means.
+    if (isDurableBackgroundDeployEnabled(env)) {
+      throw new Error(
+        `[deploy] This Worker requests durable background runs but ${CLOUDFLARE_BACKGROUND_QUEUE_ENV} ` +
+          "is not set, so no queue transport would be emitted and every background run would " +
+          "execute inline under the foreground clamp instead of the durable budget.\n" +
+          "Create both queues, dead-letter queue first, and declare them on the build:\n" +
+          `  wrangler queues create ${deadLetterQueueName}\n` +
+          `  wrangler queues create ${queueName}\n` +
+          `  ${CLOUDFLARE_BACKGROUND_QUEUE_ENV}=1\n` +
+          `Both are required: the emitted consumer names "${deadLetterQueueName}" as its ` +
+          "dead-letter queue, and wrangler refuses a consumer whose DLQ does not exist.\n" +
+          `Or set ${AGENT_CHAT_DURABLE_BACKGROUND_ENV}=false to build a Worker that runs every ` +
+          "agent turn inline and needs no queue.",
+      );
+    }
+    // The opt-out is a BUILD variable and the Worker re-reads its own env, where
+    // this host's durable gate is default-on. Left unwritten, the deployed
+    // Worker opens the gate, finds no queue, and runs the turn inline under the
+    // foreground clamp — the silent degrade the refusal above exists to
+    // prevent, reached through the escape hatch that refusal recommends. Never
+    // overwrite a value the app declared for itself.
+    carryDurableBackgroundOptOutToRuntime(config);
+    configureCloudflareModuleWorkerCpuLimit(config);
+    return;
+  }
+  const existing = (
+    typeof config.queues === "object" && config.queues !== null
+      ? config.queues
+      : {}
+  ) as { producers?: unknown; consumers?: unknown; [key: string]: unknown };
+  const producers = Array.isArray(existing.producers)
+    ? existing.producers.filter(
+        (entry) =>
+          !(
+            typeof entry === "object" &&
+            entry !== null &&
+            (entry as { binding?: unknown }).binding ===
+              AGENT_BACKGROUND_QUEUE_BINDING
+          ),
+      )
+    : [];
+  const consumers = Array.isArray(existing.consumers)
+    ? existing.consumers.filter(
+        (entry) =>
+          !(
+            typeof entry === "object" &&
+            entry !== null &&
+            (entry as { queue?: unknown }).queue === queueName
+          ),
+      )
+    : [];
+  config.queues = {
+    ...existing,
+    producers: [
+      ...producers,
+      { binding: AGENT_BACKGROUND_QUEUE_BINDING, queue: queueName },
+    ],
+    consumers: [
+      ...consumers,
+      {
+        queue: queueName,
+        // One run per invocation, delivered without waiting to fill a batch:
+        // the foreground has already returned and the user is watching the
+        // stream, so batching would only add latency to the turn.
+        max_batch_size: CLOUDFLARE_BACKGROUND_QUEUE_MAX_BATCH_SIZE,
+        max_batch_timeout: 0,
+        max_retries: 3,
+        dead_letter_queue: deadLetterQueueName,
+      },
+    ],
+  };
+  configureCloudflareModuleWorkerCpuLimit(config);
+}
+
+function carryDurableBackgroundOptOutToRuntime(config: {
+  vars?: unknown;
+  [key: string]: unknown;
+}): void {
+  const vars = (
+    typeof config.vars === "object" && config.vars !== null ? config.vars : {}
+  ) as Record<string, unknown>;
+  if (AGENT_CHAT_DURABLE_BACKGROUND_ENV in vars) return;
+  config.vars = { ...vars, [AGENT_CHAT_DURABLE_BACKGROUND_ENV]: "false" };
+}
+
+/**
+ * Applied whether or not a queue is emitted: the ceiling protects a long agent
+ * turn, and a Worker with no durable transport runs that turn inline — where it
+ * has MORE need of the raised limit, not less.
+ */
+function configureCloudflareModuleWorkerCpuLimit(config: {
+  limits?: unknown;
+  [key: string]: unknown;
+}): void {
+  const limits = (
+    typeof config.limits === "object" && config.limits !== null
+      ? config.limits
+      : {}
+  ) as { cpu_ms?: unknown; [key: string]: unknown };
+  // Never lower a ceiling an app deliberately raised further.
+  const configuredCpuMs =
+    typeof limits.cpu_ms === "number" ? limits.cpu_ms : null;
+  config.limits = {
+    ...limits,
+    cpu_ms: Math.max(configuredCpuMs ?? 0, CLOUDFLARE_MODULE_WORKER_CPU_MS),
+  };
+}
+
+export function configureCloudflareModuleWorkerOutput(
+  serverDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
   const configPath = path.join(serverDir, "wrangler.json");
   if (!fs.existsSync(configPath)) {
     throw new Error(
@@ -230,6 +771,35 @@ export function configureCloudflareModuleWorkerOutput(serverDir: string): void {
   config.compatibility_flags = [
     ...new Set([...compatibilityFlags, "nodejs_compat"]),
   ];
+  const d1Binding = resolveCloudflareD1Binding(env);
+  if (d1Binding) {
+    const existing = Array.isArray(config.d1_databases)
+      ? (config.d1_databases as CloudflareD1BindingConfig[])
+      : [];
+    config.d1_databases = [
+      ...existing.filter((entry) => entry?.binding !== d1Binding.binding),
+      d1Binding,
+    ];
+  }
+  const r2Binding = resolveCloudflareR2Binding(env);
+  if (r2Binding) {
+    const existing = Array.isArray(config.r2_buckets)
+      ? (config.r2_buckets as CloudflareR2BindingConfig[])
+      : [];
+    config.r2_buckets = [
+      ...existing.filter((entry) => entry?.binding !== r2Binding.binding),
+      r2Binding,
+    ];
+  }
+  const browserBinding = resolveCloudflareBrowserBinding(env);
+  if (browserBinding) {
+    const existing =
+      typeof config.browser === "object" && config.browser !== null
+        ? (config.browser as Record<string, unknown>)
+        : {};
+    config.browser = { ...existing, binding: browserBinding.binding };
+  }
+  configureCloudflareModuleBackgroundQueue(config, env);
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
   fs.writeFileSync(
     nitroEntryPath,
@@ -377,6 +947,95 @@ export const CLOUDFLARE_WORKER_STUB_SUBPATH_MODULES: Record<string, string> = {
     "",
   ].join("\n"),
 };
+
+/**
+ * Builtins whose bare specifier the post-build pass rewrites to `node:`.
+ * CF Workers resolves a builtin only under the prefix.
+ */
+export const CLOUDFLARE_WORKER_PATCHED_NODE_BUILTINS = [
+  "fs",
+  "path",
+  "os",
+  "crypto",
+  "http",
+  "https",
+  "stream",
+  "url",
+  "util",
+  "events",
+  "buffer",
+  "console",
+  "querystring",
+  "zlib",
+  "net",
+  "tls",
+  "assert",
+  "timers",
+  "child_process",
+  "module",
+  "process",
+  "sqlite",
+  "worker_threads",
+  "string_decoder",
+  "diagnostics_channel",
+  "async_hooks",
+  "perf_hooks",
+  "inspector",
+  "vm",
+] as const;
+
+/**
+ * Packages that survive as bare specifiers inside already-emitted chunks, past
+ * the point where a Rolldown plugin can intercept them. They are rewritten to a
+ * generated stub instead.
+ *
+ * A bare specifier left in the output is unresolvable on workerd whatever the
+ * package is — there is no node_modules to search — so an entry here costs
+ * nothing when the specifier was bundled away and is the difference between a
+ * fail-closed stub and a Worker that never starts when it was not. `postgres`
+ * is an optional peer core imports lazily: an app that correctly omits it must
+ * still boot.
+ */
+export const CLOUDFLARE_UNRESOLVED_NATIVE_STUBS = [
+  "better-sqlite3",
+  "node-pty",
+  "cron-parser",
+  "postgres",
+] as const;
+
+/**
+ * Source for those generated sibling stubs.
+ *
+ * These are reached at runtime, not only during linking: a Worker that got
+ * here has a caller holding a live reference. An empty object plus a no-op
+ * `watch()` would let that caller read "no rows", "no terminal", "no next
+ * run" and carry on, which is indistinguishable from the capability working
+ * and finding nothing.
+ */
+export function cloudflareUnresolvedNativeStubSource(
+  moduleName: string,
+): string {
+  return [
+    // A function declaration, not an arrow: a caller reaching this through
+    // `new mod.Database()` must land in the body and see the real reason,
+    // not a bare "is not a constructor" from the engine.
+    `function unavailable() { throw new Error(${JSON.stringify(
+      `${moduleName} is unavailable in Cloudflare Workers`,
+    )}); }`,
+    "export const watch = unavailable;",
+    "export const parseExpression = unavailable;",
+    "export default new Proxy(function () { unavailable(); }, {",
+    "  get(_target, property) {",
+    "    if (property === Symbol.toPrimitive) return unavailable;",
+    "    if (property === 'then') return undefined;",
+    "    return unavailable;",
+    "  },",
+    "  apply: unavailable,",
+    "  construct: unavailable,",
+    "});",
+    "",
+  ].join("\n");
+}
 
 export function cloudflareWorkerStubAliasArgs(stubDir: string): string[] {
   const subpathAliases = Object.keys(CLOUDFLARE_WORKER_STUB_SUBPATH_MODULES)
@@ -831,17 +1490,31 @@ function addImmutableAssetRouteRule(
   };
 }
 
+/**
+ * Carry the immutable policy on one glob per mount point, never one rule per
+ * asset: Nitro writes a `_headers` line per route rule and Cloudflare rejects
+ * that file past 100 rules, so an enumeration turns every asset the app adds
+ * into deploy risk. See IMMUTABLE_ASSET_ROUTE_GLOB for why the width is safe
+ * and what it costs.
+ */
 export function addImmutableAssetRouteRulesForClientBuild(
   routeRules: RouteRules,
   clientDir: string,
   appBasePath = "",
 ): void {
-  for (const assetPath of collectImmutableAssetPaths(clientDir)) {
-    addImmutableAssetRouteRule(routeRules, assetPath);
-    const mountedPath = prefixAssetPath(assetPath, appBasePath);
-    if (mountedPath !== assetPath) {
-      addImmutableAssetRouteRule(routeRules, mountedPath);
-    }
+  if (!hasAssetsDir(clientDir)) return;
+
+  addImmutableAssetRouteRule(routeRules, IMMUTABLE_ASSET_ROUTE_GLOB);
+  const mountedGlob = prefixAssetPath(IMMUTABLE_ASSET_ROUTE_GLOB, appBasePath);
+  if (mountedGlob !== IMMUTABLE_ASSET_ROUTE_GLOB) {
+    addImmutableAssetRouteRule(routeRules, mountedGlob);
+  }
+
+  const mutable = collectMutableAssetPaths(clientDir);
+  if (mutable.length > 0) {
+    console.warn(
+      `[deploy] ${mutable.length} file(s) under /assets/ carry no content hash and will be cached for a year as part of the ${IMMUTABLE_ASSET_ROUTE_GLOB} rule. Move any file you replace in place out of public/assets/: ${mutable.join(", ")}`,
+    );
   }
 }
 
@@ -1157,6 +1830,39 @@ function getSentryClientConfigScript() {
   );
 }
 
+function getPostHogClientConfigScript() {
+  // MUST stay consistent with resolvePublicPostHogConfig in
+  // server/posthog-config.ts (worker bundles a string copy; it can't import it).
+  // Never falls back to POSTHOG_API_KEY — that key can be a private one and
+  // this string is inlined into the public, CDN-cached HTML shell.
+  const env = globalThis.process?.env || {};
+  const posthogKey = firstNonEmpty(
+    env.POSTHOG_PUBLIC_KEY,
+    env.VITE_POSTHOG_KEY,
+    env.VITE_POSTHOG_PUBLIC_KEY,
+  );
+  if (!posthogKey) return null;
+  const posthogHost = (
+    firstNonEmpty(
+      env.POSTHOG_PUBLIC_HOST,
+      env.VITE_POSTHOG_HOST,
+      env.POSTHOG_HOST,
+    ) || "https://us.i.posthog.com"
+  ).replace(/\\/+$/, "");
+  const config = {
+    posthogKey,
+    posthogHost,
+    posthogErrorTracking:
+      (env.POSTHOG_ERROR_TRACKING || "").trim().toLowerCase() !== "false",
+  };
+  return (
+    '<script data-agent-native-posthog-config>' +
+    'window.__AGENT_NATIVE_CONFIG__=Object.assign({},window.__AGENT_NATIVE_CONFIG__,' +
+    JSON.stringify(config) +
+    ");</script>"
+  );
+}
+
 function getRealtimeClientConfigScript() {
   // MUST stay byte-for-byte consistent with resolveRealtimeClientConfig in
   // server/sentry-config.ts (worker bundles a string copy; it can't import it).
@@ -1330,7 +2036,11 @@ function applyImmutableAssetCacheHeaders(response, request) {
 
 async function rewriteMountedResponse(response, basePath, pathname, request) {
   const clientConfigScript =
-    [getSentryClientConfigScript(), getRealtimeClientConfigScript()]
+    [
+      getSentryClientConfigScript(),
+      getPostHogClientConfigScript(),
+      getRealtimeClientConfigScript(),
+    ]
       .filter(Boolean)
       .join("") || null;
   const headers = new Headers(response.headers);
@@ -1717,7 +2427,8 @@ export function generateCloudflarePagesStaticShellFromManifest(
     ? DEFAULT_ROOT_LOADER_REACT_ROUTER_TURBO_STREAM
     : EMPTY_REACT_ROUTER_TURBO_STREAM;
 
-  return `<!DOCTYPE html><html lang="en"><head><meta charSet="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/><link rel="manifest" href="/manifest.json"/><link rel="icon" type="image/svg+xml" href="/favicon.svg"/>${modulePreloads}${stylesheets}</head><body><div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;height:100vh;width:100%"><svg role="status" aria-label="Loading" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="animation:an-spin 1s linear infinite;opacity:0.7"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg><p class="an-stall-hint">Still loading. If this does not finish, reload the page — the browser console may show what failed.</p><style>@keyframes an-spin { to { transform: rotate(360deg) } } @keyframes an-stall-in { to { opacity: 0.6 } } .an-stall-hint { opacity: 0; margin: 0; max-width: 32rem; padding: 0 1.5rem; text-align: center; font-size: 0.875rem; line-height: 1.5; font-family: ui-sans-serif, system-ui, sans-serif; animation: an-stall-in 0.4s ease-out 10s forwards } @media (prefers-reduced-motion: reduce) { .an-stall-hint { animation-duration: 0s } } @media (prefers-color-scheme: dark) { html { background: #09090b; color: #fafafa } }</style></div><script>window.__reactRouterContext = ${JSON.stringify(context)};window.__reactRouterContext.stream = new ReadableStream({start(controller){window.__reactRouterContext.streamController = controller;}}).pipeThrough(new TextEncoderStream());</script><script type="module" async="">${routeModuleScript}</script><!--$--><script>window.__reactRouterContext.streamController.enqueue(${JSON.stringify(encodedInitialState)});</script><!--$--><script>window.__reactRouterContext.streamController.close();</script><!--/$--><!--/$--></body></html>`;
+  // guard:allow-raw-color - static shell loads before app theme tokens exist
+  return `<!DOCTYPE html><html lang="en"><head><meta charSet="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/><link rel="manifest" href="/manifest.json"/><link rel="icon" type="image/svg+xml" href="/favicon.svg"/>${modulePreloads}${stylesheets}</head><body><div style="display:flex;align-items:center;justify-content:center;height:100vh;width:100%"><svg role="status" aria-label="Loading" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="animation:an-spin 1s linear infinite;opacity:0.7"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg><style>@keyframes an-spin { to { transform: rotate(360deg) } } @media (prefers-color-scheme: dark) { html { background: #09090b; color: #fafafa } }</style></div><script>window.__reactRouterContext = ${JSON.stringify(context)};window.__reactRouterContext.stream = new ReadableStream({start(controller){window.__reactRouterContext.streamController = controller;}}).pipeThrough(new TextEncoderStream());</script><script type="module" async="">${routeModuleScript}</script><!--$--><script>window.__reactRouterContext.streamController.enqueue(${JSON.stringify(encodedInitialState)});</script><!--$--><script>window.__reactRouterContext.streamController.close();</script><!--/$--><!--/$--></body></html>`;
 }
 
 function writeCloudflarePagesStaticShell({
@@ -2317,46 +3028,7 @@ function getDirSize(dir: string): number {
   return size;
 }
 
-export function copyDir(
-  src: string,
-  dest: string,
-  ancestorRealPaths = new Set<string>(),
-) {
-  const realSrc = fs.realpathSync(src);
-  if (ancestorRealPaths.has(realSrc)) return;
-  const nextAncestorRealPaths = new Set(ancestorRealPaths);
-  nextAncestorRealPaths.add(realSrc);
-
-  fs.mkdirSync(dest, { recursive: true });
-  const entries = fs.readdirSync(src, { withFileTypes: true });
-  for (const entry of entries) {
-    const srcPath = path.join(src, entry.name);
-    const destPath = path.join(dest, entry.name);
-    if (entry.isSymbolicLink()) {
-      let stat: fs.Stats;
-      try {
-        stat = fs.statSync(srcPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-          console.warn(
-            `[deploy] Skipping broken symlink while copying ${srcPath}`,
-          );
-          continue;
-        }
-        throw error;
-      }
-      if (stat.isDirectory()) {
-        copyDir(srcPath, destPath, nextAncestorRealPaths);
-      } else {
-        fs.copyFileSync(srcPath, destPath);
-      }
-    } else if (entry.isDirectory()) {
-      copyDir(srcPath, destPath, nextAncestorRealPaths);
-    } else {
-      fs.copyFileSync(srcPath, destPath);
-    }
-  }
-}
+export { copyDir };
 
 const LIBSQL_NATIVE_PACKAGE_NAMES = [
   "darwin-arm64",
@@ -2372,6 +3044,10 @@ const LIBSQL_NATIVE_PACKAGE_NAMES = [
 const FFMPEG_STATIC_PACKAGE_NAME = "ffmpeg-static";
 const RESVG_SCOPE = "@resvg";
 const RESVG_PACKAGE_PREFIX = "resvg-js";
+const SERVERLESS_BROWSER_RUNTIME_PACKAGES = [
+  "@sparticuz/chromium",
+  "playwright-core",
+] as const;
 
 // Serverless functions only ever run on 64-bit Linux. The darwin/win32/android
 // and 32-bit-arm prebuilds of these native packages are ~100MB that can never
@@ -2443,6 +3119,148 @@ function nodeModulesAncestors(startDir: string): string[] {
     current = parent;
   }
   return dirs;
+}
+
+function readPackageManifest(
+  packageDir: string,
+): Record<string, unknown> | null {
+  const packageJsonPath = path.join(packageDir, "package.json");
+  if (!fs.existsSync(packageJsonPath)) return null;
+  const manifest: unknown = JSON.parse(
+    fs.readFileSync(packageJsonPath, "utf8"),
+  );
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    return null;
+  }
+  return manifest as Record<string, unknown>;
+}
+
+function packageRootFromResolvedPath(
+  packageName: string,
+  resolvedPath: string,
+): string | null {
+  let current = path.dirname(resolvedPath);
+  while (true) {
+    const manifest = readPackageManifest(current);
+    if (manifest?.name === packageName) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+export function findInstalledPackageRoot(
+  packageName: string,
+  nodeModulesRoots: string[],
+  fromPackageDir?: string,
+): string | null {
+  if (fromPackageDir) {
+    try {
+      const requireFromPackage = createRequire(
+        path.join(fromPackageDir, "package.json"),
+      );
+      const resolvedPath = requireFromPackage.resolve(packageName);
+      const resolvedRoot = packageRootFromResolvedPath(
+        packageName,
+        resolvedPath,
+      );
+      if (resolvedRoot) return resolvedRoot;
+      // coercion-ok: resolution failure means this optional store lookup is absent.
+    } catch {
+      // The dependency may be available only through the workspace pnpm store.
+    }
+  }
+
+  const packagePath = packageName.split("/");
+  const pnpmPrefix = `${packageName.replace("/", "+")}@`;
+  for (const root of nodeModulesRoots) {
+    const direct = path.join(root, ...packagePath);
+    if (readPackageManifest(direct)?.name === packageName) return direct;
+
+    const pnpmRoot = path.join(root, ".pnpm");
+    if (!fs.existsSync(pnpmRoot)) continue;
+    for (const entry of fs.readdirSync(pnpmRoot)) {
+      if (!entry.startsWith(pnpmPrefix)) continue;
+      const nested = path.join(pnpmRoot, entry, "node_modules", ...packagePath);
+      if (readPackageManifest(nested)?.name === packageName) return nested;
+    }
+  }
+  return null;
+}
+
+function copyRuntimePackageTree(
+  packageName: string,
+  packageDir: string,
+  serverDir: string,
+  nodeModulesRoots: string[],
+  copiedPackages: Set<string>,
+): number {
+  if (copiedPackages.has(packageName)) return 0;
+  copiedPackages.add(packageName);
+
+  const destination = path.join(
+    serverDir,
+    "node_modules",
+    ...packageName.split("/"),
+  );
+  copyDir(packageDir, destination);
+
+  const manifest = readPackageManifest(packageDir);
+  const dependencies = manifest?.dependencies;
+  if (!dependencies || typeof dependencies !== "object") return 1;
+
+  let copiedCount = 1;
+  for (const dependencyName of Object.keys(
+    dependencies as Record<string, unknown>,
+  )) {
+    const dependencyDir = findInstalledPackageRoot(
+      dependencyName,
+      nodeModulesRoots,
+      packageDir,
+    );
+    if (!dependencyDir) {
+      throw new Error(
+        `[deploy] Could not resolve ${dependencyName}, required by ${packageName}, for the serverless browser runtime.`,
+      );
+    }
+    copiedCount += copyRuntimePackageTree(
+      dependencyName,
+      dependencyDir,
+      serverDir,
+      nodeModulesRoots,
+      copiedPackages,
+    );
+  }
+  return copiedCount;
+}
+
+export function copyInstalledBrowserRuntimePackages(
+  serverDir: string | undefined,
+  projectCwd = cwd,
+): number {
+  if (!serverDir || !fs.existsSync(serverDir)) return 0;
+
+  const nodeModulesRoots = nodeModulesAncestors(projectCwd);
+  const copiedPackages = new Set<string>();
+  let copiedCount = 0;
+  for (const packageName of SERVERLESS_BROWSER_RUNTIME_PACKAGES) {
+    const packageDir = findInstalledPackageRoot(packageName, nodeModulesRoots);
+    if (!packageDir) continue;
+    copiedCount += copyRuntimePackageTree(
+      packageName,
+      packageDir,
+      serverDir,
+      nodeModulesRoots,
+      copiedPackages,
+    );
+  }
+
+  if (copiedCount > 0) {
+    console.log(
+      `[deploy] Copied ${copiedCount} serverless browser runtime package(s) into the server bundle.`,
+    );
+  }
+  return copiedCount;
 }
 
 function findInstalledLibsqlNativePackage(
@@ -2575,15 +3393,18 @@ export function findInstalledResvgPackages(
 }
 
 /**
- * Deploy-time gate for emitting the second `-background` Netlify function.
- * Netlify deploys are default-on; an explicit falsy
- * `AGENT_CHAT_DURABLE_BACKGROUND` value opts out. This is called only from the
- * Netlify preset, so non-Netlify builds remain unaffected. The gate and runtime
- * default must agree: otherwise the runtime could target a worker that the
- * deploy did not emit.
+ * Deploy-time gate for durable background runs: "does this app want the long
+ * budget at all". Both hosts are default-on and an explicit falsy
+ * `AGENT_CHAT_DURABLE_BACKGROUND` value opts out, matching each host's runtime
+ * default — otherwise the runtime could target a worker the deploy did not
+ * emit. Netlify reads it to decide whether to emit the second `-background`
+ * function; Cloudflare reads it to decide whether a build with no queue
+ * declared is a deliberate no-background Worker or a misconfiguration.
  */
-export function isDurableBackgroundDeployEnabled(): boolean {
-  return !isDurableBackgroundFlagExplicitlyDisabled();
+export function isDurableBackgroundDeployEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return !isDurableBackgroundFlagExplicitlyDisabled(env);
 }
 
 /**
@@ -2593,7 +3414,8 @@ export function isDurableBackgroundDeployEnabled(): boolean {
 function isDurableBackgroundEmitRequired(): boolean {
   return (
     isDurableBackgroundDeployEnabled() ||
-    isIntegrationDurableDispatchDeployEnabled()
+    isIntegrationDurableDispatchDeployEnabled() ||
+    isRecurringJobsDeployEnabled()
   );
 }
 
@@ -2605,16 +3427,99 @@ export function isIntegrationDurableDispatchDeployEnabled(): boolean {
 }
 
 const NETLIFY_KEEP_WARM_FUNCTION_NAME = "agent-native-keep-warm";
+export const NETLIFY_RECURRING_JOBS_FUNCTION_NAME =
+  "agent-native-recurring-jobs";
+
+/** Shared shape for the `AGENT_NATIVE_DISABLE_*` build kill switches. */
+function isDisabledByEnv(name: string): boolean {
+  const value = process.env[name]?.trim();
+  return !!value && ["1", "true", "yes", "on"].includes(value.toLowerCase());
+}
+
+export function isRecurringJobsDeployEnabled(): boolean {
+  return !isDisabledByEnv("AGENT_NATIVE_DISABLE_RECURRING_JOBS");
+}
+
+/**
+ * Keep-warm is ON by default, and on a provisioned database that is the right
+ * default. It is the wrong default on a metered scale-to-zero tier: a
+ * once-a-minute wake means autosuspend NEVER fires, so the endpoint bills (and
+ * quota-limits) as if it were awake 100% of the time with zero users online. On
+ * a free-tier Neon that exhausts the compute quota and the database then
+ * hard-blocks every read mid-session — the symptom is a dead app, not a slow one.
+ */
+export function isKeepWarmDeployEnabled(): boolean {
+  return !isDisabledByEnv("AGENT_NATIVE_DISABLE_KEEP_WARM");
+}
+
+/**
+ * The background warm is a separate, much more expensive knob than the server
+ * warm and gets its own switch. Warming `server` is one health request; warming
+ * the `-background` Lambda is a *fresh container*, so every ping pays the full
+ * on-demand `ensureTable()` schema-probe fan-out (hundreds of
+ * `information_schema` round trips) before it does anything. At the default
+ * cadence that is ~1,440 manufactured cold starts a day that no user asked for.
+ * Turn this off to keep dispatch-latency protection for the server function
+ * while dropping the probe storm.
+ */
+export function isKeepWarmBackgroundDeployEnabled(): boolean {
+  return !isDisabledByEnv("AGENT_NATIVE_DISABLE_KEEP_WARM_BACKGROUND");
+}
+
+const DEFAULT_KEEP_WARM_SCHEDULE = "* * * * *";
+
+/**
+ * Cadence for the keep-warm schedule, overridable with
+ * `AGENT_NATIVE_KEEP_WARM_SCHEDULE` (standard 5-field cron).
+ *
+ * An unparseable value THROWS rather than falling back to the default. Falling
+ * back would leave an operator who set this specifically to stop burning
+ * database quota still burning it at the original once-a-minute cadence, with a
+ * successful build and nothing in the log to say the value was ignored.
+ */
+export function resolveKeepWarmSchedule(): string {
+  const raw = process.env.AGENT_NATIVE_KEEP_WARM_SCHEDULE?.trim();
+  if (!raw) return DEFAULT_KEEP_WARM_SCHEDULE;
+  const fields = raw.split(/\s+/);
+  // The field count is checked separately from the field values because
+  // `isValidCron` also accepts 6-field (seconds) and `@daily` forms that
+  // Netlify's scheduler does not; "5 fields" is the narrower contract.
+  if (fields.length !== 5 || !isValidCron(raw)) {
+    throw new Error(
+      `AGENT_NATIVE_KEEP_WARM_SCHEDULE must be a 5-field cron expression ` +
+        `(minute hour day month weekday); got "${raw}" (${fields.length} field(s)). ` +
+        `Example: "*/5 * * * *" for every five minutes.`,
+    );
+  }
+  return raw;
+}
 
 /**
  * Emit a site-local Netlify Scheduled Function that wakes the public server
  * function and its database every minute. GitHub Actions schedules can be
  * delayed by tens of minutes, which is longer than a scale-to-zero database's
  * autosuspend window and leaves the next visitor to pay the cold-start cost.
+ *
+ * Both halves are opt-out and the cadence is configurable — see
+ * `isKeepWarmDeployEnabled`, `isKeepWarmBackgroundDeployEnabled`, and
+ * `resolveKeepWarmSchedule`. The tradeoff this function encodes is next-visitor
+ * latency against database awake-time, and only the deployment knows which of
+ * those it is paying for.
  */
 export function emitSingleTemplateNetlifyKeepWarmFunction(
   projectCwd: string,
 ): void {
+  if (!isKeepWarmDeployEnabled()) {
+    console.log(
+      "[build] Keep-warm emit skipped: AGENT_NATIVE_DISABLE_KEEP_WARM is set. " +
+        "The database is free to autosuspend; the next visitor after an idle " +
+        "period pays its cold start.",
+    );
+    return;
+  }
+  // Resolved before anything is removed or written, so a bad cron fails the
+  // build rather than leaving a wiped/half-emitted function directory behind.
+  const keepWarmSchedule = resolveKeepWarmSchedule();
   const internalDir = path.join(projectCwd, ".netlify", "functions-internal");
   const serverBundle = path.join(internalDir, "server", "main.mjs");
   if (!fs.existsSync(serverBundle)) {
@@ -2640,7 +3545,9 @@ export function emitSingleTemplateNetlifyKeepWarmFunction(
     `${AGENT_BACKGROUND_FUNCTION_NAME}.mjs`,
   );
   const backgroundWarmPath =
-    isDurableBackgroundEmitRequired() && fs.existsSync(backgroundEntryPath)
+    isKeepWarmBackgroundDeployEnabled() &&
+    isDurableBackgroundEmitRequired() &&
+    fs.existsSync(backgroundEntryPath)
       ? JSON.stringify(AGENT_BACKGROUND_FUNCTION_URL_PATH)
       : "null";
   const entry = `const HEALTH_PATH = "/_agent-native/health";
@@ -2648,8 +3555,6 @@ const BACKGROUND_WARM_PATH = ${backgroundWarmPath};
 const REQUEST_TIMEOUT_MS = 25_000;
 
 function siteOrigin(request) {
-  const configured = process.env.URL || process.env.DEPLOY_URL;
-  if (configured) return configured;
   return new URL(request.url).origin;
 }
 
@@ -2690,7 +3595,7 @@ export default async function handler(request) {
   }
 
   if (!response.ok) {
-    const body = await response.text().catch(() => "");
+    const body = await response.text();
     throw new Error(
       "[agent-native-keep-warm] Health request failed with " +
         response.status +
@@ -2707,7 +3612,7 @@ export default async function handler(request) {
 export const config = {
   name: "agent-native server keep warm",
   generator: "agent-native build",
-  schedule: "* * * * *",
+  schedule: ${JSON.stringify(keepWarmSchedule)},
   nodeBundler: "none",
 };
 `;
@@ -2717,7 +3622,96 @@ export const config = {
     entry,
   );
   console.log(
-    `[build] Emitted Netlify scheduled keep-warm function "${NETLIFY_KEEP_WARM_FUNCTION_NAME}".`,
+    `[build] Emitted Netlify scheduled keep-warm function ` +
+      `"${NETLIFY_KEEP_WARM_FUNCTION_NAME}" (schedule "${keepWarmSchedule}", ` +
+      `background warm ${backgroundWarmPath === "null" ? "off" : "on"}).`,
+  );
+}
+
+/**
+ * Emit the durable recurring-job trigger. Netlify's scheduled function only
+ * hands off work; the existing `-background` function owns the long sweep so
+ * a model run is not constrained by the synchronous scheduled-function wall.
+ */
+export function emitSingleTemplateNetlifyRecurringJobsFunction(
+  projectCwd: string,
+): void {
+  if (!isRecurringJobsDeployEnabled()) return;
+  const internalDir = path.join(projectCwd, ".netlify", "functions-internal");
+  const backgroundEntry = path.join(
+    internalDir,
+    AGENT_BACKGROUND_FUNCTION_NAME,
+    `${AGENT_BACKGROUND_FUNCTION_NAME}.mjs`,
+  );
+  if (!fs.existsSync(backgroundEntry)) {
+    throw new Error(
+      "[build] Recurring-job trigger cannot be emitted without the durable background function.",
+    );
+  }
+
+  const functionName = NETLIFY_RECURRING_JOBS_FUNCTION_NAME;
+  const dest = path.join(internalDir, functionName);
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(dest, { recursive: true });
+  const entry = `import { createHmac } from "node:crypto";
+
+const BACKGROUND_PATH = ${JSON.stringify(AGENT_BACKGROUND_FUNCTION_URL_PATH)};
+const SWEEP_PATH = ${JSON.stringify(RECURRING_JOBS_SWEEP_PATH)};
+const TOKEN_SUBJECT = ${JSON.stringify(RECURRING_JOBS_SWEEP_TOKEN_SUBJECT)};
+const PROCESSOR_FIELD = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_FIELD)};
+const PROCESSOR_ROUTE = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_ROUTE)};
+const PROCESSOR_ROUTE_FIELD = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD)};
+
+function siteOrigin(request) {
+  return new URL(request.url).origin;
+}
+
+function token(secret) {
+  const timestamp = Date.now();
+  const signature = createHmac("sha256", secret)
+    .update(\`\${TOKEN_SUBJECT}:\${timestamp}\`)
+    .digest("hex");
+  return \`\${timestamp}.\${signature}\`;
+}
+
+export default async function handler(request) {
+  const secret = process.env.A2A_SECRET;
+  if (!secret) {
+    throw new Error("[recurring-jobs] A2A_SECRET is required for the scheduled sweep");
+  }
+  const url = new URL(BACKGROUND_PATH, siteOrigin(request));
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: \`Bearer \${token(secret)}\`,
+      "Content-Type": "application/json",
+      "user-agent": "agent-native-recurring-jobs",
+    },
+    body: JSON.stringify({
+      [PROCESSOR_FIELD]: PROCESSOR_ROUTE,
+      [PROCESSOR_ROUTE_FIELD]: SWEEP_PATH,
+    }),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(
+      \`[recurring-jobs] Durable sweep handoff failed (\${response.status}): \${body.slice(0, 500)}\`,
+    );
+  }
+  console.log("[recurring-jobs] Durable sweep handed off", url.toString());
+  return new Response(null, { status: 204 });
+}
+
+export const config = {
+  name: "agent-native recurring jobs",
+  generator: "agent-native build",
+  schedule: "* * * * *",
+  nodeBundler: "none",
+};
+`;
+  fs.writeFileSync(path.join(dest, `${functionName}.mjs`), entry);
+  console.log(
+    `[build] Emitted Netlify scheduled recurring-job function "${functionName}".`,
   );
 }
 
@@ -2807,7 +3801,7 @@ export function emitSingleTemplateNetlifyBackgroundFunction(
   // NOT scanned — emitting there is why the standalone attempt 404'd.
   const dest = path.join(internalDir, backgroundName);
   fs.rmSync(dest, { recursive: true, force: true });
-  copyDir(serverDir, dest);
+  cloneServerBundleForFunction(serverDir, dest);
   // Drop the original Nitro `/*` entry so our entry is the entrypoint and the
   // copied bundle does NOT re-register the catch-all `config.path`.
   fs.rmSync(path.join(dest, "server.mjs"), { force: true });
@@ -2830,6 +3824,7 @@ export function emitSingleTemplateNetlifyBackgroundFunction(
   const backgroundProcessorRouteField = JSON.stringify(
     AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD,
   );
+  const recurringJobsSweepPath = JSON.stringify(RECURRING_JOBS_SWEEP_PATH);
   const entry = `// Mark this isolate as the durable background runtime BEFORE the handler
 // bundle is imported, so isInBackgroundFunctionRuntime() reliably returns true
 // in this function. The deployed Lambda name is NOT guaranteed to end in
@@ -2848,6 +3843,7 @@ const BACKGROUND_PROCESSOR_A2A = ${backgroundProcessorA2A};
 const BACKGROUND_PROCESSOR_INTEGRATION = ${backgroundProcessorIntegration};
 const BACKGROUND_PROCESSOR_ROUTE = ${backgroundProcessorRoute};
 const BACKGROUND_PROCESSOR_ROUTE_FIELD = ${backgroundProcessorRouteField};
+const RECURRING_JOBS_SWEEP_PATH = ${recurringJobsSweepPath};
 
 function processorPathFromBody(body) {
   if (!body) return null;
@@ -2867,7 +3863,8 @@ function processorPathFromBody(body) {
       parsed?.[BACKGROUND_PROCESSOR_FIELD] === BACKGROUND_PROCESSOR_ROUTE &&
       typeof route === "string" &&
       route.startsWith("/") &&
-      route.includes("/api/_agent-native-background/") &&
+      (route === RECURRING_JOBS_SWEEP_PATH ||
+        route.includes("/api/_agent-native-background/")) &&
       !route.includes("?") &&
       !route.includes("#")
     ) {
@@ -2988,7 +3985,7 @@ export function emitSingleTemplateNetlifyIntegrationRecoveryFunction(
   const functionName = NETLIFY_INTEGRATION_RECOVERY_FUNCTION_NAME;
   const dest = path.join(internalDir, functionName);
   fs.rmSync(dest, { recursive: true, force: true });
-  copyDir(serverDir, dest);
+  cloneServerBundleForFunction(serverDir, dest);
   fs.rmSync(path.join(dest, "server.mjs"), { force: true });
 
   const entry = `import { createHmac } from "node:crypto";
@@ -3811,7 +4808,10 @@ export async function runNitroBuildPipeline(
 
   if (hasClientBuild && publicOutputDir) {
     copyDir(clientDir, publicOutputDir);
-    if (appBasePath) {
+    if (
+      appBasePath &&
+      !publicDirIsMountedAtBasePath(publicOutputDir, appBasePath)
+    ) {
       copyDir(clientDir, path.join(publicOutputDir, appBasePath.slice(1)));
     }
     console.log(
@@ -3820,6 +4820,22 @@ export async function runNitroBuildPipeline(
   }
 
   await hooks.nitroBuild(nitro);
+}
+
+/**
+ * Nitro's serverless presets end `output.publicDir` in `{{ baseURL }}`
+ * (netlify: `dist{{ baseURL }}`, vercel: `static{{ baseURL }}`, cloudflare:
+ * `{{ output.dir }}{{ baseURL }}`), so for those the public dir already IS the
+ * mount path. Mirroring again produced a whole second client build one level
+ * deeper that nothing ever served — the workspace deploy only deleted it again.
+ * Presets whose public dir is flat (`node-server`) still need the mirror.
+ */
+export function publicDirIsMountedAtBasePath(
+  publicOutputDir: string,
+  appBasePath: string,
+): boolean {
+  const mountSuffix = path.sep + appBasePath.slice(1).split("/").join(path.sep);
+  return path.resolve(publicOutputDir).endsWith(mountSuffix);
 }
 
 /**
@@ -3910,6 +4926,12 @@ export function resolveNitroBundledYjsEntry(): string {
 /**
  * Edge runtimes have no node_modules, while Node/serverless outputs only need
  * the small set above bundled to keep their package manifests traceable.
+ *
+ * Worker and Deno presets set `node: false`, and Nitro only installs its
+ * externals plugin when `node` is true — so on those presets this value is read
+ * by nothing and nothing in the output is a Nitro external. Anything left as a
+ * bare import there is a module Rolldown could not resolve, not a dependency
+ * Nitro chose to keep outside the bundle.
  */
 export function nitroNoExternalsForPreset(
   targetPreset: string,
@@ -3922,6 +4944,316 @@ export function nitroNoExternalsForPreset(
         targetPreset === "aws-lambda"
       ? []
       : NITRO_SERVER_RUNTIME_BUNDLED_DEPS;
+}
+
+export const WORKER_FRAMEWORK_CHUNK_NAME = "_libs/@agent-native/framework";
+
+/**
+ * Matches an installed `@agent-native/*` package. Deliberately unanchored:
+ * under pnpm the real path runs through `node_modules/.pnpm/<id>/node_modules/`,
+ * so only the inner segment names the package.
+ */
+const WORKER_FRAMEWORK_CHUNK_TEST = /node_modules[/\\]@agent-native[/\\]/;
+
+/**
+ * Keeps every installed `@agent-native/*` package in one chunk for Worker and
+ * Deno output.
+ *
+ * Nitro declares one code-splitting group per installed package and then lets
+ * Rolldown merge those groups down to far fewer physical chunks, so two
+ * framework packages that share a dependency end up on opposite sides of a
+ * merge and import each other across the chunk boundary — one chunk holding
+ * zod, the other drizzle-orm. ESM evaluates one side of such a cycle first, and
+ * a module-scope read of the other side's `const` throws "Cannot access 'X'
+ * before initialization" while workerd is still linking, so the Worker never
+ * boots although install, resolution, bundling and the size check all passed.
+ * Workspace sources never match the group `test`, which is why this appears
+ * only once an app consumes the packages from node_modules, and only once it
+ * consumes two of them.
+ *
+ * Scoped to `@agent-native/*` rather than to all of node_modules on purpose.
+ * One chunk for every installed package also removes the cycle, but it drags
+ * lazily imported third-party packages into the eagerly evaluated chunk, and
+ * their module-scope `require("node:...")` then runs during startup — trading
+ * this failure for "No such module" at boot.
+ *
+ * This group does take precedence over the per-package grouping while leaving
+ * every other package on it — the emitted output is one `framework` chunk and no
+ * per-package `@agent-native/*` chunks — but not for the reason it is tempting
+ * to write down. Nitro passes its own `NODE_MODULES_RE` group as defu's FIRST
+ * argument and `rollupConfig` as its third, so this group is appended AFTER
+ * Nitro's, and Rolldown documents that at equal priority the smaller index wins.
+ * Neither ordering explains the result, so do not reason from position: what
+ * catches a regression here is `assertNoWorkerChunkImportCycles`, which fails
+ * the build rather than shipping a bundle that only breaks at boot.
+ *
+ * `advancedChunks` is not the option to reach for: Rolldown ignores it whenever
+ * `codeSplitting` is set, which Nitro always does, and warns rather than fails.
+ */
+export function workerFrameworkCodeSplitting(): {
+  groups: { test: RegExp; name: string }[];
+} {
+  return {
+    groups: [
+      { test: WORKER_FRAMEWORK_CHUNK_TEST, name: WORKER_FRAMEWORK_CHUNK_NAME },
+    ],
+  };
+}
+
+const STATIC_RELATIVE_IMPORT_RE =
+  /(?:^|[\s;})])(?:import|export)\s*(?:[^;"'()]*?from\s*)?["'](\.[^"']*)["']/g;
+
+function resolveEmittedChunkPath(fromFile: string, specifier: string): string {
+  const base = path.resolve(path.dirname(fromFile), specifier);
+  for (const candidate of [base, `${base}.mjs`, `${base}.js`]) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile())
+      return candidate;
+  }
+  return "";
+}
+
+/**
+ * Every module the Worker output emitted, at any depth.
+ *
+ * Depth is not optional knowledge here: Nitro names an externalised package
+ * chunk after the package, so a scoped one lands at
+ * `_libs/@agent-native/framework.mjs`. A one-level `readdirSync` of `_libs`
+ * sees `@agent-native` as an entry, fails the `.mjs` test, and skips every
+ * file under it — which is how three post-build patches came to run on none of
+ * the chunks that needed them.
+ */
+export function listEmittedWorkerChunkFiles(serverDir: string): string[] {
+  const files: string[] = [];
+  function walk(dir: string) {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(p);
+      else if (entry.name.endsWith(".mjs") || entry.name.endsWith(".js"))
+        files.push(p);
+    }
+  }
+  walk(serverDir);
+  return files.sort();
+}
+
+/**
+ * The specifier `fromFile` must use to reach `toFile`.
+ *
+ * Every rewrite into an emitted chunk goes through this. A depth assumed once —
+ * `./stub.mjs` for `_libs/`, `../_libs/stub.mjs` for `_chunks/` — is a depth
+ * that is wrong for the next chunk Nitro nests one level deeper, and workerd
+ * reports it as an unresolvable module rather than as a bad rewrite.
+ */
+function emittedChunkSpecifier(fromFile: string, toFile: string): string {
+  const rel = path.relative(path.dirname(fromFile), toFile).replace(/\\/g, "/");
+  return rel.startsWith(".") ? rel : `./${rel}`;
+}
+
+/**
+ * Points every import of `moduleName` at `target`, returning the code unchanged
+ * when there were none.
+ *
+ * Static and dynamic forms both count: core imports its optional peers with
+ * `await import("postgres")`, which a `from`-only pattern skips while the
+ * specifier still reaches workerd.
+ */
+export function rewriteEmittedChunkImportSpecifier(
+  code: string,
+  moduleName: string,
+  target: string,
+): string {
+  const escaped = moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // The lookbehind keeps a minified identifier that happens to end in `from`
+  // or `import` from matching.
+  const re = new RegExp(
+    `(?<![\\w$])((?:from|import)\\s*\\(?\\s*)(["'])${escaped}\\2`,
+    "g",
+  );
+  return code.replace(re, `$1$2${target}$2`);
+}
+
+export type CloudflareWorkerOutputPatchReport = {
+  /** Emitted chunks considered, relative to `serverDir`. */
+  scanned: string[];
+  /** Chunks the Node-builtin, `import.meta.url` or timer rules changed. */
+  patched: string[];
+  /** Modules a fail-closed stub was generated for. */
+  stubbed: string[];
+  /** Chunks whose imports were repointed at a generated stub. */
+  stubImporters: string[];
+};
+
+/**
+ * The Cloudflare post-build pass over the emitted Worker output.
+ *
+ * Reports what it touched because it cannot tell, on its own, whether patching
+ * nothing means there was nothing to patch: the pass ran for a year against a
+ * directory listing that never contained the chunks it was written for, logging
+ * the same success line either way.
+ */
+export function patchCloudflareWorkerOutput(
+  serverDir: string,
+): CloudflareWorkerOutputPatchReport {
+  const files = listEmittedWorkerChunkFiles(serverDir);
+  const rel = (file: string) =>
+    path.relative(serverDir, file).replace(/\\/g, "/");
+  if (files.length === 0) {
+    throw new Error(
+      `[deploy] Cloudflare post-build found no .mjs/.js output under ${serverDir}. ` +
+        `Nothing was patched, so the Worker still carries bare Node builtins, ` +
+        `an undefined import.meta.url and any global-scope timer — it would fail ` +
+        `at startup with no mention of this pass. Check that the preset's ` +
+        `serverDir is the directory Nitro actually wrote.`,
+    );
+  }
+
+  const report: CloudflareWorkerOutputPatchReport = {
+    scanned: files.map(rel),
+    patched: [],
+    stubbed: [],
+    stubImporters: [],
+  };
+
+  for (const file of files) {
+    const original = fs.readFileSync(file, "utf-8");
+    let code = original;
+
+    // 1. Bare Node.js builtins need the node: prefix on CF Workers.
+    for (const mod of CLOUDFLARE_WORKER_PATCHED_NODE_BUILTINS) {
+      code = code.replace(
+        new RegExp(`from\\s*["']${mod}["']`, "g"),
+        `from"node:${mod}"`,
+      );
+    }
+
+    // 2. React Router's server build calls createRequire(import.meta.url),
+    // which is undefined on CF Workers.
+    code = code.replace(/import\.meta\.url/g, '"file:///worker.mjs"');
+
+    // 3. CF Workers disallows timers in global scope.
+    if (code.includes("setInterval") && !code.includes("__timer_shim__")) {
+      const shim =
+        "/* __timer_shim__ */" +
+        "var __origSetInterval=globalThis.setInterval;" +
+        "globalThis.setInterval=function(){return{unref(){},ref(){},close(){}}};";
+      const restore =
+        ";(function(){if(typeof __origSetInterval!=='undefined')globalThis.setInterval=__origSetInterval})();";
+      code = shim + code + "\n" + restore;
+    }
+
+    if (code !== original) {
+      fs.writeFileSync(file, code);
+      report.patched.push(rel(file));
+    }
+  }
+
+  // Bare specifiers Nitro's bundler left behind cannot resolve on workerd.
+  // Point them at a generated stub that throws on use.
+  for (const mod of CLOUDFLARE_UNRESOLVED_NATIVE_STUBS) {
+    // Prefixed so the name cannot be one Nitro also emits. `_libs/postgres.mjs`
+    // is both what this stub would be called and what a chunk for a bundled
+    // `postgres` would be called, and writing the stub over that chunk replaces
+    // a working module with one that throws.
+    const stubPath = path.join(
+      serverDir,
+      "_libs",
+      `__unresolved__${mod.replace(/[/@]/g, "__")}.mjs`,
+    );
+    const importers: string[] = [];
+    for (const file of files) {
+      if (file === stubPath) continue;
+      const code = fs.readFileSync(file, "utf-8");
+      const rewritten = rewriteEmittedChunkImportSpecifier(
+        code,
+        mod,
+        emittedChunkSpecifier(file, stubPath),
+      );
+      if (rewritten === code) continue;
+      fs.mkdirSync(path.dirname(stubPath), { recursive: true });
+      fs.writeFileSync(stubPath, cloudflareUnresolvedNativeStubSource(mod));
+      fs.writeFileSync(file, rewritten);
+      importers.push(rel(file));
+    }
+    if (importers.length > 0) report.stubbed.push(mod);
+    report.stubImporters.push(...importers);
+  }
+
+  return report;
+}
+
+/**
+ * Static-import cycles between the chunks emitted into `serverDir`.
+ *
+ * Only static imports count: they are what the module linker evaluates before
+ * any code runs, and they are the only ones that can observe a binding in its
+ * temporal dead zone. A dynamic `import()` inside a function body is fine and
+ * must not be reported.
+ */
+export function findWorkerChunkImportCycles(serverDir: string): string[][] {
+  const files = listEmittedWorkerChunkFiles(serverDir);
+
+  const edges = new Map<string, string[]>();
+  for (const file of files) {
+    const code = fs.readFileSync(file, "utf8");
+    const targets = new Set<string>();
+    for (const match of code.matchAll(STATIC_RELATIVE_IMPORT_RE)) {
+      const resolved = resolveEmittedChunkPath(file, match[1]);
+      if (resolved && resolved !== file) targets.add(resolved);
+    }
+    edges.set(file, [...targets]);
+  }
+
+  const rel = (file: string) =>
+    path.relative(serverDir, file).replace(/\\/g, "/");
+  const cycles: string[][] = [];
+  const seenCycles = new Set<string>();
+  const state = new Map<string, "visiting" | "done">();
+  const stack: string[] = [];
+
+  function visit(file: string) {
+    state.set(file, "visiting");
+    stack.push(file);
+    for (const next of edges.get(file) ?? []) {
+      const nextState = state.get(next);
+      if (nextState === "done") continue;
+      if (nextState === "visiting") {
+        const cycle = stack.slice(stack.indexOf(next)).map(rel);
+        const key = [...cycle].sort().join("|");
+        if (!seenCycles.has(key)) {
+          seenCycles.add(key);
+          cycles.push(cycle);
+        }
+        continue;
+      }
+      visit(next);
+    }
+    stack.pop();
+    state.set(file, "done");
+  }
+
+  for (const file of files) if (!state.has(file)) visit(file);
+  return cycles;
+}
+
+/**
+ * Turns a cycle that would only surface as a minified symbol in workerd's boot
+ * log into a build failure that names the chunks.
+ */
+export function assertNoWorkerChunkImportCycles(serverDir: string): void {
+  const cycles = findWorkerChunkImportCycles(serverDir);
+  if (cycles.length === 0) return;
+  const described = cycles
+    .map((cycle) => `  ${[...cycle, cycle[0]].join(" -> ")}`)
+    .join("\n");
+  throw new Error(
+    `[deploy] Worker output has static import cycles between emitted chunks:\n${described}\n` +
+      `The module linker evaluates one side of a cycle first, so a module-scope read of the ` +
+      `other side throws "Cannot access 'X' before initialization" and the Worker never boots. ` +
+      `Every installed @agent-native/* package belongs in the single ` +
+      `${WORKER_FRAMEWORK_CHUNK_NAME} chunk — check whether a code-splitting group is ` +
+      `putting them back into per-package chunks.`,
+  );
 }
 
 /**
@@ -3942,8 +5274,10 @@ function createBrowserOnlyServerStubPlugin() {
   const STUB_ID = "\0agent-native-browser-only-server-stub";
   return {
     name: "agent-native-browser-only-server-stub",
-    // enforce: "pre" so we intercept before Nitro's node resolver bundles the
-    // real package. defu concatenates rollupConfig.plugins ahead of Nitro's own.
+    // enforce: "pre" is what puts this ahead of Nitro's node resolver, and it
+    // is the only thing that does. Array position does not: Nitro passes its
+    // own defaults as defu's FIRST argument and `rollupConfig` as its third, so
+    // anything from here is appended after them, not merged ahead of them.
     resolveId(id: string) {
       // Match the bare package name or any subpath (incl. `/index.css`).
       const pkg = id
@@ -4095,6 +5429,9 @@ export default bundle;
       ...(preset === "netlify" || preset === "vercel" || preset === "aws-lambda"
         ? { external: ["yjs"] }
         : {}),
+      ...(preset.startsWith("cloudflare") || preset.startsWith("deno")
+        ? { output: { codeSplitting: workerFrameworkCodeSplitting() } }
+        : {}),
       plugins: [
         ...(preset.startsWith("cloudflare")
           ? [createCloudflareModuleStubPlugin()]
@@ -4130,6 +5467,7 @@ export default bundle;
     copyInstalledLibsqlNativePackages(nitro.options.output.serverDir);
     copyInstalledResvgPackages(nitro.options.output.serverDir);
     copyInstalledFfmpegStaticPackage(nitro.options.output.serverDir);
+    copyInstalledBrowserRuntimePackages(nitro.options.output.serverDir);
     sanitizeServerlessFunctionPackageManifest(nitro.options.output.serverDir);
     bundleYjsRuntimeForServerlessOutput(nitro.options.output.serverDir, cwd);
   }
@@ -4152,6 +5490,8 @@ export default bundle;
       emitSingleTemplateNetlifyBackgroundFunction(cwd);
     }
 
+    emitSingleTemplateNetlifyRecurringJobsFunction(cwd);
+
     // Emit keep-warm after the background artifact so it only pings a function
     // that this build actually produced.
     emitSingleTemplateNetlifyKeepWarmFunction(cwd);
@@ -4172,7 +5512,9 @@ export default bundle;
   }
 
   // Resolve remaining bare npm imports by bundling them into _libs/.
-  // Nitro sometimes leaves small packages as externals even with noExternals.
+  // These are modules Rolldown could not resolve, not Nitro externals: Worker
+  // and Deno presets run with `node: false`, where Nitro never installs its
+  // externals plugin at all.
   if (preset.startsWith("cloudflare") || preset.startsWith("deno")) {
     const { execFileSync } = await import("child_process");
     const { createRequire } = await import("module");
@@ -4365,34 +5707,16 @@ export default bundle;
             },
           );
           // Rewrite imports in all files to point to the bundled module
-          function rewriteImports(dir: string) {
-            if (!fs.existsSync(dir)) return;
-            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-              const p = path.join(dir, entry.name);
-              if (entry.isDirectory()) {
-                rewriteImports(p);
-                continue;
-              }
-              if (!entry.name.endsWith(".mjs") && !entry.name.endsWith(".js"))
-                continue;
-              let code = fs.readFileSync(p, "utf-8");
-              const relPath = path
-                .relative(path.dirname(p), outFile)
-                .replace(/\\/g, "/");
-              const importPath = relPath.startsWith(".")
-                ? relPath
-                : "./" + relPath;
-              const re = new RegExp(
-                `from["']${mod.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`,
-                "g",
-              );
-              if (re.test(code)) {
-                code = code.replace(re, `from"${importPath}"`);
-                fs.writeFileSync(p, code);
-              }
-            }
+          for (const file of listEmittedWorkerChunkFiles(outputDir)) {
+            if (file === outFile) continue;
+            const code = fs.readFileSync(file, "utf-8");
+            const rewritten = rewriteEmittedChunkImportSpecifier(
+              code,
+              mod,
+              emittedChunkSpecifier(file, outFile),
+            );
+            if (rewritten !== code) fs.writeFileSync(file, rewritten);
           }
-          rewriteImports(outputDir);
           console.log(`[deploy] Bundled external: ${mod}`);
         } catch {
           console.warn(
@@ -4405,161 +5729,28 @@ export default bundle;
 
   // Cloudflare-specific post-build patches
   if (preset.startsWith("cloudflare")) {
-    const serverDir2 = nitro.options.output.serverDir;
-    const scanDirs = [serverDir2];
-    if (serverDir2) {
-      const chunksDir = path.join(serverDir2, "_chunks");
-      const libsDir = path.join(serverDir2, "_libs");
-      if (fs.existsSync(chunksDir)) scanDirs.push(chunksDir);
-      if (fs.existsSync(libsDir)) scanDirs.push(libsDir);
-    }
-
-    for (const scanDir of scanDirs) {
-      if (!scanDir || !fs.existsSync(scanDir)) continue;
-      for (const file of fs.readdirSync(scanDir)) {
-        if (!file.endsWith(".mjs") && !file.endsWith(".js")) continue;
-        const filePath = path.join(scanDir, file);
-        let code = fs.readFileSync(filePath, "utf-8");
-        let changed = false;
-
-        // 1. Rewrite bare Node.js imports to node: prefixed.
-        // CF Workers requires the node: prefix for built-in modules.
-        const NODE_BUILTINS = [
-          "fs",
-          "path",
-          "os",
-          "crypto",
-          "http",
-          "https",
-          "stream",
-          "url",
-          "util",
-          "events",
-          "buffer",
-          "console",
-          "querystring",
-          "zlib",
-          "net",
-          "tls",
-          "assert",
-          "timers",
-          "child_process",
-          "module",
-          "process",
-          "sqlite",
-          "worker_threads",
-          "string_decoder",
-          "diagnostics_channel",
-          "async_hooks",
-          "perf_hooks",
-          "inspector",
-          "vm",
-        ];
-        for (const mod of NODE_BUILTINS) {
-          // Match: from"fs" or from "fs" (but not from"node:fs")
-          const re = new RegExp(`from\\s*["']${mod}["']`, "g");
-          if (re.test(code)) {
-            code = code.replace(re, `from"node:${mod}"`);
-            changed = true;
-          }
-        }
-
-        // 2. Patch import.meta.url for createRequire().
-        // React Router's server build uses createRequire(import.meta.url)
-        // but import.meta.url is undefined on CF Workers.
-        if (code.includes("import.meta.url")) {
-          code = code.replace(/import\.meta\.url/g, '"file:///worker.mjs"');
-          changed = true;
-        }
-
-        // 3. Patch setInterval/setTimeout at global scope.
-        // CF Workers disallows timers in global scope.
-        if (code.includes("setInterval") && !code.includes("__timer_shim__")) {
-          const shim =
-            "/* __timer_shim__ */" +
-            "var __origSetInterval=globalThis.setInterval;" +
-            "globalThis.setInterval=function(){return{unref(){},ref(){},close(){}}};";
-          const restore =
-            ";(function(){if(typeof __origSetInterval!=='undefined')globalThis.setInterval=__origSetInterval})();";
-          code = shim + code + "\n" + restore;
-          changed = true;
-        }
-
-        if (changed) fs.writeFileSync(filePath, code);
-      }
-    }
-    // 3. Create stub modules in _libs/ for native deps that Nitro's rolldown
-    // bundler references but can't resolve on CF Workers, and rewrite
-    // bare imports to point to the stub files.
-    const libsDir2 = path.join(
-      serverDir2 || path.join(cwd, "dist", "_worker.js"),
-      "_libs",
+    const report = patchCloudflareWorkerOutput(
+      nitro.options.output.serverDir || path.join(cwd, "dist", "_worker.js"),
     );
-    if (fs.existsSync(libsDir2)) {
-      const NATIVE_STUBS = ["better-sqlite3", "node-pty", "cron-parser"];
-      for (const mod of NATIVE_STUBS) {
-        const libFiles = fs
-          .readdirSync(libsDir2)
-          .filter((f) => f.endsWith(".mjs"));
-        const referencingFiles: string[] = [];
-        for (const f of libFiles) {
-          const filePath = path.join(libsDir2, f);
-          const content = fs.readFileSync(filePath, "utf-8");
-          if (content.includes(`"${mod}"`) || content.includes(`'${mod}'`)) {
-            referencingFiles.push(filePath);
-          }
-        }
-        if (referencingFiles.length === 0) continue;
-
-        // Create a stub _libs/<mod>.mjs that exports empty defaults
-        const stubName = mod.replace(/[/@]/g, "__") + ".mjs";
-        const stubPath = path.join(libsDir2, stubName);
-        if (!fs.existsSync(stubPath)) {
-          fs.writeFileSync(
-            stubPath,
-            `export default {}; export const watch = () => ({ close() {} });\n`,
-          );
-          console.log(`[deploy] Created stub for _libs/${stubName}`);
-        }
-
-        // Rewrite bare imports in _libs/ and _chunks/ to use the stub
-        const escaped = mod.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const importRe = new RegExp(`(from\\s*["'])${escaped}(["'])`, "g");
-        // Scan _libs/ files
-        for (const filePath of referencingFiles) {
-          let code = fs.readFileSync(filePath, "utf-8");
-          if (importRe.test(code)) {
-            code = code.replace(importRe, `$1./${stubName}$2`);
-            fs.writeFileSync(filePath, code);
-            console.log(
-              `[deploy] Rewrote ${mod} imports in _libs/${path.basename(filePath)}`,
-            );
-          }
-        }
-        // Also scan _chunks/ files (they import native deps too)
-        const chunksDir2 = path.join(
-          serverDir2 || path.join(cwd, "dist", "_worker.js"),
-          "_chunks",
-        );
-        if (fs.existsSync(chunksDir2)) {
-          for (const f of fs
-            .readdirSync(chunksDir2)
-            .filter((f) => f.endsWith(".mjs") || f.endsWith(".js"))) {
-            const filePath = path.join(chunksDir2, f);
-            let code = fs.readFileSync(filePath, "utf-8");
-            if (importRe.test(code)) {
-              // From _chunks/, the stub is at ../_libs/<stubName>
-              code = code.replace(importRe, `$1../_libs/${stubName}$2`);
-              fs.writeFileSync(filePath, code);
-              console.log(`[deploy] Rewrote ${mod} imports in _chunks/${f}`);
-            }
-          }
-        }
-      }
-    }
-
     console.log(
-      "[deploy] Patched bare Node imports, timer calls, and route finder for CF Workers",
+      `[deploy] Patched bare Node imports, import.meta.url and global-scope ` +
+        `timers in ${report.patched.length} of ${report.scanned.length} ` +
+        `emitted Worker chunk(s) for CF Workers`,
+    );
+    if (report.stubbed.length > 0) {
+      console.log(
+        `[deploy] Stubbed unresolved module(s) ${report.stubbed.join(", ")} ` +
+          `for ${report.stubImporters.length} importing chunk(s)`,
+      );
+    }
+  }
+
+  // Last gate before the artifact ships: the cycle this catches passes install,
+  // resolution, bundling and the size check, and only workerd's module linker
+  // objects — by then the evidence is a minified symbol name.
+  if (preset.startsWith("cloudflare") || preset.startsWith("deno")) {
+    assertNoWorkerChunkImportCycles(
+      nitro.options.output.serverDir || path.join(cwd, "dist", "_worker.js"),
     );
   }
 

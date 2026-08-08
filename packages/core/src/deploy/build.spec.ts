@@ -16,23 +16,37 @@ import {
   addImmutableAssetRouteRulesForClientBuild,
   assertEmittedBackgroundFunctionOnDisk,
   assertNoCloudflareWorkerStubDynamicImports,
+  assertNoWorkerChunkImportCycles,
   assertSingleTemplateNetlifyBuildOutput,
   bundleYjsRuntimeForServerlessOutput,
   CLOUDFLARE_WORKER_ESBUILD_EXTERNALS,
+  CLOUDFLARE_D1_BINDING_NAME,
+  CLOUDFLARE_BROWSER_BINDING_NAME,
+  CLOUDFLARE_R2_BINDING_NAME,
   CLOUDFLARE_MODULE_STUB_MODULES,
+  CLOUDFLARE_UNRESOLVED_NATIVE_STUBS,
+  cloudflareUnresolvedNativeStubSource,
   CLOUDFLARE_WORKER_NODE_BUILTIN_STUB_MODULES,
   CLOUDFLARE_WORKER_STUB_MODULES,
   CLOUDFLARE_WORKER_STUB_SUBPATH_MODULES,
   cloudflareWorkerStubAliasArgs,
+  configureCloudflareModuleBackgroundQueue,
   configureCloudflareModuleWorkerOutput,
+  copyInstalledBrowserRuntimePackages,
   copyDir,
   createCloudflareModuleStubPlugin,
   emitSingleTemplateNetlifyBackgroundFunction,
   emitSingleTemplateNetlifyIntegrationRecoveryFunction,
   emitSingleTemplateNetlifyKeepWarmFunction,
+  emitSingleTemplateNetlifyRecurringJobsFunction,
   findInstalledFfmpegStaticPackage,
+  findInstalledPackageRoot,
   findInstalledResvgPackages,
+  findWorkerChunkImportCycles,
   isServerlessNativePlatformPackage,
+  listEmittedWorkerChunkFiles,
+  patchCloudflareWorkerOutput,
+  rewriteEmittedChunkImportSpecifier,
   generateCloudflarePagesStaticShellFromManifest,
   generateCloudflareModuleWorkerEntry,
   generateProvidedPluginsNitroPluginSource,
@@ -41,13 +55,22 @@ import {
   isCloudflareModulePreset,
   isDurableBackgroundDeployEnabled,
   isIntegrationDurableDispatchDeployEnabled,
+  isKeepWarmBackgroundDeployEnabled,
+  isKeepWarmDeployEnabled,
+  resolveKeepWarmSchedule,
+  NETLIFY_RECURRING_JOBS_FUNCTION_NAME,
   NITRO_RUNTIME_IGNORE_PATTERNS,
   nitroNoExternalsForPreset,
   patchCloudflareModuleNitroEntry,
+  resolveCloudflareBrowserBinding,
+  resolveCloudflareD1Binding,
+  resolveCloudflareR2Binding,
   resolveNitroBundledYjsEntry,
   runNitroBuildPipeline,
   sanitizeServerlessFunctionPackageManifest,
   shouldBundleFfmpegStaticForServerless,
+  WORKER_FRAMEWORK_CHUNK_NAME,
+  workerFrameworkCodeSplitting,
   writeSingleTemplateNetlifyRedirects,
 } from "./build.js";
 import { IMMUTABLE_ASSET_CACHE_CONTROL } from "./immutable-assets.js";
@@ -55,7 +78,8 @@ import { IMMUTABLE_ASSET_CACHE_CONTROL } from "./immutable-assets.js";
 const DEFAULT_SSR_CACHE_CONTROL =
   "public, max-age=600, stale-while-revalidate=604800, stale-if-error=3600";
 const DEFAULT_SSR_CDN_CACHE_CONTROL = DEFAULT_SSR_CACHE_CONTROL;
-const DEFAULT_SSR_NETLIFY_CDN_CACHE_CONTROL = DEFAULT_SSR_CACHE_CONTROL;
+const DEFAULT_SSR_NETLIFY_CDN_CACHE_CONTROL =
+  "public, durable, max-age=600, stale-while-revalidate=604800, stale-if-error=3600";
 const tempDirs: string[] = [];
 
 describe("nitroNoExternalsForPreset", () => {
@@ -73,6 +97,288 @@ describe("nitroNoExternalsForPreset", () => {
   });
 });
 
+describe("workerFrameworkCodeSplitting", () => {
+  it("claims every installed @agent-native package for one chunk", () => {
+    const [group] = workerFrameworkCodeSplitting().groups;
+    expect(group.name).toBe(WORKER_FRAMEWORK_CHUNK_NAME);
+    expect(
+      group.test.test("/app/node_modules/@agent-native/core/dist/index.js"),
+    ).toBe(true);
+    // pnpm reaches a `file:` tarball install through its store, so the path
+    // that matters is the realpath inside .pnpm, not the top-level symlink.
+    expect(
+      group.test.test(
+        "/app/node_modules/.pnpm/@agent-native+creative-context@file+vendor+x.tgz_a/node_modules/@agent-native/creative-context/dist/index.js",
+      ),
+    ).toBe(true);
+  });
+
+  it("leaves everything else on Nitro's own per-package grouping", () => {
+    const [group] = workerFrameworkCodeSplitting().groups;
+    expect(group.test.test("/app/actions/list-designs.ts")).toBe(false);
+    expect(group.test.test("/app/node_modules/nitro/dist/runtime/x.mjs")).toBe(
+      false,
+    );
+    // Third-party packages keep their own chunks: pulling a lazily imported
+    // one into the eagerly evaluated chunk runs its module-scope
+    // `require("node:...")` during startup, which workerd rejects.
+    expect(
+      group.test.test(
+        "/app/node_modules/.pnpm/@playwright+test@1.0.0/node_modules/@playwright/test/index.js",
+      ),
+    ).toBe(false);
+    expect(
+      group.test.test(
+        "/app/node_modules/.pnpm/zod@4.4.3/node_modules/zod/index.js",
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("findWorkerChunkImportCycles", () => {
+  it("reports a cycle between two emitted chunks", () => {
+    const dir = makeTempDir();
+    const libs = path.join(dir, "_libs", "@agent-native");
+    fs.mkdirSync(libs, { recursive: true });
+    fs.writeFileSync(
+      path.join(libs, "core.mjs"),
+      'import{v as a}from"./creative-context+[...].mjs";export const z=a;',
+    );
+    fs.writeFileSync(
+      path.join(libs, "creative-context+[...].mjs"),
+      'import{z as b}from"./core.mjs";export const v=b;',
+    );
+
+    const cycles = findWorkerChunkImportCycles(dir);
+
+    expect(cycles).toHaveLength(1);
+    expect(cycles[0]).toEqual(
+      expect.arrayContaining([
+        "_libs/@agent-native/core.mjs",
+        "_libs/@agent-native/creative-context+[...].mjs",
+      ]),
+    );
+  });
+
+  it("ignores dynamic imports, which do not evaluate during linking", () => {
+    const dir = makeTempDir();
+    fs.writeFileSync(
+      path.join(dir, "index.mjs"),
+      'import{a}from"./_libs/vendor.mjs";export const b=a;',
+    );
+    fs.mkdirSync(path.join(dir, "_libs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "_libs", "vendor.mjs"),
+      'export const a=()=>import("../index.mjs");',
+    );
+
+    expect(findWorkerChunkImportCycles(dir)).toEqual([]);
+  });
+
+  it("finds nothing in an acyclic single-vendor-chunk output", () => {
+    const dir = makeTempDir();
+    fs.mkdirSync(path.join(dir, "_libs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "index.mjs"),
+      'export*from"./_libs/vendor+[...].mjs";',
+    );
+    fs.writeFileSync(
+      path.join(dir, "_libs", "vendor+[...].mjs"),
+      "export const a=1;",
+    );
+
+    expect(findWorkerChunkImportCycles(dir)).toEqual([]);
+  });
+});
+
+describe("assertNoWorkerChunkImportCycles", () => {
+  it("names the cycling chunks instead of leaving workerd to fail at boot", () => {
+    const dir = makeTempDir();
+    fs.mkdirSync(path.join(dir, "_libs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "_libs", "a.mjs"),
+      'import{b}from"./b.mjs";export const a=b;',
+    );
+    fs.writeFileSync(
+      path.join(dir, "_libs", "b.mjs"),
+      'import{a}from"./a.mjs";export const b=a;',
+    );
+
+    expect(() => assertNoWorkerChunkImportCycles(dir)).toThrow(/_libs\/a\.mjs/);
+    expect(() => assertNoWorkerChunkImportCycles(dir)).toThrow(/_libs\/b\.mjs/);
+  });
+
+  it("passes an output with no chunk cycle", () => {
+    const dir = makeTempDir();
+    fs.writeFileSync(path.join(dir, "index.mjs"), "export const a=1;");
+
+    expect(() => assertNoWorkerChunkImportCycles(dir)).not.toThrow();
+  });
+});
+
+describe("listEmittedWorkerChunkFiles", () => {
+  it("reaches a chunk Nitro nested under a scope directory", () => {
+    const dir = makeTempDir();
+    fs.mkdirSync(path.join(dir, "_libs", "@agent-native"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "index.mjs"), "export const a=1;");
+    fs.writeFileSync(
+      path.join(dir, "_libs", "@agent-native", "framework.mjs"),
+      "export const b=1;",
+    );
+    fs.writeFileSync(path.join(dir, "_libs", "notes.txt"), "ignored");
+
+    expect(
+      listEmittedWorkerChunkFiles(dir).map((f) =>
+        path.relative(dir, f).replace(/\\/g, "/"),
+      ),
+    ).toEqual(["_libs/@agent-native/framework.mjs", "index.mjs"]);
+  });
+});
+
+describe("patchCloudflareWorkerOutput", () => {
+  // Nitro names an externalised package chunk after the package, so a scoped
+  // one lands two levels down. A one-level readdir sees `@agent-native` as an
+  // entry, fails the `.mjs` test, and silently patches none of it.
+  function writeNestedOutput(dir: string, source: string): string {
+    const nested = path.join(dir, "_libs", "@agent-native");
+    fs.mkdirSync(nested, { recursive: true });
+    const file = path.join(nested, "framework.mjs");
+    fs.writeFileSync(file, source);
+    fs.writeFileSync(path.join(dir, "index.mjs"), "export const a=1;");
+    return file;
+  }
+
+  it("patches a nested chunk's bare Node builtins, import.meta.url and global timer", () => {
+    const dir = makeTempDir();
+    const file = writeNestedOutput(
+      dir,
+      [
+        'import{readFileSync}from"fs";',
+        'import{createRequire}from"module";',
+        "const require_=createRequire(import.meta.url);",
+        "setInterval(()=>{},6e4).unref?.();",
+        "export const read=readFileSync;",
+        "export const req=require_;",
+      ].join("\n"),
+    );
+
+    const report = patchCloudflareWorkerOutput(dir);
+    const patched = fs.readFileSync(file, "utf8");
+
+    expect(report.patched).toContain("_libs/@agent-native/framework.mjs");
+    expect(patched).toContain('from"node:fs"');
+    expect(patched).toContain('from"node:module"');
+    expect(patched).not.toMatch(/import\.meta\.url/);
+    expect(patched).toContain('"file:///worker.mjs"');
+    expect(patched).toContain("__timer_shim__");
+    expect(patched).toContain("globalThis.setInterval=function()");
+  });
+
+  it("repoints a nested chunk's unresolved import at a stub, at its own depth", () => {
+    const dir = makeTempDir();
+    // Core imports its optional peers lazily, so the specifier that reaches
+    // workerd is the dynamic form.
+    const file = writeNestedOutput(
+      dir,
+      'export const db=async()=>(await import("postgres")).default;',
+    );
+
+    const report = patchCloudflareWorkerOutput(dir);
+
+    expect(report.stubbed).toContain("postgres");
+    expect(report.stubImporters).toContain("_libs/@agent-native/framework.mjs");
+    // From `_libs/@agent-native/`, the stub in `_libs/` is one level up — the
+    // depths the old pass hardcoded would both have missed it.
+    expect(fs.readFileSync(file, "utf8")).toContain(
+      'import("../__unresolved__postgres.mjs")',
+    );
+    expect(
+      fs.existsSync(path.join(dir, "_libs", "__unresolved__postgres.mjs")),
+    ).toBe(true);
+  });
+
+  it("does not write its stub over a chunk Nitro emitted under the same name", () => {
+    const dir = makeTempDir();
+    writeNestedOutput(
+      dir,
+      'export const db=async()=>(await import("postgres")).default;',
+    );
+    const emitted = path.join(dir, "_libs", "postgres.mjs");
+    fs.writeFileSync(emitted, "export default function real(){return 1}");
+
+    patchCloudflareWorkerOutput(dir);
+
+    expect(fs.readFileSync(emitted, "utf8")).toContain("function real()");
+  });
+
+  it("keeps the generated stub throwing on use rather than answering empty", async () => {
+    const dir = makeTempDir();
+    writeNestedOutput(
+      dir,
+      'export const db=async()=>(await import("postgres")).default;',
+    );
+
+    patchCloudflareWorkerOutput(dir);
+    const stub = await import(
+      pathToFileURL(path.join(dir, "_libs", "__unresolved__postgres.mjs")).href
+    );
+
+    expect(() => stub.default("postgres://x")).toThrow(
+      /postgres is unavailable/,
+    );
+  });
+
+  it("reports patching nothing instead of logging success over an empty walk", () => {
+    const dir = makeTempDir();
+    fs.mkdirSync(path.join(dir, "_libs"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "index.mjs"), 'import"node:fs";');
+
+    const report = patchCloudflareWorkerOutput(dir);
+
+    expect(report.scanned).toEqual(["index.mjs"]);
+    expect(report.patched).toEqual([]);
+    expect(report.stubbed).toEqual([]);
+  });
+
+  it("fails loudly when the output it was pointed at holds no chunks", () => {
+    const dir = makeTempDir();
+
+    expect(() => patchCloudflareWorkerOutput(dir)).toThrow(/no \.mjs\/\.js/);
+  });
+});
+
+describe("rewriteEmittedChunkImportSpecifier", () => {
+  it("rewrites the static, side-effect and dynamic forms", () => {
+    const code = [
+      'import pg from"postgres";',
+      'export*from"postgres";',
+      'import"postgres";',
+      'const x=await import("postgres");',
+    ].join("\n");
+
+    expect(
+      rewriteEmittedChunkImportSpecifier(code, "postgres", "./stub.mjs"),
+    ).toBe(
+      [
+        'import pg from"./stub.mjs";',
+        'export*from"./stub.mjs";',
+        'import"./stub.mjs";',
+        'const x=await import("./stub.mjs");',
+      ].join("\n"),
+    );
+  });
+
+  it("leaves a subpath specifier and a bare string alone", () => {
+    // The pass this replaced decided which files referenced a module by
+    // searching for the quoted name, which matches both of these.
+    const code = 'import a from"postgres/other";const dialect="postgres";';
+
+    expect(
+      rewriteEmittedChunkImportSpecifier(code, "postgres", "./stub.mjs"),
+    ).toBe(code);
+  });
+});
+
 describe("isCloudflareModulePreset", () => {
   it("recognizes Nitro's module preset and its CLI spelling", () => {
     expect(isCloudflareModulePreset("cloudflare_module")).toBe(true);
@@ -82,6 +388,10 @@ describe("isCloudflareModulePreset", () => {
 });
 
 describe("Cloudflare module Worker entry", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("defers Nitro's handler and lifecycle initialization", () => {
     const source =
       'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}';
@@ -116,18 +426,80 @@ describe("Cloudflare module Worker entry", () => {
     expect(entry).toContain("async trace(traces, env, ctx)");
   });
 
+  it("exports a durable background queue consumer alongside the request handler", () => {
+    const entry = generateCloudflareModuleWorkerEntry();
+
+    // The consumer synthesises a request to the processor route the message
+    // selects and delegates to the SAME handler that serves fetch.
+    expect(entry).toContain(
+      'const PROCESS_RUN_PATH = "/_agent-native/agent-chat/_process-run";',
+    );
+    expect(entry).toContain(
+      "function runBackgroundQueueMessage(message, env, ctx)",
+    );
+    expect(entry).toContain(
+      "new URL(processorPathForEnvelope(envelope.body), envelope.origin)",
+    );
+    expect(entry).toContain("loaded.fetch(request, env, ctx)");
+    // The signed internal token travels with the message, unchanged.
+    expect(entry).toContain(
+      'headers["Authorization"] = envelope.authorization;',
+    );
+    // Every processor the Netlify wrapper reaches is reachable here too.
+    expect(entry).toContain(
+      'const A2A_PROCESS_TASK_PATH = "/_agent-native/a2a/_process-task";',
+    );
+    expect(entry).toContain(
+      'const INTEGRATION_PROCESS_TASK_PATH = "/_agent-native/integrations/process-task";',
+    );
+    expect(entry).toContain('"/api/_agent-native-background/"');
+    // The long budget is proven per invocation, never isolate-wide.
+    expect(entry).toContain(
+      'const ENTER_BACKGROUND_SCOPE_KEY = "__AGENT_NATIVE_ENTER_BACKGROUND_INVOCATION_SCOPE__";',
+    );
+    expect(entry).toContain("enterBackgroundScope(() =>");
+    expect(entry).toContain('typeof enterBackgroundScope !== "function"');
+  });
+
+  it("never acknowledges a queue message it did not run", () => {
+    const entry = generateCloudflareModuleWorkerEntry();
+
+    expect(entry).toContain("message.retry();");
+    expect(entry).toContain("response.status >= 500");
+    expect(entry).toContain("for (const message of foreign) message.retry();");
+    // A handler that answers with nothing is neither a 5xx nor a decision;
+    // acking it would drop the run while reporting it delivered.
+    expect(entry).toContain('!response || typeof response.status !== "number"');
+  });
+
+  it("refuses a message that declares a processor it cannot route", () => {
+    const entry = generateCloudflareModuleWorkerEntry();
+
+    // Absent processor field → agent chat, the documented default. Declared but
+    // unroutable → a loud refusal, not a turn run against the wrong processor.
+    expect(entry).toContain("function processorPathForEnvelope(body)");
+    expect(entry).toContain("refusing to run it as an agent-chat turn");
+    expect(entry).toContain("return PROCESS_RUN_PATH;");
+  });
+
   it("points Wrangler at the lazy entry while retaining the Nitro server", () => {
     const serverDir = makeTempDir();
     fs.writeFileSync(
       path.join(serverDir, "wrangler.json"),
-      JSON.stringify({ main: "index.mjs", assets: { binding: "ASSETS" } }),
+      JSON.stringify({
+        name: "design",
+        main: "index.mjs",
+        assets: { binding: "ASSETS" },
+      }),
     );
     fs.writeFileSync(
       path.join(serverDir, "index.mjs"),
       'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
     );
 
-    configureCloudflareModuleWorkerOutput(serverDir);
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
 
     expect(
       JSON.parse(
@@ -136,6 +508,15 @@ describe("Cloudflare module Worker entry", () => {
     ).toMatchObject({
       main: "worker.mjs",
       assets: { binding: "ASSETS" },
+      queues: {
+        producers: [
+          {
+            binding: "AGENT_NATIVE_BACKGROUND_QUEUE",
+            queue: "design-agent-background",
+          },
+        ],
+      },
+      limits: { cpu_ms: 300_000 },
     });
     expect(
       fs.readFileSync(path.join(serverDir, "worker.mjs"), "utf8"),
@@ -143,6 +524,191 @@ describe("Cloudflare module Worker entry", () => {
     expect(
       fs.readFileSync(path.join(serverDir, "index.mjs"), "utf8"),
     ).toContain("t??=Ei();");
+  });
+
+  it("emits the producer binding, the consumer registration, and a raised CPU limit", () => {
+    const config: Record<string, unknown> = { name: "design" };
+
+    configureCloudflareModuleBackgroundQueue(config, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    expect(config.queues).toEqual({
+      producers: [
+        {
+          binding: "AGENT_NATIVE_BACKGROUND_QUEUE",
+          queue: "design-agent-background",
+        },
+      ],
+      consumers: [
+        {
+          queue: "design-agent-background",
+          max_batch_size: 1,
+          max_batch_timeout: 0,
+          max_retries: 3,
+          dead_letter_queue: "design-agent-background-dlq",
+        },
+      ],
+    });
+    // 300,000 ms is the documented Workers Paid maximum; the 30,000 ms default
+    // kills a long turn on CPU time alone.
+    expect(config.limits).toEqual({ cpu_ms: 300_000 });
+  });
+
+  it("keeps an app's own queues and never lowers a CPU limit it raised further", () => {
+    const config: Record<string, unknown> = {
+      name: "design",
+      queues: {
+        producers: [{ binding: "APP_QUEUE", queue: "app-jobs" }],
+        consumers: [{ queue: "app-jobs" }],
+      },
+      limits: { cpu_ms: 300_000, other: true },
+    };
+
+    configureCloudflareModuleBackgroundQueue(config, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    const queues = config.queues as {
+      producers: unknown[];
+      consumers: unknown[];
+    };
+    expect(queues.producers).toHaveLength(2);
+    expect(queues.producers[0]).toEqual({
+      binding: "APP_QUEUE",
+      queue: "app-jobs",
+    });
+    expect(queues.consumers).toHaveLength(2);
+    expect(config.limits).toMatchObject({ cpu_ms: 300_000, other: true });
+  });
+
+  it("replaces a stale framework binding rather than emitting it twice", () => {
+    const config: Record<string, unknown> = {
+      name: "design",
+      queues: {
+        producers: [
+          { binding: "AGENT_NATIVE_BACKGROUND_QUEUE", queue: "old-queue-name" },
+        ],
+        consumers: [{ queue: "design-agent-background", max_batch_size: 10 }],
+      },
+    };
+
+    configureCloudflareModuleBackgroundQueue(config, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    const queues = config.queues as {
+      producers: { queue: string }[];
+      consumers: { max_batch_size?: number }[];
+    };
+    expect(queues.producers).toEqual([
+      {
+        binding: "AGENT_NATIVE_BACKGROUND_QUEUE",
+        queue: "design-agent-background",
+      },
+    ]);
+    expect(queues.consumers).toHaveLength(1);
+    expect(queues.consumers[0].max_batch_size).toBe(1);
+  });
+
+  it("refuses to name a background queue for an unnamed Worker", () => {
+    expect(() =>
+      configureCloudflareModuleBackgroundQueue(
+        {},
+        { CLOUDFLARE_BACKGROUND_QUEUE: "1" },
+      ),
+    ).toThrow(/has no `name`/);
+  });
+
+  it("emits no queue for a Worker that asked for neither a queue nor durable background", () => {
+    const config: Record<string, unknown> = { name: "design" };
+
+    configureCloudflareModuleBackgroundQueue(config, {
+      AGENT_CHAT_DURABLE_BACKGROUND: "false",
+    });
+
+    // No `queues` key at all: wrangler rejects a producer or a consumer whose
+    // queue does not exist, so an app that never hands a run to the background
+    // must not be made to provision one to deploy.
+    expect(config.queues).toBeUndefined();
+    expect(config.limits).toEqual({ cpu_ms: 300_000 });
+  });
+
+  it("carries the build's opt-out into the Worker's own environment", () => {
+    const config: Record<string, unknown> = { name: "design" };
+
+    configureCloudflareModuleBackgroundQueue(config, {
+      AGENT_CHAT_DURABLE_BACKGROUND: "off",
+    });
+
+    // The opt-out is a BUILD variable and the deployed Worker re-reads its own
+    // env, where this host's durable gate is default-ON. Unwritten, the Worker
+    // opens the gate, finds no queue, and runs the turn inline under the
+    // foreground clamp — the degrade the refusal exists to prevent, reached
+    // through the escape hatch the refusal recommends.
+    expect(config.vars).toEqual({ AGENT_CHAT_DURABLE_BACKGROUND: "false" });
+  });
+
+  it("never overwrites a durable background value the app declared itself", () => {
+    const config: Record<string, unknown> = {
+      name: "design",
+      vars: { AGENT_CHAT_DURABLE_BACKGROUND: "1", APP_URL: "https://x.test" },
+    };
+
+    configureCloudflareModuleBackgroundQueue(config, {
+      AGENT_CHAT_DURABLE_BACKGROUND: "false",
+    });
+
+    expect(config.vars).toEqual({
+      AGENT_CHAT_DURABLE_BACKGROUND: "1",
+      APP_URL: "https://x.test",
+    });
+  });
+
+  it("reads both halves of the decision from the build environment it was given", () => {
+    // The queue toggle and the durable flag are one decision. Read from two
+    // environments, a build is refused — or emitted — for a reason its operator
+    // never wrote.
+    vi.stubEnv("AGENT_CHAT_DURABLE_BACKGROUND", "true");
+    const config: Record<string, unknown> = { name: "design" };
+
+    configureCloudflareModuleBackgroundQueue(config, {
+      AGENT_CHAT_DURABLE_BACKGROUND: "false",
+    });
+
+    expect(config.queues).toBeUndefined();
+  });
+
+  it("refuses at build time when durable background is requested with no queue", () => {
+    const config: Record<string, unknown> = { name: "paul-dispatch-app" };
+
+    // The refusal must name both resources: a consumer whose dead-letter queue
+    // is missing is rejected by wrangler exactly like a missing queue, and
+    // "create the queue" alone sends the operator round the loop twice.
+    expect(() => configureCloudflareModuleBackgroundQueue(config, {})).toThrow(
+      /CLOUDFLARE_BACKGROUND_QUEUE/,
+    );
+    expect(() => configureCloudflareModuleBackgroundQueue(config, {})).toThrow(
+      /paul-dispatch-app-agent-background\b/,
+    );
+    expect(() => configureCloudflareModuleBackgroundQueue(config, {})).toThrow(
+      /paul-dispatch-app-agent-background-dlq/,
+    );
+    expect(() => configureCloudflareModuleBackgroundQueue(config, {})).toThrow(
+      /AGENT_CHAT_DURABLE_BACKGROUND=false/,
+    );
+    // Refused, not degraded: nothing partial is left on the config for a caller
+    // to mistake for a configured Worker.
+    expect(config.queues).toBeUndefined();
+  });
+
+  it("refuses an unrecognised queue declaration rather than reading it as either answer", () => {
+    expect(() =>
+      configureCloudflareModuleBackgroundQueue(
+        { name: "design" },
+        { CLOUDFLARE_BACKGROUND_QUEUE: "maybe" },
+      ),
+    ).toThrow(/is not a recognised value/);
   });
 });
 
@@ -156,6 +722,348 @@ describe("Cloudflare module preset stubs", () => {
     expect(plugin.load(sentryStub as string)).toContain("captureException");
     expect(plugin.resolveId("@sentry/node/internals")).toBeNull();
     expect(plugin.resolveId("@anthropic-ai/sdk")).toBeNull();
+  });
+});
+
+describe("Cloudflare module Worker D1 binding", () => {
+  it("emits no binding when the build environment names no database", () => {
+    expect(resolveCloudflareD1Binding({})).toBeNull();
+  });
+
+  it("binds the database core actually reads", () => {
+    expect(
+      resolveCloudflareD1Binding({
+        CLOUDFLARE_D1_DATABASE_NAME: "design-local",
+        CLOUDFLARE_D1_DATABASE_ID: "00000000-0000-0000-0000-000000000000",
+      }),
+    ).toEqual({
+      binding: CLOUDFLARE_D1_BINDING_NAME,
+      database_name: "design-local",
+      database_id: "00000000-0000-0000-0000-000000000000",
+    });
+  });
+
+  it("refuses a half-configured database instead of dropping the binding", () => {
+    // A dropped binding leaves the Worker on the SQLite dialect and failing
+    // inside the native stub, which names neither the database nor the config.
+    expect(() =>
+      resolveCloudflareD1Binding({
+        CLOUDFLARE_D1_DATABASE_NAME: "design-local",
+      }),
+    ).toThrow(/CLOUDFLARE_D1_DATABASE_ID/);
+    expect(() =>
+      resolveCloudflareD1Binding({ CLOUDFLARE_D1_DATABASE_ID: "abc" }),
+    ).toThrow(/CLOUDFLARE_D1_DATABASE_NAME/);
+  });
+
+  it("writes the binding into the generated Wrangler config", () => {
+    const serverDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(serverDir, "wrangler.json"),
+      JSON.stringify({
+        name: "design",
+        main: "index.mjs",
+        assets: { binding: "ASSETS" },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(serverDir, "index.mjs"),
+      'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
+    );
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_D1_DATABASE_NAME: "design-local",
+      CLOUDFLARE_D1_DATABASE_ID: "00000000-0000-0000-0000-000000000000",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    expect(
+      JSON.parse(
+        fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"),
+      ),
+    ).toMatchObject({
+      main: "worker.mjs",
+      d1_databases: [
+        {
+          binding: "DB",
+          database_name: "design-local",
+          database_id: "00000000-0000-0000-0000-000000000000",
+        },
+      ],
+    });
+  });
+
+  it("replaces only its own binding and keeps hand-added ones", () => {
+    const serverDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(serverDir, "wrangler.json"),
+      JSON.stringify({
+        name: "design",
+        main: "index.mjs",
+        d1_databases: [
+          { binding: "DB", database_name: "stale", database_id: "stale-id" },
+          { binding: "ANALYTICS", database_name: "a", database_id: "a-id" },
+        ],
+      }),
+    );
+    fs.writeFileSync(
+      path.join(serverDir, "index.mjs"),
+      'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
+    );
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_D1_DATABASE_NAME: "design-local",
+      CLOUDFLARE_D1_DATABASE_ID: "fresh-id",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    expect(
+      JSON.parse(fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"))
+        .d1_databases,
+    ).toEqual([
+      { binding: "ANALYTICS", database_name: "a", database_id: "a-id" },
+      {
+        binding: "DB",
+        database_name: "design-local",
+        database_id: "fresh-id",
+      },
+    ]);
+  });
+
+  it("emits no binding at all when the build environment names no database", () => {
+    const serverDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(serverDir, "wrangler.json"),
+      JSON.stringify({ name: "design", main: "index.mjs" }),
+    );
+    fs.writeFileSync(
+      path.join(serverDir, "index.mjs"),
+      'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
+    );
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    expect(
+      JSON.parse(
+        fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"),
+      ),
+    ).not.toHaveProperty("d1_databases");
+  });
+});
+
+describe("Cloudflare module Worker R2 binding", () => {
+  function makeWorkerDir(config: Record<string, unknown>): string {
+    const serverDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(serverDir, "wrangler.json"),
+      JSON.stringify({ name: "design", main: "index.mjs", ...config }),
+    );
+    fs.writeFileSync(
+      path.join(serverDir, "index.mjs"),
+      'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
+    );
+    return serverDir;
+  }
+
+  function readConfig(serverDir: string): Record<string, unknown> {
+    return JSON.parse(
+      fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"),
+    );
+  }
+
+  it("emits no binding when the build environment names no bucket", () => {
+    expect(resolveCloudflareR2Binding({})).toBeNull();
+    expect(
+      resolveCloudflareR2Binding({ CLOUDFLARE_R2_BUCKET_NAME: "  " }),
+    ).toBeNull();
+  });
+
+  it("binds the bucket the upload provider actually reads", () => {
+    expect(
+      resolveCloudflareR2Binding({ CLOUDFLARE_R2_BUCKET_NAME: "app-uploads" }),
+    ).toEqual({
+      binding: CLOUDFLARE_R2_BINDING_NAME,
+      bucket_name: "app-uploads",
+    });
+  });
+
+  it("writes the binding into the generated Wrangler config", () => {
+    const serverDir = makeWorkerDir({});
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_R2_BUCKET_NAME: "app-uploads",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    expect(readConfig(serverDir)).toMatchObject({
+      r2_buckets: [{ binding: "UPLOADS", bucket_name: "app-uploads" }],
+    });
+  });
+
+  it("deploys clean with no r2_buckets key at all when unconfigured", () => {
+    // An unconditional binding would make a bucket a prerequisite for every
+    // Cloudflare deploy, discovered from a `wrangler deploy` failure rather
+    // than from anything the app configured. Uploads fail closed at runtime
+    // with setup guidance instead — see the file-upload registry.
+    const serverDir = makeWorkerDir({});
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    expect(readConfig(serverDir)).not.toHaveProperty("r2_buckets");
+  });
+
+  it("replaces only its own binding and keeps hand-added ones", () => {
+    const serverDir = makeWorkerDir({
+      r2_buckets: [
+        { binding: "UPLOADS", bucket_name: "stale" },
+        { binding: "ARCHIVE", bucket_name: "archive" },
+      ],
+    });
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_R2_BUCKET_NAME: "app-uploads",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    expect(readConfig(serverDir).r2_buckets).toEqual([
+      { binding: "ARCHIVE", bucket_name: "archive" },
+      { binding: "UPLOADS", bucket_name: "app-uploads" },
+    ]);
+  });
+});
+
+describe("Cloudflare module Worker Browser Rendering binding", () => {
+  function makeWorkerDir(config: Record<string, unknown>): string {
+    const serverDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(serverDir, "wrangler.json"),
+      JSON.stringify({ name: "design", main: "index.mjs", ...config }),
+    );
+    fs.writeFileSync(
+      path.join(serverDir, "index.mjs"),
+      'function ki(e){let t=Ei(),n=Di();return{async fetch(n,r,i){globalThis.__env__=r,g(n,{env:r,context:i});return await t.fetch(n)},scheduled(e,t,r){r.waitUntil(n.callHook("scheduled",e))}}',
+    );
+    return serverDir;
+  }
+
+  function readConfig(serverDir: string): Record<string, unknown> {
+    return JSON.parse(
+      fs.readFileSync(path.join(serverDir, "wrangler.json"), "utf8"),
+    );
+  }
+
+  it("emits no binding when the build environment does not ask for one", () => {
+    expect(resolveCloudflareBrowserBinding({})).toBeNull();
+    expect(
+      resolveCloudflareBrowserBinding({ CLOUDFLARE_BROWSER_RENDERING: "" }),
+    ).toBeNull();
+    expect(
+      resolveCloudflareBrowserBinding({ CLOUDFLARE_BROWSER_RENDERING: "0" }),
+    ).toBeNull();
+    expect(
+      resolveCloudflareBrowserBinding({
+        CLOUDFLARE_BROWSER_RENDERING: "false",
+      }),
+    ).toBeNull();
+  });
+
+  it("binds the name the render path actually reads", () => {
+    expect(
+      resolveCloudflareBrowserBinding({ CLOUDFLARE_BROWSER_RENDERING: "1" }),
+    ).toEqual({ binding: CLOUDFLARE_BROWSER_BINDING_NAME });
+    expect(
+      resolveCloudflareBrowserBinding({
+        CLOUDFLARE_BROWSER_RENDERING: " True ",
+      }),
+    ).toEqual({ binding: "BROWSER" });
+  });
+
+  it("throws on a value it cannot read as either answer", () => {
+    // Truthiness would make this "on" and a strict === "1" would make it
+    // "off"; both are a deploy that does not match what its operator wrote.
+    expect(() =>
+      resolveCloudflareBrowserBinding({
+        CLOUDFLARE_BROWSER_RENDERING: "maybe",
+      }),
+    ).toThrow(/CLOUDFLARE_BROWSER_RENDERING="maybe"/);
+  });
+
+  it("writes the binding into the generated Wrangler config", () => {
+    const serverDir = makeWorkerDir({});
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BROWSER_RENDERING: "1",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    expect(readConfig(serverDir)).toMatchObject({
+      browser: { binding: "BROWSER" },
+    });
+  });
+
+  it("deploys clean with no browser key at all when unconfigured", () => {
+    // Browser Rendering is an entitlement rather than a resource, which makes
+    // it MORE of a deploy prerequisite, not less: wrangler rejects a binding
+    // the account cannot have. An unconditional emit would fail the deploy of
+    // every app that never renders anything. Rendering fails closed at
+    // runtime with setup guidance instead.
+    const serverDir = makeWorkerDir({});
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    expect(readConfig(serverDir)).not.toHaveProperty("browser");
+  });
+
+  it("keeps other keys an app hand-added under browser", () => {
+    const serverDir = makeWorkerDir({
+      browser: { binding: "STALE", experimental_remote: true },
+    });
+
+    configureCloudflareModuleWorkerOutput(serverDir, {
+      CLOUDFLARE_BROWSER_RENDERING: "on",
+      CLOUDFLARE_BACKGROUND_QUEUE: "1",
+    });
+
+    expect(readConfig(serverDir).browser).toEqual({
+      binding: "BROWSER",
+      experimental_remote: true,
+    });
+  });
+});
+
+describe("cloudflareUnresolvedNativeStubSource", () => {
+  it("throws on every access instead of answering as an idle capability", async () => {
+    const source = cloudflareUnresolvedNativeStubSource("better-sqlite3");
+    const module = await import(
+      `data:text/javascript,${encodeURIComponent(source)}`
+    );
+
+    expect(() => module.watch()).toThrow(
+      /better-sqlite3 is unavailable in Cloudflare Workers/,
+    );
+    expect(() => new module.default.Database()).toThrow(
+      /better-sqlite3 is unavailable in Cloudflare Workers/,
+    );
+    expect(() => module.default()).toThrow(
+      /better-sqlite3 is unavailable in Cloudflare Workers/,
+    );
+    expect(() => new module.default()).toThrow(
+      /better-sqlite3 is unavailable in Cloudflare Workers/,
+    );
+  });
+
+  it("covers every package the post-build rewrite can generate", () => {
+    for (const mod of CLOUDFLARE_UNRESOLVED_NATIVE_STUBS) {
+      expect(cloudflareUnresolvedNativeStubSource(mod)).toContain(
+        `${mod} is unavailable in Cloudflare Workers`,
+      );
+    }
   });
 });
 
@@ -673,6 +1581,9 @@ export default (event) =>
     expect(source).toContain(
       'const SSR_CACHE_CONTROL = "public, max-age=30, stale-while-revalidate=30, stale-if-error=3600";',
     );
+    expect(source).toContain(
+      'const SSR_NETLIFY_CDN_CACHE_CONTROL = "public, durable, max-age=30, stale-while-revalidate=30, stale-if-error=3600";',
+    );
   });
 
   it("adds immutable cache headers to Cloudflare Pages hashed assets only", async () => {
@@ -854,6 +1765,8 @@ export default (event) =>
     expect(html).toContain('import("/assets/entry.client-abc.js")');
     expect(html).toContain('href="/assets/root.css"');
     expect(html).toContain("streamController.enqueue");
+    expect(html).not.toContain("dev server");
+    expect(html).not.toContain("browser console");
     expect(html).toContain("loaderData");
     expect(html).not.toContain("en-US");
   });
@@ -1310,6 +2223,96 @@ describe("findInstalledFfmpegStaticPackage", () => {
   });
 });
 
+describe("copyInstalledBrowserRuntimePackages", () => {
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    for (const directory of dirs.splice(0)) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("copies Chromium assets and its runtime dependencies from pnpm output", () => {
+    const root = fs.mkdtempSync(
+      path.join(process.cwd(), ".tmp-browser-runtime-test-"),
+    );
+    dirs.push(root);
+    const nodeModules = path.join(root, "node_modules");
+    const chromiumDir = path.join(
+      nodeModules,
+      ".pnpm",
+      "@sparticuz+chromium@149.0.0",
+      "node_modules",
+      "@sparticuz",
+      "chromium",
+    );
+    const chromiumDependenciesDir = path.join(
+      nodeModules,
+      ".pnpm",
+      "@sparticuz+chromium@149.0.0",
+      "node_modules",
+    );
+    const tarFsDir = path.join(chromiumDependenciesDir, "tar-fs");
+    const playwrightCoreDir = path.join(
+      nodeModules,
+      ".pnpm",
+      "playwright-core@1.61.1",
+      "node_modules",
+      "playwright-core",
+    );
+    fs.mkdirSync(path.join(chromiumDir, "bin"), { recursive: true });
+    fs.mkdirSync(path.join(chromiumDir, "build"), { recursive: true });
+    fs.mkdirSync(tarFsDir, { recursive: true });
+    fs.mkdirSync(playwrightCoreDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(chromiumDir, "package.json"),
+      JSON.stringify({
+        name: "@sparticuz/chromium",
+        dependencies: { "tar-fs": "3.1.3" },
+        main: "build/index.js",
+      }),
+    );
+    fs.writeFileSync(path.join(chromiumDir, "bin", "chromium.br"), "binary");
+    fs.writeFileSync(path.join(chromiumDir, "build", "index.js"), "export {};");
+    fs.writeFileSync(
+      path.join(tarFsDir, "package.json"),
+      JSON.stringify({ name: "tar-fs", main: "index.js" }),
+    );
+    fs.writeFileSync(path.join(tarFsDir, "index.js"), "export {};");
+    fs.writeFileSync(
+      path.join(playwrightCoreDir, "package.json"),
+      JSON.stringify({ name: "playwright-core", main: "index.js" }),
+    );
+    fs.writeFileSync(path.join(playwrightCoreDir, "index.js"), "export {};");
+
+    const serverDir = path.join(root, "server");
+    fs.mkdirSync(serverDir, { recursive: true });
+
+    expect(findInstalledPackageRoot("@sparticuz/chromium", [nodeModules])).toBe(
+      chromiumDir,
+    );
+    expect(copyInstalledBrowserRuntimePackages(serverDir, root)).toBe(3);
+    expect(
+      fs.existsSync(
+        path.join(
+          serverDir,
+          "node_modules",
+          "@sparticuz",
+          "chromium",
+          "bin",
+          "chromium.br",
+        ),
+      ),
+    ).toBe(true);
+    expect(fs.existsSync(path.join(serverDir, "node_modules", "tar-fs"))).toBe(
+      true,
+    );
+    expect(
+      fs.existsSync(path.join(serverDir, "node_modules", "playwright-core")),
+    ).toBe(true);
+  });
+});
+
 describe("sanitizeServerlessFunctionPackageManifest", () => {
   const dirs: string[] = [];
 
@@ -1536,8 +2539,7 @@ describe("runNitroBuildPipeline", () => {
       hooks: {
         prepare: async () => {
           calls.push("prepare");
-          routeRuleAtPrepare =
-            nitro.options.routeRules?.["/assets/entry.client-aB12_cdE.js"];
+          routeRuleAtPrepare = nitro.options.routeRules?.["/assets/**"];
         },
         copyPublicAssets: async () => {
           calls.push("copyPublicAssets");
@@ -1595,7 +2597,36 @@ describe("runNitroBuildPipeline", () => {
     ).toBe(true);
   });
 
-  it("adds exact immutable route rules for copied hashed client assets", async () => {
+  it("does not mirror again when the preset already mounted publicDir at the base path", async () => {
+    const { cwd, clientDir } = setupFixture();
+    // Nitro's netlify preset resolves publicDir to `dist{{ baseURL }}`, so the
+    // public dir IS the mount path. Mirroring again wrote a whole second client
+    // build at dist/docs/docs that only the workspace deploy ever deleted.
+    const publicOutputDir = path.join(cwd, "dist", "docs");
+    fs.mkdirSync(publicOutputDir, { recursive: true });
+
+    await runNitroBuildPipeline({
+      nitro: { options: { output: { publicDir: publicOutputDir } } },
+      hooks: {
+        prepare: async () => {},
+        copyPublicAssets: async () => {},
+        nitroBuild: async () => {},
+      },
+      clientDir,
+      publicOutputDir,
+      appBasePath: "/docs",
+      cwd,
+    });
+
+    expect(
+      fs.existsSync(
+        path.join(publicOutputDir, "assets", "entry.client-abc.js"),
+      ),
+    ).toBe(true);
+    expect(fs.existsSync(path.join(publicOutputDir, "docs"))).toBe(false);
+  });
+
+  it("adds one immutable route rule per mount point for copied client assets", async () => {
     const { cwd, clientDir, publicOutputDir } = setupFixture();
     const nitro: any = {
       options: { output: { publicDir: publicOutputDir } },
@@ -1615,29 +2646,73 @@ describe("runNitroBuildPipeline", () => {
     });
 
     expect(
-      nitro.options.routeRules["/assets/entry.client-aB12_cdE.js"].headers[
-        "cache-control"
-      ],
+      nitro.options.routeRules["/assets/**"].headers["cache-control"],
     ).toBe(IMMUTABLE_ASSET_CACHE_CONTROL);
     expect(
-      nitro.options.routeRules["/docs/assets/entry.client-aB12_cdE.js"].headers[
-        "cdn-cache-control"
-      ],
+      nitro.options.routeRules["/docs/assets/**"].headers["cdn-cache-control"],
     ).toBe(IMMUTABLE_ASSET_CACHE_CONTROL);
     expect(
-      nitro.options.routeRules["/docs/assets/entry.client-aB12_cdE.js"].headers[
+      nitro.options.routeRules["/docs/assets/**"].headers[
         "netlify-cdn-cache-control"
       ],
     ).toBe(IMMUTABLE_ASSET_CACHE_CONTROL);
-    expect(nitro.options.routeRules["/assets/logo.png"]).toBeUndefined();
+    // No per-asset rule: Nitro writes one `_headers` line per route rule and
+    // Cloudflare rejects that file past 100 rules.
     expect(
-      nitro.options.routeRules["/assets/entry.client-abc.js"],
+      nitro.options.routeRules["/assets/entry.client-aB12_cdE.js"],
     ).toBeUndefined();
+    expect(Object.keys(nitro.options.routeRules)).toHaveLength(2);
   });
 
-  it("merges immutable headers into existing route rules", () => {
+  it("keeps the immutable rule count fixed as the asset count grows", () => {
+    const { clientDir } = setupFixture();
+    for (let i = 0; i < 500; i++) {
+      fs.writeFileSync(
+        path.join(
+          clientDir,
+          "assets",
+          `chunk-${String(i).padStart(4, "0")}-aB12_cdE.js`,
+        ),
+        "x",
+      );
+    }
+
+    const routeRules: Record<string, { headers?: Record<string, string> }> = {};
+    addImmutableAssetRouteRulesForClientBuild(routeRules, clientDir, "/docs");
+
+    expect(Object.keys(routeRules).sort()).toEqual([
+      "/assets/**",
+      "/docs/assets/**",
+    ]);
+  });
+
+  it("emits no immutable rule when the client build has no assets directory", () => {
+    const { cwd } = setupFixture();
+    const emptyClientDir = path.join(cwd, "build", "no-client");
+    fs.mkdirSync(emptyClientDir, { recursive: true });
+
+    const routeRules: Record<string, { headers?: Record<string, string> }> = {};
+    addImmutableAssetRouteRulesForClientBuild(routeRules, emptyClientDir);
+
+    expect(routeRules).toEqual({});
+  });
+
+  it("reports the non-hashed files the glob now covers", () => {
+    const { clientDir } = setupFixture();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    addImmutableAssetRouteRulesForClientBuild({}, clientDir);
+
+    const message = warn.mock.calls.map(([m]) => String(m)).join("\n");
+    expect(message).toContain("/assets/logo.png");
+    expect(message).toContain("/assets/entry.client-abc.js");
+    expect(message).not.toContain("/assets/entry.client-aB12_cdE.js");
+    warn.mockRestore();
+  });
+
+  it("merges immutable headers into an existing route rule", () => {
     const routeRules: Record<string, { headers?: Record<string, string> }> = {
-      "/assets/entry.client-aB12_cdE.js": {
+      "/assets/**": {
         headers: { "cross-origin-resource-policy": "cross-origin" },
       },
     };
@@ -1645,9 +2720,7 @@ describe("runNitroBuildPipeline", () => {
 
     addImmutableAssetRouteRulesForClientBuild(routeRules, clientDir);
 
-    expect(
-      routeRules["/assets/entry.client-aB12_cdE.js"].headers,
-    ).toMatchObject({
+    expect(routeRules["/assets/**"].headers).toMatchObject({
       "cross-origin-resource-policy": "cross-origin",
       "cache-control": IMMUTABLE_ASSET_CACHE_CONTROL,
       "cdn-cache-control": IMMUTABLE_ASSET_CACHE_CONTROL,
@@ -1685,6 +2758,7 @@ describe("durable-background Netlify function emit (single-template, default-on)
   let previousFlag: string | undefined;
   let previousWorkspaceFlag: string | undefined;
   let previousViteWorkspaceFlag: string | undefined;
+  let previousDisableRecurringJobs: string | undefined;
   let previousAppBasePath: string | undefined;
   let previousViteAppBasePath: string | undefined;
 
@@ -1692,11 +2766,14 @@ describe("durable-background Netlify function emit (single-template, default-on)
     previousFlag = process.env.AGENT_CHAT_DURABLE_BACKGROUND;
     previousWorkspaceFlag = process.env.AGENT_NATIVE_WORKSPACE;
     previousViteWorkspaceFlag = process.env.VITE_AGENT_NATIVE_WORKSPACE;
+    previousDisableRecurringJobs =
+      process.env.AGENT_NATIVE_DISABLE_RECURRING_JOBS;
     previousAppBasePath = process.env.APP_BASE_PATH;
     previousViteAppBasePath = process.env.VITE_APP_BASE_PATH;
     delete process.env.AGENT_CHAT_DURABLE_BACKGROUND;
     delete process.env.AGENT_NATIVE_WORKSPACE;
     delete process.env.VITE_AGENT_NATIVE_WORKSPACE;
+    delete process.env.AGENT_NATIVE_DISABLE_RECURRING_JOBS;
     delete process.env.APP_BASE_PATH;
     delete process.env.VITE_APP_BASE_PATH;
   });
@@ -1709,6 +2786,10 @@ describe("durable-background Netlify function emit (single-template, default-on)
     restoreEnv("AGENT_CHAT_DURABLE_BACKGROUND", previousFlag);
     restoreEnv("AGENT_NATIVE_WORKSPACE", previousWorkspaceFlag);
     restoreEnv("VITE_AGENT_NATIVE_WORKSPACE", previousViteWorkspaceFlag);
+    restoreEnv(
+      "AGENT_NATIVE_DISABLE_RECURRING_JOBS",
+      previousDisableRecurringJobs,
+    );
     restoreEnv("APP_BASE_PATH", previousAppBasePath);
     restoreEnv("VITE_APP_BASE_PATH", previousViteAppBasePath);
     for (const d of dirs.splice(0)) {
@@ -1859,7 +2940,156 @@ describe("durable-background Netlify function emit (single-template, default-on)
     expect(entry).not.toContain("includedFiles");
     expect(entry).toContain("await fetch(url");
     expect(entry).toContain("agent-native-netlify-keep-warm");
+    expect(entry).toContain("return new URL(request.url).origin");
     expect(entry).not.toMatch(/^\s*path:/m);
+  });
+
+  it("emits a durable recurring-job handoff beside the background worker", () => {
+    const cwd = setupNetlifyOutput();
+
+    emitSingleTemplateNetlifyBackgroundFunction(cwd);
+    emitSingleTemplateNetlifyRecurringJobsFunction(cwd);
+
+    const entryPath = path.join(
+      cwd,
+      ".netlify",
+      "functions-internal",
+      NETLIFY_RECURRING_JOBS_FUNCTION_NAME,
+      `${NETLIFY_RECURRING_JOBS_FUNCTION_NAME}.mjs`,
+    );
+    const entry = fs.readFileSync(entryPath, "utf8");
+    expect(entry).toContain('schedule: "* * * * *"');
+    expect(entry).toContain(
+      'const SWEEP_PATH = "/_agent-native/jobs/_process-sweep"',
+    );
+    expect(entry).toContain(
+      'const BACKGROUND_PATH = "/.netlify/functions/server-agent-background"',
+    );
+    expect(entry).toContain('createHmac("sha256", secret)');
+    expect(entry).toContain("__agentNativeProcessorRoute");
+    expect(entry).toContain("A2A_SECRET is required");
+    expect(entry).toContain("return new URL(request.url).origin");
+  });
+
+  describe("keep-warm opt-out and cadence", () => {
+    const KEEP_WARM_ENV_KEYS = [
+      "AGENT_NATIVE_DISABLE_KEEP_WARM",
+      "AGENT_NATIVE_DISABLE_KEEP_WARM_BACKGROUND",
+      "AGENT_NATIVE_KEEP_WARM_SCHEDULE",
+    ] as const;
+    let saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      saved = {};
+      for (const key of KEEP_WARM_ENV_KEYS) {
+        saved[key] = process.env[key];
+        delete process.env[key];
+      }
+    });
+
+    afterEach(() => {
+      for (const key of KEEP_WARM_ENV_KEYS) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+    });
+
+    it("is ON BY DEFAULT, at the historical once-a-minute cadence", () => {
+      expect(isKeepWarmDeployEnabled()).toBe(true);
+      expect(isKeepWarmBackgroundDeployEnabled()).toBe(true);
+      expect(resolveKeepWarmSchedule()).toBe("* * * * *");
+    });
+
+    it("emits nothing when keep-warm is disabled, so the DB can autosuspend", () => {
+      process.env.AGENT_NATIVE_DISABLE_KEEP_WARM = "1";
+      const cwd = setupNetlifyOutput();
+
+      emitSingleTemplateNetlifyKeepWarmFunction(cwd);
+
+      expect(fs.existsSync(keepWarmDir(cwd))).toBe(false);
+    });
+
+    it("honours an overridden cron cadence", () => {
+      process.env.AGENT_NATIVE_KEEP_WARM_SCHEDULE = "*/5 * * * *";
+      const cwd = setupNetlifyOutput();
+
+      emitSingleTemplateNetlifyKeepWarmFunction(cwd);
+
+      const entry = fs.readFileSync(
+        path.join(keepWarmDir(cwd), "agent-native-keep-warm.mjs"),
+        "utf8",
+      );
+      expect(entry).toContain('schedule: "*/5 * * * *"');
+      expect(entry).not.toContain('schedule: "* * * * *"');
+    });
+
+    it("THROWS on an unparseable cadence instead of silently keeping 1/min", () => {
+      // Falling back would leave an operator who set this to stop burning
+      // database quota still burning it, with a green build and no warning.
+      process.env.AGENT_NATIVE_KEEP_WARM_SCHEDULE = "every 5 minutes";
+      expect(() => resolveKeepWarmSchedule()).toThrow(
+        /must be a 5-field cron expression/,
+      );
+
+      const cwd = setupNetlifyOutput();
+      expect(() => emitSingleTemplateNetlifyKeepWarmFunction(cwd)).toThrow(
+        /AGENT_NATIVE_KEEP_WARM_SCHEDULE/,
+      );
+      // And it throws BEFORE wiping/writing the function dir, so a failed build
+      // never leaves a half-emitted artifact behind.
+      expect(fs.existsSync(keepWarmDir(cwd))).toBe(false);
+    });
+
+    it("THROWS on a 5-token value whose fields are not cron fields", () => {
+      // Counting tokens is not parsing them: "not a cron expression here" is
+      // five whitespace-separated words and would otherwise ship to Netlify as
+      // a schedule, which is the same silent-wrong-cadence failure above.
+      for (const bad of [
+        "not a cron expression here",
+        "*/0 * * * *",
+        "60 * * * *",
+        "* * * * 9",
+      ]) {
+        process.env.AGENT_NATIVE_KEEP_WARM_SCHEDULE = bad;
+        expect(() => resolveKeepWarmSchedule()).toThrow(
+          /must be a 5-field cron expression/,
+        );
+      }
+    });
+
+    it("accepts the cron syntax operators an operator would actually reach for", () => {
+      for (const good of [
+        "*/5 * * * *",
+        "0 */6 * * *",
+        "15,45 3 * * 1-5",
+        "0 0 1 JAN *",
+      ]) {
+        process.env.AGENT_NATIVE_KEEP_WARM_SCHEDULE = good;
+        expect(resolveKeepWarmSchedule()).toBe(good);
+      }
+    });
+
+    it("drops the background warm independently of the server warm", () => {
+      // Warming `server` is one health request; warming `-background` is a
+      // fresh container that pays the whole schema-probe fan-out.
+      process.env.AGENT_CHAT_DURABLE_BACKGROUND = "true";
+      process.env.AGENT_NATIVE_DISABLE_KEEP_WARM_BACKGROUND = "1";
+      try {
+        const cwd = setupNetlifyOutput();
+        emitSingleTemplateNetlifyBackgroundFunction(cwd);
+        emitSingleTemplateNetlifyKeepWarmFunction(cwd);
+
+        const entry = fs.readFileSync(
+          path.join(keepWarmDir(cwd), "agent-native-keep-warm.mjs"),
+          "utf8",
+        );
+        expect(entry).toContain("const BACKGROUND_WARM_PATH = null");
+        // The server warm is untouched.
+        expect(entry).toContain('const HEALTH_PATH = "/_agent-native/health"');
+      } finally {
+        delete process.env.AGENT_CHAT_DURABLE_BACKGROUND;
+      }
+    });
   });
 
   it("does not emit a keep-warm function without Nitro's server bundle", () => {
@@ -1974,6 +3204,26 @@ describe("durable-background Netlify function emit (single-template, default-on)
     expect(entry).toContain("wrapper failed before reaching the route");
   });
 
+  it("hard-links the handler bundle instead of writing a second copy of it", () => {
+    const cwd = setupNetlifyOutput();
+
+    emitSingleTemplateNetlifyBackgroundFunction(cwd);
+
+    const source = path.join(
+      cwd,
+      ".netlify",
+      "functions-internal",
+      "server",
+      "_libs",
+      "yjs.mjs",
+    );
+    const clone = path.join(backgroundDir(cwd), "_libs", "yjs.mjs");
+    // Same inode: the extra function costs its entry file, not another whole
+    // server bundle. Netlify still zips each function separately, so this is
+    // invisible to the deploy — a hard link IS a regular file to every reader.
+    expect(fs.statSync(clone).ino).toBe(fs.statSync(source).ino);
+  });
+
   it("does NOT touch the server /* catch-all (no excludedPath patch — default url is never shadowed)", () => {
     const cwd = setupNetlifyOutput();
 
@@ -2009,6 +3259,7 @@ describe("durable-background Netlify function emit (single-template, default-on)
     dirs.push(cwd);
     // No .netlify/functions-internal/server/main.mjs present.
     process.env.AGENT_CHAT_DURABLE_BACKGROUND = "false";
+    process.env.AGENT_NATIVE_DISABLE_RECURRING_JOBS = "true";
 
     expect(() =>
       emitSingleTemplateNetlifyBackgroundFunction(cwd),

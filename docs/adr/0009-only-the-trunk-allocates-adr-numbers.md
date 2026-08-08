@@ -13,28 +13,31 @@ forever, to avoid a renumber done once.
 
 ## Consequences
 
-These files move from `sonhyrd/agent-native` to the trunk and take new numbers:
+`sonhyrd/agent-native` holds four ADRs in total, and all four moved here. Two of
+them are reachable only from that repository's unmerged branch
+`cloudflare-workers-support`, which is why an inventory taken against its `main`
+finds two:
 
-| in `sonhyrd/agent-native` | here | state |
-| --- | --- | --- |
-| `0002-local-workers-runtime-counts-as-hosted` | `0003` | reserved, moves with its code |
-| `0003-cloudflare-queues-for-durable-background-runs` | `0004` | reserved, moves with its code |
-| `0004-one-cold-isolate-init-mechanism` | `0005` | moved |
-| `0005-cloudflare-lane-upstreams-vault-lane-does-not` | `0006` | moved |
-| `0006-app-repos-own-their-template-source` | `0007` | moved |
-| `0007-fork-versions-are-upstream-versions-plus-a-prerelease-tag` | `0008` | moved |
-| `0008-only-the-trunk-allocates-adr-numbers` | `0009` | moved |
+| in `sonhyrd/agent-native`                            | here   | landed in |
+| ---------------------------------------------------- | ------ | --------- |
+| `0002-local-workers-runtime-counts-as-hosted`        | `0003` | R1        |
+| `0003-cloudflare-queues-for-durable-background-runs` | `0004` | R3        |
+| `0004-host-adapters-live-in-tree-behind-registries`  | `0010` | close-out |
+| `0005-the-host-owns-fallback-storage-policy`         | `0011` | close-out |
 
-`0003` and `0004` are held empty on purpose. They belong to the two Cloudflare
-ADRs that move in Phase 1 alongside the code they describe; allocating them to
-anything else would reintroduce the collision this ADR exists to stop.
+Numbers were taken in the order the documents landed. `0010` and `0011` were not
+`0005` and `0006` — the numbers this table once projected for them — because
+five ADRs written here during the fork-combine grilling took `0005`–`0009`
+first. That is the rule working, not a mistake: a projected number is a reserved
+number, and this repository does not reserve.
 
-Three in-document cross-references shift with them: the queues ADR cites
-ADR 0002 (becomes 0003), and ADRs 0006 and 0007 cite each other.
+Cross-references shift with each move: the queues ADR cited `0002` (now `0003`),
+ADRs `0006` and `0007` cite each other, and `0010` and `0011` cite each other.
 
-Source files stop citing ADR paths entirely. `agent/durable-background.ts`,
-`agent/durable-background.spec.ts` and `agent/background-queue.ts` each carry a
-`See docs/adr/…` comment; every one of them is a file ADR 0006 sends Upstream,
-where `docs/adr/` does not exist, so the citation would dangle in a public PR.
-Each is replaced by the one-sentence constraint it pointed at — which is what a
-comment is for.
+Source files stop citing ADR paths entirely. Every file carrying a
+`See docs/adr/…` comment in `sonhyrd/agent-native` —
+`agent/durable-background.ts`, `agent/durable-background.spec.ts`,
+`agent/background-queue.ts` and `hosts/cloudflare/background-transport.ts` — is
+a file ADR 0006 sends Upstream, where `docs/adr/` does not exist, so the
+citation would dangle in a public PR. Each was replaced by the one-sentence
+constraint it pointed at, as the code moved, which is what a comment is for.

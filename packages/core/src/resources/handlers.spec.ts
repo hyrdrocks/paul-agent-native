@@ -810,6 +810,83 @@ describe("resource handlers", () => {
     });
   });
 
+  describe("binary resources that hold a storage handle", () => {
+    it("returns the handle on a JSON read instead of blanking it", async () => {
+      // Blanking is right for an inline base64 body — it can be megabytes. A
+      // handle is the opposite: short, and the only thing that shows the
+      // payload is NOT in this row.
+      mockResourceGet.mockResolvedValue({
+        id: "img",
+        path: "/photo.png",
+        owner: "test@test.com",
+        mimeType: "image/png",
+        content: "https://objects.example.test/uploads/abc.png",
+      });
+
+      const result = await handleGetResource({ _params: { id: "img" } });
+
+      expect(result).toMatchObject({
+        content: "https://objects.example.test/uploads/abc.png",
+      });
+    });
+
+    it("still blanks an inline body on a JSON read", async () => {
+      mockResourceGet.mockResolvedValue({
+        id: "img",
+        path: "/photo.png",
+        owner: "test@test.com",
+        mimeType: "image/png",
+        content: "iVBORw0KGgoAAAANSUhEUg",
+      });
+
+      expect(await handleGetResource({ _params: { id: "img" } })).toMatchObject(
+        { content: "" },
+      );
+    });
+
+    it("does not redirect a text resource whose body happens to be a url", async () => {
+      // A url-shaped body is still a body. Redirecting would serve someone
+      // else's page in place of the file the caller asked for.
+      mockResourceGet.mockResolvedValue({
+        id: "link",
+        path: "/link.txt",
+        owner: "test@test.com",
+        mimeType: "text/plain",
+        content: "https://example.test/page",
+      });
+
+      const result = await handleGetResource({
+        _params: { id: "link" },
+        _query: { raw: "" },
+      });
+
+      expect(lastStatus).not.toBe(302);
+      expect(result).toBeInstanceOf(Response);
+    });
+
+    it("redirects a raw read to the object rather than base64-decoding a url", async () => {
+      // Decoding a URL as base64 returns bytes that are not the file, served
+      // under the file's own content type — a corrupt image that looks served.
+      mockResourceGet.mockResolvedValue({
+        id: "img",
+        path: "/photo.png",
+        owner: "test@test.com",
+        mimeType: "image/png",
+        content: "https://objects.example.test/uploads/abc.png",
+      });
+
+      const { setResponseHeader } = await import("h3");
+      await handleGetResource({ _params: { id: "img" }, _query: { raw: "" } });
+
+      expect(lastStatus).toBe(302);
+      expect(setResponseHeader).toHaveBeenCalledWith(
+        expect.anything(),
+        "Location",
+        "https://objects.example.test/uploads/abc.png",
+      );
+    });
+  });
+
   describe("handleUploadResource", () => {
     it("stores text uploads in SQL", async () => {
       const resource = {
@@ -900,6 +977,73 @@ describe("resource handlers", () => {
         url: "https://cdn.example.test/photo.png",
         provider: "test",
       });
+    });
+
+    it("reads the path field as text, not as a Uint8Array's byte list", async () => {
+      // On a Worker the multipart parser yields a plain Uint8Array, whose
+      // toString() is "47,101,..." — so the path was stored as a comma-joined
+      // byte list and every later read of it missed. Node's Buffer hid it.
+      mockUploadFile.mockResolvedValue({
+        url: "https://cdn.example.test/photo.png",
+        provider: "test",
+      });
+      mockResourcePut.mockResolvedValue({ id: "img" });
+
+      await handleUploadResource({
+        _multipart: [
+          {
+            name: "file",
+            filename: "photo.png",
+            type: "image/png",
+            data: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+          },
+          {
+            name: "path",
+            data: new Uint8Array(
+              new TextEncoder().encode("/uploads/photo.png"),
+            ),
+          },
+        ],
+      });
+
+      expect(mockResourcePut).toHaveBeenCalledWith(
+        "test@test.com",
+        "/uploads/photo.png",
+        "https://cdn.example.test/photo.png",
+        "image/png",
+      );
+    });
+
+    it("reads the shared flag as text, not as a Uint8Array's byte list", async () => {
+      mockUploadFile.mockResolvedValue({
+        url: "https://cdn.example.test/photo.png",
+        provider: "test",
+      });
+      mockResourcePut.mockResolvedValue({ id: "img" });
+
+      await handleUploadResource({
+        _multipart: [
+          {
+            name: "file",
+            filename: "photo.png",
+            type: "image/png",
+            data: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+          },
+          {
+            name: "shared",
+            data: new Uint8Array(new TextEncoder().encode("true")),
+          },
+        ],
+      });
+
+      // "true" as a byte list is "116,114,117,101", which never equals "true",
+      // so a shared upload silently became a personal one.
+      expect(mockResourcePut).toHaveBeenCalledWith(
+        expect.not.stringMatching(/^test@test\.com$/),
+        "/photo.png",
+        "https://cdn.example.test/photo.png",
+        "image/png",
+      );
     });
 
     it("rejects unauthenticated shared uploads", async () => {

@@ -59,7 +59,7 @@
     "vitest": "^4.1.5"
   },
   "peerDependencies": {
-    "@agent-native/core": ">=0.134.0-paul.0",
+    "@agent-native/core": ">=0.145.3-paul.0",
     "react": ">=18"
   },
   "peerDependenciesMeta": {

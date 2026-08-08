@@ -32,14 +32,20 @@ export type DrizzleDb = Awaited<ReturnType<typeof createDb>>;
 
 export { createGetDb } from "./create-get-db.js";
 export {
+  deferMigration,
+  MIGRATION_DEFERRED,
   runMigrations,
   type MigrationEntry,
+  type MigrationRunResult,
   type MigrationSql,
 } from "./migrations.js";
 export {
   getDbExec,
   createDbExec,
+  getDatabaseUrl,
   getDialect,
+  getDialectLabel,
+  supportsInteractiveTransactions,
   isLocalDatabase,
   isPostgres,
   intType,
@@ -51,6 +57,13 @@ export {
   type Dialect,
 } from "./client.js";
 export { table, text, integer, now } from "./schema.js";
+export {
+  runCompareAndSwap,
+  type CompareAndSwapOptions,
+  type CompareAndSwapPlan,
+  type CompareAndSwapResult,
+} from "./atomic-compare-and-swap.js";
+export { runAtomicWrites } from "./atomic-writes.js";
 export {
   ensureAdditiveColumns,
   type EnsureAdditiveColumnsOptions,
