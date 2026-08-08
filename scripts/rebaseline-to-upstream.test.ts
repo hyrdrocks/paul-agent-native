@@ -10,7 +10,9 @@ import {
   decideRebaseline,
   parseRebaselineArgs,
   parseWorkspaceGlobs,
+  planBaseline,
   planRebaseline,
+  rewriteBaselineVersion,
   rewriteVersion,
   workspaceManifests,
 } from "./rebaseline-to-upstream";
@@ -178,6 +180,7 @@ describe("rewriteVersion", () => {
 function forkFixture(
   manifests: Record<string, Record<string, unknown>>,
   files: string[] = [],
+  initialVersions?: Record<string, string>,
 ): string {
   const root = mkdtempSync(path.join(tmpdir(), "rebaseline-"));
   for (const [dir, manifest] of Object.entries(manifests)) {
@@ -190,6 +193,22 @@ function forkFixture(
   for (const file of files) {
     mkdirSync(path.join(root, path.dirname(file)), { recursive: true });
     writeFileSync(path.join(root, file), "");
+  }
+  if (initialVersions !== undefined) {
+    mkdirSync(path.join(root, ".changeset"), { recursive: true });
+    writeFileSync(
+      path.join(root, ".changeset/pre.json"),
+      `${JSON.stringify(
+        {
+          mode: "pre",
+          tag: "paul",
+          initialVersions,
+          changesets: ["lucky-donkeys-attack"],
+        },
+        null,
+        2,
+      )}\n`,
+    );
   }
   return root;
 }
@@ -262,7 +281,7 @@ describe("planRebaseline", () => {
     );
 
     assert.deepEqual(
-      plan.map((entry) => [entry.name, entry.decision.action]),
+      plan.members.map((entry) => [entry.name, entry.decision.action]),
       [
         ["@agent-native/core", "rebaseline"],
         ["@agent-native/docs", "no-version"],
@@ -307,6 +326,324 @@ describe("planRebaseline", () => {
     assert.equal(
       readFileSync(path.join(root, "packages/frame/package.json"), "utf8"),
       before,
+    );
+  });
+
+  it("reports no baseline when the workspace is not in pre mode", () => {
+    const root = forkFixture({
+      "packages/core": {
+        name: "@agent-native/core",
+        version: "0.134.0-paul.2",
+      },
+    });
+
+    const plan = planRebaseline(
+      root,
+      workspaceManifests(root, ["packages/*"]),
+      readUpstream,
+    );
+
+    assert.equal(plan.baseline, null);
+  });
+});
+
+describe("planBaseline", () => {
+  // The baseline records the version each manifest ends the pass on, which for a
+  // re-baselined package is Upstream's number and for every other action is the
+  // number the manifest keeps. Anything else produces the disagreement this
+  // whole pass exists to remove.
+  const members = [
+    {
+      name: "@agent-native/core",
+      file: "packages/core/package.json",
+      decision: {
+        action: "rebaseline" as const,
+        from: "0.134.0-paul.2",
+        to: "0.145.2",
+        sameTuple: false,
+      },
+    },
+    {
+      name: "@agent-native/frame",
+      file: "packages/frame/package.json",
+      decision: {
+        action: "ahead" as const,
+        forkVersion: "0.1.155-paul.0",
+        upstreamVersion: "0.1.154",
+      },
+    },
+    {
+      name: "@agent-native/local",
+      file: "packages/local/package.json",
+      decision: { action: "fork-only" as const, forkVersion: "0.1.0" },
+    },
+    {
+      name: "@agent-native/toolkit",
+      file: "packages/toolkit/package.json",
+      decision: { action: "unchanged" as const, version: "0.13.3" },
+    },
+    {
+      name: "@agent-native/docs",
+      file: "packages/docs/package.json",
+      decision: { action: "no-version" as const, upstreamVersion: "0.0.1" },
+    },
+  ];
+
+  it("records the version each member ends the pass on", () => {
+    assert.deepEqual(
+      planBaseline(members, {
+        "@agent-native/core": "0.133.3",
+        "@agent-native/frame": "0.1.154",
+        "@agent-native/local": "0.1.0",
+        "@agent-native/toolkit": "0.13.3",
+      }),
+      [
+        {
+          name: "@agent-native/core",
+          decision: { action: "rewrite", from: "0.133.3", to: "0.145.2" },
+        },
+        {
+          name: "@agent-native/frame",
+          decision: {
+            action: "rewrite",
+            from: "0.1.154",
+            to: "0.1.155-paul.0",
+          },
+        },
+        {
+          name: "@agent-native/local",
+          decision: { action: "current", version: "0.1.0" },
+        },
+        {
+          name: "@agent-native/toolkit",
+          decision: { action: "current", version: "0.13.3" },
+        },
+      ],
+    );
+  });
+
+  it("reports a member the baseline has never heard of, rather than dropping it", () => {
+    const plan = planBaseline(members, { "@agent-native/core": "0.133.3" });
+
+    assert.deepEqual(
+      plan.find((entry) => entry.name === "@agent-native/toolkit"),
+      {
+        name: "@agent-native/toolkit",
+        decision: { action: "absent", memberVersion: "0.13.3" },
+      },
+    );
+  });
+
+  it("reports a baseline entry no workspace member answers to, rather than dropping it", () => {
+    const plan = planBaseline(members, {
+      "@agent-native/core": "0.133.3",
+      "@agent-native/retired": "0.9.0",
+    });
+
+    assert.deepEqual(
+      plan.find((entry) => entry.name === "@agent-native/retired"),
+      {
+        name: "@agent-native/retired",
+        decision: { action: "orphan", baselineVersion: "0.9.0" },
+      },
+    );
+  });
+
+  it("counts a versionless member as absent from the workspace, not as a member to record", () => {
+    const plan = planBaseline(members, { "@agent-native/docs": "0.0.1" });
+
+    assert.deepEqual(
+      plan.find((entry) => entry.name === "@agent-native/docs"),
+      {
+        name: "@agent-native/docs",
+        decision: { action: "orphan", baselineVersion: "0.0.1" },
+      },
+    );
+  });
+});
+
+describe("rewriteBaselineVersion", () => {
+  const before = [
+    "{",
+    '  "mode": "pre",',
+    '  "initialVersions": {',
+    '    "@agent-native/core": "0.133.3",',
+    '    "@agent-native/dispatch": "0.133.3"',
+    "  }",
+    "}",
+    "",
+  ].join("\n");
+
+  it("replaces one entry and touches nothing else", () => {
+    assert.equal(
+      rewriteBaselineVersion(
+        before,
+        "@agent-native/core",
+        "0.133.3",
+        "0.145.2",
+      ),
+      before.replace(
+        '"@agent-native/core": "0.133.3"',
+        '"@agent-native/core": "0.145.2"',
+      ),
+    );
+  });
+
+  it("throws rather than no-op when the entry is absent", () => {
+    assert.throws(
+      () =>
+        rewriteBaselineVersion(before, "@agent-native/gone", "1.0.0", "2.0.0"),
+      /not found/,
+    );
+  });
+
+  it("throws rather than pick one when the entry appears twice", () => {
+    assert.throws(
+      () =>
+        rewriteBaselineVersion(
+          `${before}${before}`,
+          "@agent-native/core",
+          "0.133.3",
+          "0.145.2",
+        ),
+      /twice/,
+    );
+  });
+});
+
+describe("the pre-mode baseline and the manifests move together", () => {
+  const upstream: Record<string, string> = {
+    "packages/core/package.json": "0.145.2",
+    "packages/frame/package.json": "0.1.154",
+  };
+  const readUpstream = (file: string) => upstream[file] ?? null;
+
+  const manifests = {
+    "packages/core": {
+      name: "@agent-native/core",
+      version: "0.134.0-paul.2",
+    },
+    "packages/frame": {
+      name: "@agent-native/frame",
+      version: "0.1.155-paul.0",
+    },
+  };
+
+  it("leaves the baseline file untouched until apply runs", () => {
+    const root = forkFixture(manifests, [], {
+      "@agent-native/core": "0.133.3",
+      "@agent-native/frame": "0.1.154",
+    });
+    const before = readFileSync(path.join(root, ".changeset/pre.json"), "utf8");
+
+    planRebaseline(
+      root,
+      workspaceManifests(root, ["packages/*"]),
+      readUpstream,
+    );
+
+    assert.equal(
+      readFileSync(path.join(root, ".changeset/pre.json"), "utf8"),
+      before,
+    );
+  });
+
+  it("applies the baseline and the manifests in one pass, and agrees with itself", () => {
+    const root = forkFixture(manifests, [], {
+      "@agent-native/core": "0.133.3",
+      "@agent-native/frame": "0.1.154",
+    });
+
+    applyRebaseline(
+      root,
+      planRebaseline(
+        root,
+        workspaceManifests(root, ["packages/*"]),
+        readUpstream,
+      ),
+    );
+
+    const pre = JSON.parse(
+      readFileSync(path.join(root, ".changeset/pre.json"), "utf8"),
+    );
+    for (const dir of ["packages/core", "packages/frame"]) {
+      const manifest = JSON.parse(
+        readFileSync(path.join(root, dir, "package.json"), "utf8"),
+      );
+      assert.equal(pre.initialVersions[manifest.name], manifest.version);
+    }
+    assert.equal(pre.initialVersions["@agent-native/core"], "0.145.2");
+  });
+
+  it("keeps the rest of the baseline file byte-identical", () => {
+    const root = forkFixture(manifests, [], {
+      "@agent-native/core": "0.133.3",
+      "@agent-native/frame": "0.1.155-paul.0",
+    });
+    const before = readFileSync(path.join(root, ".changeset/pre.json"), "utf8");
+
+    applyRebaseline(
+      root,
+      planRebaseline(
+        root,
+        workspaceManifests(root, ["packages/*"]),
+        readUpstream,
+      ),
+    );
+
+    assert.equal(
+      readFileSync(path.join(root, ".changeset/pre.json"), "utf8"),
+      before.replace(
+        '"@agent-native/core": "0.133.3"',
+        '"@agent-native/core": "0.145.2"',
+      ),
+    );
+  });
+
+  it("writes nothing at all when one manifest rewrite cannot be made", () => {
+    const root = forkFixture(manifests, [], {
+      "@agent-native/core": "0.133.3",
+      "@agent-native/frame": "0.1.154",
+    });
+    const plan = planRebaseline(
+      root,
+      workspaceManifests(root, ["packages/*"]),
+      readUpstream,
+    );
+    // The manifest moved under the plan, so its recorded `from` is no longer in
+    // the file. A half-applied pass is the tree this ticket exists to prevent.
+    writeFileSync(
+      path.join(root, "packages/core/package.json"),
+      '{\n  "name": "@agent-native/core",\n  "version": "9.9.9"\n}\n',
+    );
+    const baselineBefore = readFileSync(
+      path.join(root, ".changeset/pre.json"),
+      "utf8",
+    );
+
+    assert.throws(() => applyRebaseline(root, plan), /not found/);
+
+    assert.equal(
+      readFileSync(path.join(root, ".changeset/pre.json"), "utf8"),
+      baselineBefore,
+    );
+  });
+
+  it("creates no baseline file when the workspace is not in pre mode", () => {
+    const root = forkFixture(manifests);
+
+    applyRebaseline(
+      root,
+      planRebaseline(
+        root,
+        workspaceManifests(root, ["packages/*"]),
+        readUpstream,
+      ),
+    );
+
+    assert.throws(
+      () => readFileSync(path.join(root, ".changeset/pre.json"), "utf8"),
+      /ENOENT/,
     );
   });
 });
