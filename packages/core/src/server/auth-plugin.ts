@@ -4,6 +4,7 @@ import {
   getAuthMountFailure,
 } from "./auth.js";
 import type { AuthOptions } from "./auth.js";
+import { runBetterAuthMigrations } from "./better-auth-migrations.js";
 import {
   getH3App,
   awaitBootstrap,
@@ -25,6 +26,10 @@ export function createAuthPlugin(options?: AuthOptions): NitroPluginDef {
     // was not reachable yet on a cold instance.
     const mount = async () => {
       await awaitBootstrap(nitroApp);
+      // guard:allow-boot-data-work — local/long-lived runtimes provision auth
+      // before mounting routes; production functions are rejected by the
+      // migration runner and use the release job instead.
+      await runBetterAuthMigrations(nitroApp);
       const app = getH3App(nitroApp);
       await autoMountAuth(app, options);
       const failure = getAuthMountFailure(app);

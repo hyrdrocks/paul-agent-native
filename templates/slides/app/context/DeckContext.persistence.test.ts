@@ -16,6 +16,7 @@ vi.mock("@agent-native/core/client/org", () => ({
 
 import {
   DeckProvider,
+  _resetDeckSaveStateForTests,
   hasUncommittedDeckChanges,
   mergeServerAddedSlides,
   useDecks,
@@ -216,6 +217,7 @@ function deletedDeck(
 describe("DeckContext deck creation persistence", () => {
   beforeEach(() => {
     _resetSyncTransportRegistryForTests();
+    _resetDeckSaveStateForTests();
     orgQueryState.data = undefined;
     orgQueryState.isLoading = false;
     vi.stubGlobal("EventSource", MockEventSource);
@@ -226,6 +228,7 @@ describe("DeckContext deck creation persistence", () => {
   afterEach(() => {
     cleanup();
     _resetSyncTransportRegistryForTests();
+    _resetDeckSaveStateForTests();
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
