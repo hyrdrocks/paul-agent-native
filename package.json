@@ -69,6 +69,8 @@
     "test:content-product-docs": "tsx --test scripts/validate-content-product-docs.test.ts",
     "pack:workspace-packages": "node scripts/pack-workspace-packages.ts",
     "test:pack-workspace-packages": "tsx --test scripts/pack-workspace-packages.test.ts",
+    "rebaseline:upstream": "node scripts/rebaseline-to-upstream.ts",
+    "test:rebaseline-to-upstream": "tsx --test scripts/rebaseline-to-upstream.test.ts",
     "test:guard-no-host-literals": "node --test scripts/guard-no-host-literals.test.mjs",
     "content-product-impact": "tsx scripts/validate-content-product-impact.ts",
     "test:content-product-impact": "tsx --test scripts/validate-content-product-impact.test.ts scripts/validate-content-product-impact-workflow.test.ts",
