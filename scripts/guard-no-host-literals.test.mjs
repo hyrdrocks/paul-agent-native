@@ -144,7 +144,11 @@ describe("host literal guard — end to end against a real diff", () => {
       {
         cwd: dir,
         encoding: "utf8",
-        env: { ...process.env, GUARD_DIFF_BASE: "" },
+        // Both diff-base variables have to be scrubbed, not just the explicit
+        // one: on a PR, Actions sets GITHUB_BASE_REF ambiently, and the guard
+        // would resolve it to `origin/main`, which this fixture has no remote
+        // for. The fixture must resolve its own base from its own history.
+        env: { ...process.env, GUARD_DIFF_BASE: "", GITHUB_BASE_REF: "" },
       },
     );
   }
