@@ -201,7 +201,7 @@ if (result) {
 
 `uploadFile()` devuelve `null` en exactamente una condición: no hay proveedor configurado y el host permite un respaldo. Las otras dos condiciones son lanzamientos tipados, así que nunca pueden confundirse con un archivo almacenado:
 
-| Lanzado | Significa | Reparación |
-| --- | --- | --- |
-| `FileUploadStorageNotConfiguredError` | No hay almacén, y este host rechaza un respaldo. | Lee `.setup`. |
-| `FileUploadProviderUnreadableError` | No se pudo leer si hay un almacén configurado. | Arregla el almacén de credenciales; no es un error de configuración. |
+| Lanzado                               | Significa                                        | Reparación                                                           |
+| ------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------- |
+| `FileUploadStorageNotConfiguredError` | No hay almacén, y este host rechaza un respaldo. | Lee `.setup`.                                                        |
+| `FileUploadProviderUnreadableError`   | No se pudo leer si hay un almacén configurado.   | Arregla el almacén de credenciales; no es un error de configuración. |

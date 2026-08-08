@@ -102,7 +102,7 @@ a "did the adapter register?" leg — see the last consequence below.
 
 ADR 0010 says host knowledge lives in `hosts/`. Read alone, it argues for
 putting this answer in the Cloudflare adapter next to the R2 provider, which is
-exactly wrong here. This is the one host fact that must be readable *without*
+exactly wrong here. This is the one host fact that must be readable _without_
 the adapter, because its failure mode is the adapter being absent. A future
 reader will assume the provider knows whether its host permits a fallback and be
 wrong; the record has to sit where they will look, under its own number, rather
@@ -125,7 +125,7 @@ than as a caveat inside the record that points the other way.
 - **Adding a fallback-less host is one policy plus a constants module for its
   guidance.** The record wanted this to be two lines in `runtime.ts`,
   deliberately not a registration, because a registration is exactly the thing
-  that can fail to happen. As landed it *is* a registration, so a new host has
+  that can fail to happen. As landed it _is_ a registration, so a new host has
   to prove its registration is reachable by value — see the section above.
 - **The policy must never grow a "did the adapter register?" leg.** That is the
   same inference in a new costume, and it re-creates the silent SQL write this

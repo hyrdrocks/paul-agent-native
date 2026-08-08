@@ -31,7 +31,7 @@ tracker; substitute `hyrdrocks/paul-agent-native` for fork-combine and Cloudflar
 Do **not** infer the repo from `git remote -v` here — that is the trap this file exists to close.
 
 Reads take `--json`. A plain `gh issue view` currently returns a Projects-classic GraphQL
-deprecation error *instead of* the body, and exits in a way that reads like an empty ticket;
+deprecation error _instead of_ the body, and exits in a way that reads like an empty ticket;
 `docs/agents/delegate-profile.md` records the measurement and the `gh api` workaround for the
 PR-side equivalent.
 

@@ -201,7 +201,7 @@ if (result) {
 
 `uploadFile()` devolve `null` para exatamente uma condição — nenhum provedor configurado e o host permite um substituto. As outras duas condições são lançamentos tipados, então nunca podem ser confundidas com um arquivo armazenado:
 
-| Lançado | Significa | Reparo |
-| --- | --- | --- |
-| `FileUploadStorageNotConfiguredError` | Sem armazenamento, e este host recusa um substituto. | Leia `.setup`. |
-| `FileUploadProviderUnreadableError` | Não foi possível ler se há armazenamento configurado. | Conserte o armazenamento de credenciais; não é um erro de configuração. |
+| Lançado                               | Significa                                             | Reparo                                                                  |
+| ------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------- |
+| `FileUploadStorageNotConfiguredError` | Sem armazenamento, e este host recusa um substituto.  | Leia `.setup`.                                                          |
+| `FileUploadProviderUnreadableError`   | Não foi possível ler se há armazenamento configurado. | Conserte o armazenamento de credenciais; não é um erro de configuração. |

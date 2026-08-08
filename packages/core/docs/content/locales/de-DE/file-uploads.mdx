@@ -201,7 +201,7 @@ if (result) {
 
 `uploadFile()` gibt `null` für genau eine Bedingung zurück — kein Anbieter konfiguriert und der Host erlaubt einen Fallback. Die beiden anderen Bedingungen sind typisierte Throws und können daher nie mit einer gespeicherten Datei verwechselt werden:
 
-| Geworfen | Bedeutet | Behebung |
-| --- | --- | --- |
-| `FileUploadStorageNotConfiguredError` | Kein Speicher, und dieser Host lehnt einen Fallback ab. | `.setup` lesen. |
-| `FileUploadProviderUnreadableError` | Ob ein Speicher konfiguriert ist, konnte nicht gelesen werden. | Credential-Store reparieren; das ist kein Konfigurationsfehler. |
+| Geworfen                              | Bedeutet                                                       | Behebung                                                        |
+| ------------------------------------- | -------------------------------------------------------------- | --------------------------------------------------------------- |
+| `FileUploadStorageNotConfiguredError` | Kein Speicher, und dieser Host lehnt einen Fallback ab.        | `.setup` lesen.                                                 |
+| `FileUploadProviderUnreadableError`   | Ob ein Speicher konfiguriert ist, konnte nicht gelesen werden. | Credential-Store reparieren; das ist kein Konfigurationsfehler. |

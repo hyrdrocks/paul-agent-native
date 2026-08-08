@@ -18,12 +18,12 @@ them are reachable only from that repository's unmerged branch
 `cloudflare-workers-support`, which is why an inventory taken against its `main`
 finds two:
 
-| in `sonhyrd/agent-native` | here | landed in |
-| --- | --- | --- |
-| `0002-local-workers-runtime-counts-as-hosted` | `0003` | R1 |
-| `0003-cloudflare-queues-for-durable-background-runs` | `0004` | R3 |
-| `0004-host-adapters-live-in-tree-behind-registries` | `0010` | close-out |
-| `0005-the-host-owns-fallback-storage-policy` | `0011` | close-out |
+| in `sonhyrd/agent-native`                            | here   | landed in |
+| ---------------------------------------------------- | ------ | --------- |
+| `0002-local-workers-runtime-counts-as-hosted`        | `0003` | R1        |
+| `0003-cloudflare-queues-for-durable-background-runs` | `0004` | R3        |
+| `0004-host-adapters-live-in-tree-behind-registries`  | `0010` | close-out |
+| `0005-the-host-owns-fallback-storage-policy`         | `0011` | close-out |
 
 Numbers were taken in the order the documents landed. `0010` and `0011` were not
 `0005` and `0006` — the numbers this table once projected for them — because

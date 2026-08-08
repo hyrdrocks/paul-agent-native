@@ -16,13 +16,13 @@ Entering pre mode did this to five packages at once — `dispatch`,
 `creative-context`, `frame`, `pinpoint` and `scheduling` — and all five are
 renumbered here to the version their own changesets earn against the baseline:
 
-| package | baseline | earns | was | is |
-| --- | --- | --- | --- | --- |
-| `@agent-native/dispatch` | `0.16.6` | minor | `1.0.0-paul.0` | `0.17.0-paul.0` |
-| `@agent-native/creative-context` | `0.5.8` | patch (dependencies) | `1.0.0-paul.0` | `0.5.9-paul.0` |
-| `@agent-native/frame` | `0.1.154` | patch (dependencies) | `1.0.0-paul.0` | `0.1.155-paul.0` |
-| `@agent-native/pinpoint` | `0.1.18` | patch (dependencies) | `1.0.0-paul.0` | `0.1.19-paul.0` |
-| `@agent-native/scheduling` | `0.1.34` | patch (dependencies) | `1.0.0-paul.0` | `0.1.35-paul.0` |
+| package                          | baseline  | earns                | was            | is               |
+| -------------------------------- | --------- | -------------------- | -------------- | ---------------- |
+| `@agent-native/dispatch`         | `0.16.6`  | minor                | `1.0.0-paul.0` | `0.17.0-paul.0`  |
+| `@agent-native/creative-context` | `0.5.8`   | patch (dependencies) | `1.0.0-paul.0` | `0.5.9-paul.0`   |
+| `@agent-native/frame`            | `0.1.154` | patch (dependencies) | `1.0.0-paul.0` | `0.1.155-paul.0` |
+| `@agent-native/pinpoint`         | `0.1.18`  | patch (dependencies) | `1.0.0-paul.0` | `0.1.19-paul.0`  |
+| `@agent-native/scheduling`       | `0.1.34`  | patch (dependencies) | `1.0.0-paul.0` | `0.1.35-paul.0`  |
 
 The baselines are Upstream's, not the Fork's: the Fork branches from Upstream at
 `dcc028cb7` — Upstream's own `chore: version packages (#2580)` — where

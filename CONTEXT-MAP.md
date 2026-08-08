@@ -4,10 +4,10 @@ This repository holds two glossaries, and they are **not** two halves of one
 list. Each defines the vocabulary of a different subject, for a different
 reader, changing on a different schedule. Read the one your work is in.
 
-| Context | Glossary | Subject | Audience |
-| --- | --- | --- | --- |
-| **Fork Distribution** | `CONTEXT.md` | How our private forks of `BuilderIO/agent-native` are built, released and consumed | Whoever is releasing, vendoring, or moving work between repositories |
-| **Host** | `packages/core/src/hosts/CONTEXT.md` | How the framework runs the same application on more than one deployment platform | Whoever is writing framework code, here or Upstream |
+| Context               | Glossary                             | Subject                                                                            | Audience                                                             |
+| --------------------- | ------------------------------------ | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| **Fork Distribution** | `CONTEXT.md`                         | How our private forks of `BuilderIO/agent-native` are built, released and consumed | Whoever is releasing, vendoring, or moving work between repositories |
+| **Host**              | `packages/core/src/hosts/CONTEXT.md` | How the framework runs the same application on more than one deployment platform   | Whoever is writing framework code, here or Upstream                  |
 
 ## Why they must not be merged
 
@@ -20,9 +20,9 @@ terms for a private release process, in a public repository, defining nothing
 they can act on.
 
 **They disagree about what a word means, and both are right.** The clearest
-case is deployment. In the Host context, Cloudflare Workers is a *Host*: a
+case is deployment. In the Host context, Cloudflare Workers is a _Host_: a
 platform with a runtime, reached through a registered adapter. In the Fork
-Distribution context, the same word appears inside *App Repo* and *Vendor*,
+Distribution context, the same word appears inside _App Repo_ and _Vendor_,
 where what matters is which repository owns the source and how a package
 reaches it — the runtime is not the subject at all. One merged entry would have
 to be vague enough to cover both, which is how a glossary stops being usable.

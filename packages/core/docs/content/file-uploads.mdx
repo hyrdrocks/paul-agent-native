@@ -48,8 +48,8 @@ The provider resolution order is:
       <span class="diagram-pill warn">3</span>
       <div class="diagram-node">
         SQL fallback<br /><small class="diagram-muted"
-          >base64 in DB — only where the host permits it; elsewhere this step
-          is a typed failure naming the setup</small
+          >base64 in DB — only where the host permits it; elsewhere this step is
+          a typed failure naming the setup</small
         >
       </div>
     </div>
@@ -211,10 +211,10 @@ if (result) {
 
 `uploadFile()` returns `null` for exactly one condition — no provider is configured and the host permits a fallback. Two other conditions are typed throws, so they can never be confused with a stored file:
 
-| Thrown | Means | Repair |
-| --- | --- | --- |
-| `FileUploadStorageNotConfiguredError` | No store, and this host refuses a fallback. | Read `.setup`. |
-| `FileUploadProviderUnreadableError` | Whether a store is configured could not be read. | Fix the credential store; this is not a setup mistake. |
+| Thrown                                | Means                                            | Repair                                                 |
+| ------------------------------------- | ------------------------------------------------ | ------------------------------------------------------ |
+| `FileUploadStorageNotConfiguredError` | No store, and this host refuses a fallback.      | Read `.setup`.                                         |
+| `FileUploadProviderUnreadableError`   | Whether a store is configured could not be read. | Fix the credential store; this is not a setup mistake. |
 
 ## Resumable / Streaming Uploads {#resumable}
 

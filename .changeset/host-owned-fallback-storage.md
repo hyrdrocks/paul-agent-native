@@ -37,7 +37,7 @@ Adds `cloudflareR2FileUploadProvider`, registered by the Cloudflare host adapter
 and reporting itself unconfigured anywhere else. It writes through the `UPLOADS`
 binding and resolves the bucket's public origin through `resolveSecret`, the
 single reader for app-provided deploy configuration. It resolves that origin
-*before* the put: an object stored under a URL that resolves to nothing is a
+_before_ the put: an object stored under a URL that resolves to nothing is a
 dangling upload every layer above reads as a success. Object keys are a random
 UUID plus the extension, never the filename or owner, because the bucket is
 world-readable by construction and the key is what protects the object.

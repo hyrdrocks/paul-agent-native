@@ -34,7 +34,7 @@
 
     // Public by construction: the R2 provider persists a URL, so the bucket is
     // world-readable and the random object key is what guards the object.
-    "CLOUDFLARE_R2_PUBLIC_BASE_URL": "https://pub-547d1dbdb13249b492798093733b130b.r2.dev"
+    "CLOUDFLARE_R2_PUBLIC_BASE_URL": "https://pub-547d1dbdb13249b492798093733b130b.r2.dev",
   },
 
   "routes": [{ "pattern": "design.paulsjob.ai", "custom_domain": true }],
@@ -43,7 +43,7 @@
   // would break silently there.
   "preview_urls": false,
 
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
 
   // ---------------------------------------------------------------------
   // Emitted by the preset. Do not hand-author these in the app repo; they

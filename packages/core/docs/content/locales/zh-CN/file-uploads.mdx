@@ -201,7 +201,7 @@ if (result) {
 
 `uploadFile()` 只在一种情况下返回 `null` —— 没有配置提供者，且宿主允许兜底。另外两种情况是带类型的抛出，因此绝不会被误认为“文件已存储”：
 
-| 抛出 | 含义 | 修复 |
-| --- | --- | --- |
-| `FileUploadStorageNotConfiguredError` | 没有存储，且该宿主拒绝兜底。 | 阅读 `.setup`。 |
-| `FileUploadProviderUnreadableError` | 无法读出是否配置了存储。 | 修复凭据存储；这不是配置错误。 |
+| 抛出                                  | 含义                         | 修复                           |
+| ------------------------------------- | ---------------------------- | ------------------------------ |
+| `FileUploadStorageNotConfiguredError` | 没有存储，且该宿主拒绝兜底。 | 阅读 `.setup`。                |
+| `FileUploadProviderUnreadableError`   | 无法读出是否配置了存储。     | 修复凭据存储；这不是配置错误。 |

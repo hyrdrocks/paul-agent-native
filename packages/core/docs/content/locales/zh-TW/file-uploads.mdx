@@ -201,7 +201,7 @@ if (result) {
 
 `uploadFile()` 只在一種情況下回傳 `null` —— 沒有設定提供者，且主機允許後備。另外兩種情況是帶型別的擲出，因此絕不會被誤認為「檔案已儲存」：
 
-| 擲出 | 含義 | 修復 |
-| --- | --- | --- |
-| `FileUploadStorageNotConfiguredError` | 沒有儲存，且該主機拒絕後備。 | 閱讀 `.setup`。 |
-| `FileUploadProviderUnreadableError` | 無法讀出是否設定了儲存。 | 修復憑證儲存；這不是設定錯誤。 |
+| 擲出                                  | 含義                         | 修復                           |
+| ------------------------------------- | ---------------------------- | ------------------------------ |
+| `FileUploadStorageNotConfiguredError` | 沒有儲存，且該主機拒絕後備。 | 閱讀 `.setup`。                |
+| `FileUploadProviderUnreadableError`   | 無法讀出是否設定了儲存。     | 修復憑證儲存；這不是設定錯誤。 |

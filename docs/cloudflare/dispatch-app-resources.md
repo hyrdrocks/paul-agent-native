@@ -17,9 +17,9 @@ does. Turning durable background off for it would have traded a deploy failure
 for every long turn silently running inline under the foreground clamp, so the
 queues were created instead.
 
-| Resource | Name | Id |
-| --- | --- | --- |
-| Queue | `paul-dispatch-app-agent-background` | `8a0a4d314873465280a620b40213c5a8` |
+| Resource          | Name                                     | Id                                 |
+| ----------------- | ---------------------------------------- | ---------------------------------- |
+| Queue             | `paul-dispatch-app-agent-background`     | `8a0a4d314873465280a620b40213c5a8` |
 | Dead-letter queue | `paul-dispatch-app-agent-background-dlq` | `2cf21f67fc6a42af9fbb378eca4758b4` |
 
 A queue id is an identifier, not a credential — the same reason

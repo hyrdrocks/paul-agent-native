@@ -201,7 +201,7 @@ if (result) {
 
 `uploadFile()` renvoie `null` pour exactement une condition : aucun fournisseur configuré et l'hôte autorise un repli. Les deux autres conditions sont des exceptions typées, donc elles ne peuvent jamais être confondues avec un fichier stocké :
 
-| Levée | Signifie | Réparation |
-| --- | --- | --- |
-| `FileUploadStorageNotConfiguredError` | Aucun stockage, et cet hôte refuse un repli. | Lisez `.setup`. |
-| `FileUploadProviderUnreadableError` | Impossible de lire si un stockage est configuré. | Réparez le magasin d'identifiants ; ce n'est pas une erreur de configuration. |
+| Levée                                 | Signifie                                         | Réparation                                                                    |
+| ------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------- |
+| `FileUploadStorageNotConfiguredError` | Aucun stockage, et cet hôte refuse un repli.     | Lisez `.setup`.                                                               |
+| `FileUploadProviderUnreadableError`   | Impossible de lire si un stockage est configuré. | Réparez le magasin d'identifiants ; ce n'est pas une erreur de configuration. |

@@ -7,11 +7,11 @@ Everything below **exists now**. Nothing here is a plan.
 
 ## Account
 
-| | |
-| --- | --- |
-| Account name | `Pauls Job` |
-| Account id | `6e11e8e7c871694bd4789ce8661fe326` |
-| Plan | Workers Paid (Queues, Browser Rendering and the 300 s CPU ceiling all require it) |
+|              |                                                                                   |
+| ------------ | --------------------------------------------------------------------------------- |
+| Account name | `Pauls Job`                                                                       |
+| Account id   | `6e11e8e7c871694bd4789ce8661fe326`                                                |
+| Plan         | Workers Paid (Queues, Browser Rendering and the 300 s CPU ceiling all require it) |
 
 The same account already runs `paul-dispatch-app`. It is reused deliberately: a
 second account would split billing and entitlements, and this repo's
@@ -60,7 +60,7 @@ against.
 
 The `browser` emitter is conditional the same way, and for a reason worth
 stating because Browser Rendering has no resource behind it. An entitlement is
-*more* of a deploy prerequisite than a resource, not less: `wrangler deploy`
+_more_ of a deploy prerequisite than a resource, not less: `wrangler deploy`
 rejects a binding the account is not entitled to, so an unconditional emit would
 fail the deploy of every app that never renders anything — R3's queue mistake
 (#30, since fixed: the queue emitter is conditional too, see below) in a second
@@ -70,13 +70,13 @@ nobody flips is that a Worker with no `BROWSER` bound refuses at the first rende
 and names both the variable and the binding. That absent-binding deploy is what
 #16's AC3 negative control ran against.
 
-| Binding | Kind | Resource | Name is fixed by |
-| --- | --- | --- | --- |
-| `DB` | D1 | `paul-design-app` (id `256288ec-77ac-4e9d-ab1b-8d415e4ee997`, region APAC) | `CLOUDFLARE_D1_BINDING_NAME`, read by `getCloudflareD1Binding()` |
-| `UPLOADS` | R2 | `paul-design-app-uploads` | `CLOUDFLARE_R2_BINDING_NAME` in `file-upload/cloudflare-r2.ts` |
-| `AGENT_NATIVE_BACKGROUND_QUEUE` | Queue producer | `paul-design-app-agent-background` (id `2a6089b9f4384295826f33e59369435b`) | `AGENT_BACKGROUND_QUEUE_BINDING` in `agent/background-queue.ts` |
-| — | Queue consumer | same queue, DLQ `paul-design-app-agent-background-dlq` (id `8bd3355ef05f4efda0e8e35010d7a33d`) | emitted by `configureCloudflareModuleBackgroundQueue()` |
-| `BROWSER` | Browser Rendering | account entitlement, no resource to create | `CLOUDFLARE_BROWSER_BINDING_NAME` in `browser-rendering/cloudflare-browser.ts`, read through the seam by the Design template's `server/lib/playwright-runtime.ts` |
+| Binding                         | Kind              | Resource                                                                                       | Name is fixed by                                                                                                                                                  |
+| ------------------------------- | ----------------- | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DB`                            | D1                | `paul-design-app` (id `256288ec-77ac-4e9d-ab1b-8d415e4ee997`, region APAC)                     | `CLOUDFLARE_D1_BINDING_NAME`, read by `getCloudflareD1Binding()`                                                                                                  |
+| `UPLOADS`                       | R2                | `paul-design-app-uploads`                                                                      | `CLOUDFLARE_R2_BINDING_NAME` in `file-upload/cloudflare-r2.ts`                                                                                                    |
+| `AGENT_NATIVE_BACKGROUND_QUEUE` | Queue producer    | `paul-design-app-agent-background` (id `2a6089b9f4384295826f33e59369435b`)                     | `AGENT_BACKGROUND_QUEUE_BINDING` in `agent/background-queue.ts`                                                                                                   |
+| —                               | Queue consumer    | same queue, DLQ `paul-design-app-agent-background-dlq` (id `8bd3355ef05f4efda0e8e35010d7a33d`) | emitted by `configureCloudflareModuleBackgroundQueue()`                                                                                                           |
+| `BROWSER`                       | Browser Rendering | account entitlement, no resource to create                                                     | `CLOUDFLARE_BROWSER_BINDING_NAME` in `browser-rendering/cloudflare-browser.ts`, read through the seam by the Design template's `server/lib/playwright-runtime.ts` |
 
 The DLQ exists because the emitted consumer names it
 (`` `${queueName}-dlq` ``). A missing DLQ is a deploy-time failure, not a
@@ -176,11 +176,11 @@ this directory.
 
 Non-secret, belongs in `wrangler.jsonc` `vars` (committed):
 
-| Var | Value |
-| --- | --- |
-| `CLOUDFLARE_R2_PUBLIC_BASE_URL` | the r2.dev address above |
-| `APP_URL` / `BETTER_AUTH_URL` | the public origin — recommended `https://design.paulsjob.ai`, mirroring `dispatch.paulsjob.ai`. **Not created yet**; a `custom_domain` route creates the DNS record on first deploy. Better Auth builds cookies and OAuth redirects from `BETTER_AUTH_URL`, so it must match the route exactly. |
-| `MCP_SERVER_NAME` | optional; without it core derives `agent-native-design` from the hostname |
+| Var                             | Value                                                                                                                                                                                                                                                                                           |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLOUDFLARE_R2_PUBLIC_BASE_URL` | the r2.dev address above                                                                                                                                                                                                                                                                        |
+| `APP_URL` / `BETTER_AUTH_URL`   | the public origin — recommended `https://design.paulsjob.ai`, mirroring `dispatch.paulsjob.ai`. **Not created yet**; a `custom_domain` route creates the DNS record on first deploy. Better Auth builds cookies and OAuth redirects from `BETTER_AUTH_URL`, so it must match the route exactly. |
+| `MCP_SERVER_NAME`               | optional; without it core derives `agent-native-design` from the hostname                                                                                                                                                                                                                       |
 
 Secret, set with `wrangler secret put` and never committed:
 
@@ -220,13 +220,13 @@ user.
 
 ### Where the value physically lives
 
-| Runtime | Storage | Reaches `process.env` via |
-| --- | --- | --- |
-| Deployed Worker | `wrangler secret put ANTHROPIC_API_KEY` | Nitro's Cloudflare preset |
-| Local Workers run | `.output/server/.dev.vars` (written from `.cf-local/dev.vars` by the template's `justfile`) | same |
+| Runtime           | Storage                                                                                     | Reaches `process.env` via |
+| ----------------- | ------------------------------------------------------------------------------------------- | ------------------------- |
+| Deployed Worker   | `wrangler secret put ANTHROPIC_API_KEY`                                                     | Nitro's Cloudflare preset |
+| Local Workers run | `.output/server/.dev.vars` (written from `.cf-local/dev.vars` by the template's `justfile`) | same                      |
 
 Two storage locations, one reader. That is the distinction that matters: a
-second *store* is fine, a second *read site* is the bug.
+second _store_ is fine, a second _read site_ is the bug.
 
 ## Local run and deployed run take the same path
 
@@ -264,18 +264,18 @@ deleted. Every step used the binding rather than inspecting it.
 
 Deployed run, all five green:
 
-| Step | Result |
-| --- | --- |
-| D1 `create table` / `insert` / `select` through `env.DB` | row read back |
-| R2 `put` then `get` through `env.UPLOADS` | body matched |
-| `GET https://pub-….r2.dev/uploads/<uuid>.txt` | `200`, body matched |
-| `env.AGENT_NATIVE_BACKGROUND_QUEUE.send()` | accepted |
-| queue consumer wrote to D1, read back over HTTP | 3 of 3 messages consumed |
+| Step                                                                 | Result                        |
+| -------------------------------------------------------------------- | ----------------------------- |
+| D1 `create table` / `insert` / `select` through `env.DB`             | row read back                 |
+| R2 `put` then `get` through `env.UPLOADS`                            | body matched                  |
+| `GET https://pub-….r2.dev/uploads/<uuid>.txt`                        | `200`, body matched           |
+| `env.AGENT_NATIVE_BACKGROUND_QUEUE.send()`                           | accepted                      |
+| queue consumer wrote to D1, read back over HTTP                      | 3 of 3 messages consumed      |
 | `puppeteer.launch(env.BROWSER)`, `setContent`, `$eval`, `screenshot` | text read back, 6615-byte PNG |
 
 Local `wrangler dev` run, same code, same config, D1/queue/browser local and R2
 remote: identical results, including the queue round-trip and a 5849-byte
-screenshot. With R2 in *local* mode the public-URL step returned `404` — the
+screenshot. With R2 in _local_ mode the public-URL step returned `404` — the
 divergence recorded above.
 
 Probe artifacts were removed afterwards: the `binding_probe` table dropped, the

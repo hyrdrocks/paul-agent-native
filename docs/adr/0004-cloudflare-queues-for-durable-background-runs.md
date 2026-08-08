@@ -33,13 +33,13 @@ an incoming pathname.
 Cloudflare publishes a wall-time limit per invocation type
 (`developers.cloudflare.com/workers/platform/limits/`):
 
-| Invocation type          | Wall time  |
-| ------------------------ | ---------- |
-| Incoming HTTP request    | Unlimited **while the client stays connected** |
-| `waitUntil()` after the response | 30 seconds |
-| Queue consumer           | 15 minutes |
-| Cron Trigger             | 15 minutes |
-| Durable Object alarm     | 15 minutes |
+| Invocation type                  | Wall time                                      |
+| -------------------------------- | ---------------------------------------------- |
+| Incoming HTTP request            | Unlimited **while the client stays connected** |
+| `waitUntil()` after the response | 30 seconds                                     |
+| Queue consumer                   | 15 minutes                                     |
+| Cron Trigger                     | 15 minutes                                     |
+| Durable Object alarm             | 15 minutes                                     |
 
 **The post-response continuation API (`ctx.waitUntil`) is disqualified.** It is
 the closest thing to the Netlify background function in shape — fire work, let
@@ -75,14 +75,14 @@ foreground soft-timeout regime or the circuit breaker's recovery logic.
   128 KB (256 KB per batch). The normal path already sends only a marker,
   because the run row carries the payload. The inline-body fallback — used only
   when the run row insert failed — refuses an oversized payload and degrades to
-  an inline run. It never truncates: a truncated payload runs a *different* turn
+  an inline run. It never truncates: a truncated payload runs a _different_ turn
   than the one asked for and looks like a completed one.
 - **The CPU ceiling is raised to 300,000 ms.** That is the documented Workers
   Paid maximum against a 30,000 ms default. Waiting on model I/O is not CPU
   time, but a 15-minute turn's own work accumulates past 30 seconds.
 - **A failed send and an unclaimed run are different conditions.** A send that
   fails is known and handled: the run degrades to an inline turn, and the
-  existing circuit breaker is unchanged. A send the queue *accepted* that no
+  existing circuit breaker is unchanged. A send the queue _accepted_ that no
   consumer ever claims is an undiagnosable deploy defect — the producer works,
   so nothing else surfaces it, and the circuit breaker's inline recovery makes
   it look healthy. That one is reported once per isolate. Collapsing the two
@@ -90,7 +90,7 @@ foreground soft-timeout regime or the circuit breaker's recovery logic.
   exists to end.
 - **The long-budget signal is per-invocation.** One Worker isolate serves
   concurrent fetch and queue invocations, so no isolate-wide marker can prove
-  *this* invocation holds the budget — see ADR 0002 and the async-context scope
+  _this_ invocation holds the budget — see ADR 0002 and the async-context scope
   the consumer enters.
 - **A key-value binding is deliberately not emitted.** Nothing in the framework
   reads one; shipping the configuration would be dead weight that invites
