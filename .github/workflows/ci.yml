@@ -62,6 +62,9 @@ jobs:
       - name: Run packing procedure tests
         run: pnpm test:pack-workspace-packages
 
+      - name: Run re-baseline procedure tests
+        run: pnpm test:rebaseline-to-upstream
+
   typecheck:
     name: Typecheck
     runs-on: ubuntu-latest
