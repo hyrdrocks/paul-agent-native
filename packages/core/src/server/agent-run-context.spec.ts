@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const getSessionMock = vi.hoisted(() => vi.fn());
 const getOrgContextMock = vi.hoisted(() => vi.fn());
 const resolveOrgIdForEmailMock = vi.hoisted(() => vi.fn());
-const getRunOwnerEmailMock = vi.hoisted(() => vi.fn());
+const getRunOwnerMock = vi.hoisted(() => vi.fn());
 
 vi.mock("./auth.js", () => ({
   getSession: getSessionMock,
@@ -15,7 +15,7 @@ vi.mock("../org/context.js", () => ({
 }));
 
 vi.mock("../agent/run-store.js", () => ({
-  getRunOwnerEmail: getRunOwnerEmailMock,
+  getRunOwner: getRunOwnerMock,
 }));
 
 import {
@@ -48,11 +48,11 @@ describe("server/agent-run-context", () => {
     getSessionMock.mockReset();
     getOrgContextMock.mockReset();
     resolveOrgIdForEmailMock.mockReset();
-    getRunOwnerEmailMock.mockReset();
+    getRunOwnerMock.mockReset();
     getSessionMock.mockResolvedValue(null);
     getOrgContextMock.mockResolvedValue({ orgId: null });
     resolveOrgIdForEmailMock.mockResolvedValue(null);
-    getRunOwnerEmailMock.mockResolvedValue(null);
+    getRunOwnerMock.mockResolvedValue(null);
   });
 
   it("resolves and caches a signed-in owner from the session", async () => {
@@ -220,7 +220,10 @@ describe("server/agent-run-context", () => {
 
   it("seeds the durable background owner from the persisted run row", async () => {
     const event = makeEvent();
-    getRunOwnerEmailMock.mockResolvedValue("owner@example.com");
+    getRunOwnerMock.mockResolvedValue({
+      email: "owner@example.com",
+      anonymous: false,
+    });
 
     const seeded = await seedBackgroundAgentRunOwnerContext(event, "run_123");
 
@@ -230,5 +233,42 @@ describe("server/agent-run-context", () => {
     });
     await expect(resolveAgentRunOwnerContext(event)).resolves.toBe(seeded);
     expect(getSessionMock).not.toHaveBeenCalled();
+  });
+
+  // The dispatch is cookieless by construction, so falling through to the
+  // session lookup can only ever produce a 401 that blames the caller for a
+  // cookie the route never wanted. Both failure modes must name themselves.
+  it("fails loudly when the run row records no owner", async () => {
+    getRunOwnerMock.mockResolvedValue(null);
+
+    await expect(
+      seedBackgroundAgentRunOwnerContext(makeEvent(), "run_123"),
+    ).rejects.toMatchObject({
+      statusCode: 500,
+      statusMessage: "Background run run_123 has no recorded owner",
+    });
+    expect(getSessionMock).not.toHaveBeenCalled();
+  });
+
+  // Losing this flag hands a public read-only visitor's background turn the
+  // full read/write handler, because the seeded context short-circuits the
+  // anonymous resolver downstream.
+  it("keeps an anonymous owner anonymous across the background handoff", async () => {
+    getRunOwnerMock.mockResolvedValue({
+      email: "public-owner",
+      anonymous: true,
+    });
+
+    await expect(
+      seedBackgroundAgentRunOwnerContext(makeEvent(), "run_anon"),
+    ).resolves.toEqual({ owner: "public-owner", anonymous: true });
+  });
+
+  it("propagates a run-store read failure instead of reporting it as unauthenticated", async () => {
+    getRunOwnerMock.mockRejectedValue(new Error("no such table: agent_runs"));
+
+    await expect(
+      seedBackgroundAgentRunOwnerContext(makeEvent(), "run_123"),
+    ).rejects.toThrow("no such table: agent_runs");
   });
 });

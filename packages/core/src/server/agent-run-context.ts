@@ -106,18 +106,36 @@ export function seedAgentRunOwnerContext(
   return ownerContext;
 }
 
+/**
+ * Expand the owner of an HMAC-authenticated background dispatch from its
+ * persisted run row.
+ *
+ * Never coerces: an unreadable run store throws its own error, and a run with
+ * no recorded owner throws a 500 naming that. Both used to collapse into
+ * `null`, which then fell through to the session lookup and surfaced as a bare
+ * `401 Unauthenticated` — a cookieless self-dispatch reported as the caller's
+ * fault, on a route where no cookie was ever expected.
+ *
+ * `anonymous` is read from the row, never assumed: it selects the read-only
+ * anonymous handler downstream, so defaulting it to `false` would hand a public
+ * visitor's background turn the full read/write tool surface.
+ */
 export async function seedBackgroundAgentRunOwnerContext(
   event: H3Event,
   runId: string,
-): Promise<AgentRunOwnerContext | null> {
-  try {
-    const { getRunOwnerEmail } = await import("../agent/run-store.js");
-    const owner = await getRunOwnerEmail(runId);
-    if (!owner) return null;
-    return seedAgentRunOwnerContext(event, { owner, anonymous: false });
-  } catch {
-    return null;
+): Promise<AgentRunOwnerContext> {
+  const { getRunOwner } = await import("../agent/run-store.js");
+  const owner = await getRunOwner(runId);
+  if (!owner) {
+    throw createError({
+      statusCode: 500,
+      statusMessage: `Background run ${runId} has no recorded owner`,
+    });
   }
+  return seedAgentRunOwnerContext(event, {
+    owner: owner.email,
+    anonymous: owner.anonymous,
+  });
 }
 
 export async function resolveAgentRunOwnerContext(
@@ -208,6 +226,8 @@ export async function resolveAgentRunRequestContext(options: {
   const browserSessionId = readBrowserSessionIdHeader(options.event);
   const waitUntil = requestWaitUntil(options.event);
   const run = {
+    owner: options.ownerContext.owner,
+    ownerAnonymous: options.ownerContext.anonymous,
     ...(options.isBackgroundWorker ? { isBackgroundWorker: true } : {}),
     ...(waitUntil ? { waitUntil } : {}),
   };
@@ -217,7 +237,7 @@ export async function resolveAgentRunRequestContext(options: {
     orgId,
     timezone,
     ...(browserSessionId ? { browserSessionId } : {}),
-    ...(Object.keys(run).length > 0 ? { run } : {}),
+    run,
   };
 }
 
