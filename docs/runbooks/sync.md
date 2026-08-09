@@ -39,10 +39,11 @@ The conflicts fall into two kinds, and they are resolved differently:
   content along with it. The 0.146.6 Sync lost three fork additions to core's
   manifest that way — a `sideEffects` entry, five `exports` paths, and a
   dependency — and it surfaced two steps later as `Cannot find module
-  '@cfworker/json-schema'`, which reads exactly like a bad merge and is not.
+'@cfworker/json-schema'`, which reads exactly like a bad merge and is not.
   Resolve it as a real three-way merge; it should conflict on the `version` line
   alone. For `CHANGELOG.md` the two are equivalent, which is what makes the
   `package.json` case easy to miss.
+
 - **Source** (`server/auth.ts`, `core-routes-plugin.ts`, `db/client.ts`,
   `deploy/build.ts`, and the rest of the host seam) — read both sides. This is
   the single most likely place a `=== "cloudflare"` comes back into
@@ -63,7 +64,7 @@ package that declares core as a peer out of range, and changesets answers that b
 majoring all of them at once — the accident ADR 0008 had to undo.
 
 **The order of these two commands is load-bearing, not stylistic.** Re-run the
-Re-baseline *after* the version pass and it writes the fork prerelease into
+Re-baseline _after_ the version pass and it writes the fork prerelease into
 `initialVersions` — core is `ahead` of Upstream by then, and the `ahead` branch
 records the version the manifest actually holds. The baseline would name a fork
 prerelease instead of the Upstream release it forks, which is the opposite of
@@ -120,7 +121,7 @@ carrying a stale build, and nothing else catches that.
 A Sync introduces no new capability, so the probe does not move — it asserts
 whatever the last real piece of fork work established. It still has to run.
 
-`cf-smoke.mjs` is a different claim: it proves a *deploy serves*, at the HTTP
+`cf-smoke.mjs` is a different claim: it proves a _deploy serves_, at the HTTP
 boundary, after deploying. It does not substitute for the probe, and the probe
 does not substitute for it.
 
