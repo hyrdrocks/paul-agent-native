@@ -225,6 +225,36 @@ describe("scoping", () => {
       expect(ctx.orgIdTables.has("plain_table")).toBe(false);
     });
 
+    // `agent_runs` grew an `owner_email` column so the cookieless background
+    // worker can attribute its own dispatch. That column alone would otherwise
+    // flip the table from the fail-closed default to a user-scoped view and
+    // expose `dispatch_payload` — the persisted chat request body — to raw SQL.
+    it("keeps agent_runs fail-closed even though it has an owner_email column", async () => {
+      vi.stubEnv("NODE_ENV", "production");
+      vi.stubEnv("AGENT_USER_EMAIL", "alice+qa@test.com");
+      const { buildScopingSqlite } = await import("./scoping.js");
+
+      const mockClient = {
+        execute: vi.fn().mockImplementation((sql: string) => {
+          if (sql.includes("sqlite_master")) {
+            return { rows: [{ name: "agent_runs" }] };
+          }
+          return {
+            rows: [
+              { name: "id" },
+              { name: "owner_email" },
+              { name: "dispatch_payload" },
+            ],
+          };
+        }),
+      };
+
+      const ctx = await buildScopingSqlite(mockClient);
+      const view = ctx.setup.find((s) => s.includes('"agent_runs"'));
+      expect(view).toContain("WHERE 1 = 0");
+      expect(view).not.toContain("alice+qa@test.com");
+    });
+
     it("scopes resources by the nonstandard owner column", async () => {
       vi.stubEnv("NODE_ENV", "production");
       vi.stubEnv("AGENT_USER_EMAIL", "reader+qa@test.com");

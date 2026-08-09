@@ -15,6 +15,16 @@
  * so the user's SQL runs unmodified against the filtered views.
  */
 
+// Framework bookkeeping tables that must stay invisible to raw SQL no matter
+// which columns they happen to grow. `agent_runs` acquired an `owner_email`
+// column so the cookieless background worker can attribute its own dispatch;
+// without this list that column alone would silently promote the table from the
+// fail-closed default below to a user-scoped view, handing db-query/db-exec
+// (and anything that reaches them through prompt injection) the persisted
+// `dispatch_payload` — the full chat request body, attachments included — plus
+// write access to the run-claim rows the reaper depends on.
+const ALWAYS_FAIL_CLOSED_TABLES = new Set(["agent_runs"]);
+
 // Core tables with non-standard scoping (not owner_email).
 // Map of table name → { column, mode }.
 const CORE_TABLE_SCOPING: Record<
@@ -151,6 +161,11 @@ function buildScopedTables(
   };
 
   for (const [table, columns] of columnsByTable) {
+    if (ALWAYS_FAIL_CLOSED_TABLES.has(table)) {
+      scoped.push(viewFor(table, "1 = 0"));
+      continue;
+    }
+
     // Check core table scoping
     const coreScoping = CORE_TABLE_SCOPING[table];
     if (coreScoping) {
