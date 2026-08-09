@@ -1,5 +1,12 @@
 # @agent-native/pinpoint
 
+## 0.1.20-paul.1
+
+### Patch Changes
+
+- Updated dependencies
+  - @agent-native/core@0.146.7-paul.0
+
 ## 0.1.20-paul.0
 
 ### Patch Changes

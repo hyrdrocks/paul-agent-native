@@ -1,87 +1,42 @@
 # @agent-native/creative-context
 
-## 0.6.3-paul.0
+## 0.6.4-paul.0
 
 ### Patch Changes
 
-- 8693d39: Boot an app on the Cloudflare SQL dialect: dialect capabilities, lazy schema
-  initialisation, the Workers runtime counted as hosted, and the D1 binding
-  emitted into the generated Worker configuration.
+- Carry the fork's prerelease tag onto the Upstream 0.146.6 baseline, so no
+  package in the trunk ships under a number Upstream has already published.
 
-  The database layer now answers capability questions instead of making callers
-  name a product. `supportsInteractiveTransactions()` says whether a dialect can
-  hold a `BEGIN` open across round trips — read literally, because every supported
-  dialect writes atomically and the one that answers `false` does so through a
-  batched statement list. `runAtomicWrites` and `runCompareAndSwap` each have one
-  implementation with that branch inside, so the dialects cannot drift apart, and
-  no caller outside the database layer checks the dialect by name any more.
-  `@agent-native/creative-context` creates a context through `runAtomicWrites`
-  rather than an interactive transaction, so the sources, the context row and its
-  audit entry still land together on a dialect that has no `BEGIN` to hold open. The
-  human-readable database label and the platform-binding client both travel with
-  the dialect, so authentication asks for a client rather than reaching for a
-  host's binding — on a bound dialect with nothing bound it now names the missing
-  binding instead of failing inside the fail-closed `better-sqlite3` stub.
+  Merging Upstream took its side of every conflicting `version` line, which is
+  correct — the Re-baseline owns those numbers — but it also erased the `-paul`
+  tag from the four packages whose trees actually differ from Upstream. Every
+  pending changeset was already recorded as applied in pre mode, so the version
+  pass had nothing to re-apply and left core sitting on exactly `0.146.6`: a
+  tarball name-identical to a real published release, carrying 133 files of fork
+  source. That is the version lying about what it contains, and it is what the
+  Capability Probe has to catch afterwards instead.
 
-  Schema initialisation no longer fires outside a request. The five
-  fire-and-forget `ensure*Tables()` calls at plugin-init are gone and each store
-  wraps its existing routine in the cold-isolate init memo; the request-scoped
-  entry points thread their h3 event through so the request that starts the work
-  can hold it open. The audit cleanup job ticks on a timer with no request of its
-  own, so it awaits its own initialisation.
+  The four named here are precisely the packages whose `src` differs from
+  `5297bd478`. `frame`, `pinpoint` and `scheduling` are not named — they carry no
+  fork source and are already tagged from the last Sync; they move only as
+  dependents. `recap-cli`, `toolkit` and `agent-browser-extension` stay on
+  Upstream's plain numbers because they are byte-identical to Upstream, which is
+  the one case a reused plain version is honest.
 
-  The Workers runtime counts as hosted, including under `wrangler dev`, which runs
-  the same runtime binary under the same constraints. The long-budget signal is
-  carried per invocation there rather than per isolate, because one Worker isolate
-  serves concurrent fetch and queue invocations and an isolate-wide marker would
-  let an unrelated foreground turn lift its own clamp. Until a durable transport
-  exists for this host, an enabled gate reports once per isolate that the run is
-  executing inline rather than degrading in silence.
+  Patch, deliberately, and not because a patch is all this is worth. A minor or
+  major on core is what puts every package declaring core as a `>=` peer out of
+  range, and changesets answers that by majoring all five at once — measured
+  again here, and it still lands `dispatch`, `creative-context`, `frame`,
+  `pinpoint` and `scheduling` on `1.0.0`. ADR 0008 had to undo that once.
 
-  Native packages that survive as bare specifiers in an emitted Worker bundle are
-  stubbed to throw on every access, replacing a stub whose empty default and no-op
-  `watch()` a caller could not tell from the capability working and finding
-  nothing.
+- Updated dependencies
+  - @agent-native/core@0.146.7-paul.0
 
-- 35958d1: Renumber the five packages that entering changesets pre mode bumped to `1.0.0`
-  back onto the `0.x` line, so a Fork version is the Upstream version it forks
-  advanced by its own changesets, plus the `-paul.N` prerelease suffix. No
-  changeset ever asked for that major: it is what changesets does to a package
-  declaring `@agent-native/core` as a `>=` peer dependency once core's version
-  carries a prerelease, because a prerelease satisfies no plain `>=` range.
-  `@agent-native/dispatch` goes to `0.17.0-paul.0`, and `creative-context`,
-  `frame`, `pinpoint` and `scheduling` to a patch above their baselines. A
-  vendored tarball name therefore moves backwards without the build inside it
-  moving backwards; `docs/adr/0008` says why.
-- Updated dependencies [f2fe0b3]
-- Updated dependencies [1c13483]
-- Updated dependencies [e6cf9fa]
-- Updated dependencies [8693d39]
-- Updated dependencies [5c07988]
-- Updated dependencies [b9ae314]
-- Updated dependencies [2c2f66d]
-- Updated dependencies [e5d6c95]
-- Updated dependencies [a33bb80]
-- Updated dependencies [20a6b93]
-- Updated dependencies [a12f7f9]
-- Updated dependencies [bef7405]
-- Updated dependencies [0ebd8af]
-- Updated dependencies [c2b7f82]
-- Updated dependencies [a1311d7]
-- Updated dependencies [e517dcc]
-- Updated dependencies [834ac94]
-- Updated dependencies [f2fe0b3]
-- Updated dependencies [d583f7d]
-  - @agent-native/core@0.145.3-paul.0
-
-## 0.5.9-paul.0
+## 0.6.3
 
 ### Patch Changes
 
-- Updated dependencies [f3a868b]
-- Updated dependencies [0c17835]
-- Updated dependencies [17b5fe8]
-  - @agent-native/core@0.134.0-paul.0
+- 25f588e: Redirect legacy `/agent` management URLs to the canonical settings routes and preserve app-owned settings tabs.
 
 ## 0.6.2
 

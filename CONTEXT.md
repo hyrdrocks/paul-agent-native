@@ -21,7 +21,9 @@ _Avoid_: branch, our repo
 
 **Lane**:
 One Fork plus the App Repos that consume it, tracked as a single stream of work.
-Today there are two: the vault/dispatch lane and the Cloudflare/design lane.
+There were two — the vault/dispatch lane and the Cloudflare/design lane — until
+the combine merged both Forks into one trunk. Both App Repos now Vendor from the
+trunk, so the word survives only to name work by its subject, not by its Fork.
 
 **App Repo**:
 A standalone repository holding one workspace app's own source, scaffolded from
@@ -40,6 +42,20 @@ To pack a package from a Fork checkout into a committed `.tgz` inside an App
 Repo and point `package.json` at it with a `file:` specifier. Our release
 mechanism; we do not publish forked packages to npm.
 _Avoid_: publish, release, link
+
+**Re-baseline**:
+To copy each package's `version` verbatim from a named Upstream release commit,
+replacing the version the Fork had drifted to. changesets can only increment
+what `package.json` already says, so carrying the Fork from one Upstream release
+to the next is a merge resolution, not a bump.
+_Avoid_: bump, upgrade
+
+**Sync**:
+One full pass of merging Upstream into the trunk Fork, Re-baselining onto that
+Upstream release, and re-Vendoring every App Repo from the resulting trunk
+commit. A partial pass is not a Sync: an App Repo vendored from an unmerged
+trunk is the failure this term exists to name.
+_Avoid_: update, upgrade, pull
 
 **Init Memo**:
 The seam a one-time isolate initialisation is wrapped in — a callable returning

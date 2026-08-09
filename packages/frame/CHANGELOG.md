@@ -1,5 +1,12 @@
 # @agent-native/frame
 
+## 0.1.155-paul.2
+
+### Patch Changes
+
+- Updated dependencies
+  - @agent-native/core@0.146.7-paul.0
+
 ## 0.1.155-paul.1
 
 ### Patch Changes

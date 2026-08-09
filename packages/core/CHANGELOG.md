@@ -1,634 +1,339 @@
 # @agent-native/core
 
-## 0.145.3-paul.0
+## 0.146.7-paul.0
 
 ### Patch Changes
 
-- f2fe0b3: Let the Anthropic provider reach a configured base URL, so a self-hosted or
-  local Anthropic-compatible gateway is a supported configuration rather than a
-  detour through an OpenAI-shaped translation. `ANTHROPIC_BASE_URL` resolves with
-  the same precedence `OPENAI_BASE_URL` already had — an explicitly passed
-  endpoint, then the scoped `app_secrets` row, then the deployment env var — and
-  applies to both the native `anthropic` engine and `ai-sdk:anthropic`. Which
-  providers have a configurable endpoint is now one table rather than a name check
-  at each call site, so the agent-engine settings endpoint writes an Anthropic
-  gateway to its own key instead of answering "Endpoint URL is only supported for
-  OpenAI" — without that, the scoped tier the resolver prefers was unreachable and
-  only the deployment env var worked.
+- Carry the fork's prerelease tag onto the Upstream 0.146.6 baseline, so no
+  package in the trunk ships under a number Upstream has already published.
 
-  The two Anthropic clients disagree about what a base URL is: the official SDK
-  appends `/v1/messages`, `@ai-sdk/anthropic` appends only `/messages`. One
-  configured value now converts to whichever form the selected engine needs, so
-  the same gateway URL does not 404 on one of them. A resolved endpoint is passed
-  to the SDK explicitly so a scoped row beats the SDK's own `ANTHROPIC_BASE_URL`
-  read; with nothing resolved the SDK default is left alone, because callers that
-  construct the engine directly never reach the registry.
+  Merging Upstream took its side of every conflicting `version` line, which is
+  correct — the Re-baseline owns those numbers — but it also erased the `-paul`
+  tag from the four packages whose trees actually differ from Upstream. Every
+  pending changeset was already recorded as applied in pre mode, so the version
+  pass had nothing to re-apply and left core sitting on exactly `0.146.6`: a
+  tarball name-identical to a real published release, carrying 133 files of fork
+  source. That is the version lying about what it contains, and it is what the
+  Capability Probe has to catch afterwards instead.
 
-  Fail-closed behaviour is unchanged: with neither a key nor a base URL
-  configured, the engine still stops with the missing-credentials message instead
-  of sending an unauthenticated request. Only a configured base URL makes a
-  keyless run deliberate.
+  The four named here are precisely the packages whose `src` differs from
+  `5297bd478`. `frame`, `pinpoint` and `scheduling` are not named — they carry no
+  fork source and are already tagged from the last Sync; they move only as
+  dependents. `recap-cli`, `toolkit` and `agent-browser-extension` stay on
+  Upstream's plain numbers because they are byte-identical to Upstream, which is
+  the one case a reused plain version is honest.
 
-- 1c13483: Resolve the durable background transport through a registry both hosts join as
-  peers. Transport selection used to be one host hardcoded in
-  `resolveBackgroundDispatchTarget()` with a second bolted on beside it, so a
-  reader saw two hosts handled two ways and could not tell which won when both
-  answered. Each host now registers a transport under `hosts/` declaring its own
-  consultation priority, and the resolver asks them in that declared order,
-  terminating in the portable in-process route. Priority is a declaration rather
-  than a position in a branch chain, so adding a host cannot silently displace an
-  existing one by being registered, imported, or bundled ahead of it.
+  Patch, deliberately, and not because a patch is all this is worth. A minor or
+  major on core is what puts every package declaring core as a `>=` peer out of
+  range, and changesets answers that by majoring all five at once — measured
+  again here, and it still lands `dispatch`, `creative-context`, `frame`,
+  `pinpoint` and `scheduling` on `1.0.0`. ADR 0008 had to undo that once.
 
-  The caller opt-out (`durableBackground: false`) resolves before any transport is
-  consulted — it is a caller fact, not a host fact, and never reaches the
-  registry.
+## 0.146.6
 
-  `BackgroundDispatchTarget` no longer enumerates a per-host arm. What a caller
-  needs travels as declared properties — whether there is a `path` to POST to, and
-  whether the receiver carries its own long budget — rather than as a discriminant
-  every consumer in core has to recognise. The unclaimed-run watchdog now arms
-  from the transport's own `acknowledgesWithoutClaim` declaration: a transport
-  that acknowledges a handoff without proving a consumer claimed the run opts in,
-  one that returns a synchronous accepted status does not. Callers hand a run to a
-  transport with no path through the new `deliverBackgroundHandoff`, so no call
-  site needs to know which hosts POST and which do not.
+### Patch Changes
 
-  `@agent-native/core/agent/durable-background` is now an export subpath, so a
-  consumer can ask which transport this process actually resolves without pulling
-  the whole server graph.
+- a882a53: Make a slow cold-start response diagnosable from one look. HTTP telemetry now
+  reports the pre-handler boot phases (`boot_to_module_ms`, `module_to_request_ms`)
+  that no in-handler measurement can see, logs one structured line to stdout for
+  every cold or slow (>=1s) request, and stops putting live-looking per-phase
+  `server-timing` entries on shared-cacheable responses — a CDN replays those
+  bytes, so a cacheable response now carries a single `origin` entry stamped with
+  the wall-clock time of the render that produced it.
+- a882a53: Stop MCP hydration from running on every serverless cold start. Eager
+  initialization now only happens on long-lived runtimes; serverless functions
+  initialize on first use from the agent-chat handler, the MCP management routes,
+  and the recurring-jobs sweep. The 60-second MCP config refresh timer is gated by
+  `shouldDisableInProcessSweeps()` like the other in-process sweeps, and an
+  unreadable settings table now rejects with `McpConfigUnreadableError` instead of
+  being coerced into "no MCP servers configured".
+- a882a53: Stop inlining the translation catalog into the render-blocking locale init
+  script. `getLocaleInitScript()` now emits only `locale`, `preference`, and
+  `dir`; the catalog already reaches `AgentNativeI18nProvider` through loader data
+  as `initialMessages`. The `messages` option is removed — passing it is now a
+  type error rather than a silently duplicated payload.
+- a882a53: Provision recurring scheduler health during release migrations so serverless background sweeps can execute scheduled automations.
+- a882a53: Stop shipping the serverless browser runtime into apps that cannot use it. The
+  Chromium/Playwright copy now runs only when the app itself depends on the
+  browser runtime, instead of resolving a sibling workspace package's Chromium
+  through the pnpm store. Serverless function dirs also drop prebuilds that cannot
+  execute on Linux x64/arm64 and any local `data/` SQLite database before the
+  extra Netlify functions are cloned, and the Netlify deploy guard now reports
+  per-function sizes and fails when one exceeds its budget.
 
-- e6cf9fa: Bound the Netlify and Vercel immutable-asset config to one entry per mount
-  point instead of one per content-hashed asset, so neither file grows with the
-  app. On a two-app workspace carrying 400 hashed assets each, the generated
-  `_headers` goes from 1600 blocks to 4 and the Vercel `config.json` from 800
-  header routes to 2.
+## 0.146.5
 
-  The collapse is not the same on both platforms, because their formats do not
-  express the same thing. Vercel's `src` is a regex, so it carries the exact
-  hashed-filename test — an unhashed file sitting in the same directory is not
-  newly covered, which the `/assets/**` glob a `_headers` file is limited to
-  cannot avoid. Netlify has no regex form, so it takes `/assets/:file`: a
-  placeholder matches one path segment where `*` crosses `/`, which leaves a
-  subdirectory of hand-maintained files uncovered rather than pinned for a year.
-  What it still cannot exclude is an unhashed file directly in `assets/`, so the
-  Netlify build now names those files rather than widening the policy in silence,
-  and it names only the ones the rule actually pins.
+### Patch Changes
 
-  `collectImmutableAssetPaths` is unchanged and still decides per-path headers at
-  runtime, where exactness is affordable.
+- 25f588e: Redirect legacy `/agent` management URLs to the canonical settings routes and preserve app-owned settings tabs.
 
-- 8693d39: Boot an app on the Cloudflare SQL dialect: dialect capabilities, lazy schema
-  initialisation, the Workers runtime counted as hosted, and the D1 binding
-  emitted into the generated Worker configuration.
+## 0.146.4
 
-  The database layer now answers capability questions instead of making callers
-  name a product. `supportsInteractiveTransactions()` says whether a dialect can
-  hold a `BEGIN` open across round trips — read literally, because every supported
-  dialect writes atomically and the one that answers `false` does so through a
-  batched statement list. `runAtomicWrites` and `runCompareAndSwap` each have one
-  implementation with that branch inside, so the dialects cannot drift apart, and
-  no caller outside the database layer checks the dialect by name any more.
-  `@agent-native/creative-context` creates a context through `runAtomicWrites`
-  rather than an interactive transaction, so the sources, the context row and its
-  audit entry still land together on a dialect that has no `BEGIN` to hold open. The
-  human-readable database label and the platform-binding client both travel with
-  the dialect, so authentication asks for a client rather than reaching for a
-  host's binding — on a bound dialect with nothing bound it now names the missing
-  binding instead of failing inside the fail-closed `better-sqlite3` stub.
+### Patch Changes
 
-  Schema initialisation no longer fires outside a request. The five
-  fire-and-forget `ensure*Tables()` calls at plugin-init are gone and each store
-  wraps its existing routine in the cold-isolate init memo; the request-scoped
-  entry points thread their h3 event through so the request that starts the work
-  can hold it open. The audit cleanup job ticks on a timer with no request of its
-  own, so it awaits its own initialisation.
+- e959709: Keep app-owned scheduled automations on the scheduler for the app that created them.
+- e959709: Keep approval controls visible when a paused chat tool call is rebuilt from its stored events.
+- e959709: Deploying a new app now migrates at release time with no configuration.
 
-  The Workers runtime counts as hosted, including under `wrangler dev`, which runs
-  the same runtime binary under the same constraints. The long-budget signal is
-  carried per invocation there rather than per isolate, because one Worker isolate
-  serves concurrent fetch and queue invocations and an isolate-wide marker would
-  let an unrelated foreground turn lift its own clamp. Until a durable transport
-  exists for this host, an enabled gate reports once per isolate that the run is
-  executing inline rather than degrading in silence.
+  `agent-native create` generates a `CONTEXT=production` migration step in the
+  app's Netlify build command, and the scaffold ships `scripts/migrate-production.ts`.
+  Create an app, connect Netlify, and schema is owned by the deploy — there is no
+  flag to set and no step to remember.
 
-  Native packages that survive as bare specifiers in an emitted Worker bundle are
-  stubbed to throw on every access, replacing a stub whose empty default and no-op
-  `watch()` a caller could not tell from the capability working and finding
-  nothing.
+  The serverless request-path migration skip is now the default rather than
+  opt-in. An earlier iteration gated it behind `AGENT_NATIVE_RELEASE_MIGRATIONS`,
+  which was the wrong shape: a flag you must remember is a flag half the fleet
+  will not have, and it left "migrate on every cold start" as the default for
+  every app that did not set it. All templates now ship the release step instead.
 
-- 5c07988: Carry a durable background agent run on Cloudflare through a queue.
+  Also fixes a real regression this introduced: the Netlify rewrite detected the
+  existing build command with `command = "([^"]*)"`, which stops at the first
+  escaped quote. Every generated command now contains `\"` from the CONTEXT test,
+  so the `NETLIFY_DATABASE_URL_UNPOOLED` override silently vanished for the four
+  templates that use it, and a created app would have built against the pooled URL.
 
-  A Worker with the emitted background queue bound resolves the dispatch target's
-  `queue` arm, and the generated Worker entry exports the consumer alongside the
-  request handler: per message it enters the per-invocation background scope,
-  synthesises a request to the existing processor route with the signed internal
-  token preserved, and delegates to the same handler that serves fetch. The
-  processor-selection field is honoured, so agent chat, A2A, integration webhooks
-  and the background route processor all reach the correct processor.
+- e959709: Scope workspace automations to their owning app by default, keep Dispatch's all-apps view explicit, and expose failed run threads for troubleshooting.
 
-  The build emits the producer binding, the consumer registration, and a 300,000 ms
-  CPU limit into the generated Worker configuration.
+## 0.146.3
 
-  An absent binding or a failed send degrades to an inline run with the circuit
-  breaker unchanged; a queue that accepts a run no consumer ever claims is reported
-  once per isolate rather than downgraded silently; and an oversized inline-body
-  payload is refused rather than truncated.
+### Patch Changes
 
-- b9ae314: Emit the Cloudflare background queue only when the app declares it, and refuse
-  at build time when it wants one and has none.
+- 62f694b: Add four new docs MDX components — `Notice`, `Banner`, `Accordion`, `Badge` — for content that doesn't belong in a `Cards` grid: a bold alert card, a page/section-top announcement strip, collapsed-by-default FAQ items, and a small status chip. Also fixes the `Steps`/`Cards`/`Comparison`/`Accordion` markdown parser to be fence-aware (a `###` inside a code sample no longer splits into a new item) and to round-trip items with a genuinely empty body, and teaches the docs' crawlable markdown mirror to render all seven docs-only block types as readable text instead of a raw JSON fence.
 
-  The queue emitter was the only one of the four Cloudflare emitters that was
-  unconditional, so from the release that added it every Cloudflare deploy needed
-  a queue and a `-dlq` to exist — including apps that never hand a run to the
-  background. They learned that from a `wrangler deploy` failure rather than from
-  anything they had configured.
+## 0.146.2
 
-  `CLOUDFLARE_BACKGROUND_QUEUE` now declares them, the way
-  `CLOUDFLARE_BROWSER_RENDERING` declares the Browser Rendering entitlement: the
-  queue name is still derived from the Worker's own name, so the variable carries
-  no id, only the fact that the resources exist. Unset means no `queues` key at
-  all in the generated config and a deploy that needs no queue.
+### Patch Changes
 
-  The two halves are not separable, and the second is the one that matters.
-  Simply skipping the emit for an app that still wants durable background runs
-  would leave a deployed Worker accepting background work and running it inline
-  under the foreground clamp — a silent runtime degrade traded for a loud deploy
-  failure, which is strictly worse. So that combination throws at build time,
-  before anything is deployed, naming the queue, the dead-letter queue, the two
-  `wrangler queues create` calls in the order wrangler accepts them, and
-  `AGENT_CHAT_DURABLE_BACKGROUND=false` as the other way out. "No queue
-  configured" and "queue configured and working" stay distinguishable states.
+- a107169: Fix PPTX/PDF import color and text fidelity: resolve theme/master colors (including `lumMod`/`lumOff`/`tint`/`shade` transforms) instead of defaulting to black, inherit per-level placeholder colors from the slide master, resolve each slide's own layout→master→theme chain instead of reusing the deck's first master (fixes wrong colors in presentations combining more than one template), recover per-run text colors and styles from PDF content streams instead of collapsing multi-color/multi-weight lines to a single style, treat a PDF's initial (unset) fill color as the known black default instead of an unresolved guess, preserve real PDF line spacing for bullet lists, bound concurrent PDF page image uploads, and fail clearly instead of silently importing a scanned/unrecoverable PDF as blank placeholder slides.
+- Updated dependencies [a107169]
+  - @agent-native/toolkit@0.13.5
 
-  Whether the app wants durable background runs is read through the existing
-  `isDurableBackgroundDeployEnabled()` gate rather than a second parse of the
-  flag, so the Cloudflare and Netlify emits cannot come to disagree about what
-  requesting it means. The raised `cpu_ms` ceiling stays unconditional: a Worker
-  with no queue runs its long turns inline, where it needs the ceiling more.
-  `CLOUDFLARE_BROWSER_RENDERING` and the new variable now share one toggle parse,
-  so an unrecognised value throws for both rather than being read as either
-  answer.
+## 0.146.1
 
-- 2c2f66d: Resolve the durable background handoff as one typed transport decision. A single
-  `resolveBackgroundDispatchTarget()` returns a `BackgroundDispatchTarget` union —
-  an HTTP function target, a queue target, and the portable in-process route —
-  carrying the runtime expectation alongside the transport, so the two agent-chat
-  dispatch call sites no longer re-derive host knowledge from the dispatch path
-  string. Netlify resolves to exactly the values it produced before; no behaviour
-  changes.
-- e5d6c95: Add the Host glossary at `packages/core/src/hosts/CONTEXT.md`, defining the
-  vocabulary of the host seam — Host, host adapter, background transport, dialect
-  capability, provider tier, fallback storage, seam allow-list — so a term used in
-  one adapter means the same thing in the next.
-- a33bb80: Give the Host ownership of how a process reaches a browser, and emit this
-  Host's Browser Rendering binding.
+### Patch Changes
 
-  Rendering a real DOM used to be decided at the call site, and a call site can
-  only see "the Chromium import threw". Every call site resolves that the same
-  way — it returns something the caller cannot tell from a render: an empty
-  screenshot, a blank page, an SVG with no nodes. On a Worker there is no Chromium
-  binary and nowhere to install one, so that is not an edge case there, it is
-  every render.
+- 6071f7d: Provision and reuse the connected Builder workspace project automatically for hosted Turn Into App requests.
+- 6071f7d: Compact agent sidebar shortcut hints and keep the sidebar's wider drawer as its only expand action.
+- 6071f7d: Make the serverless request-path migration skip opt-in via
+  `AGENT_NATIVE_RELEASE_MIGRATIONS`.
 
-  So the question is asked once. Hosts register a provider under
-  `browser-rendering` declaring their own consultation priority, exactly as
-  background transports and fallback-storage policies do.
-  `resolveBrowserRenderingDecision()` answers with a binding to render through, or
-  a refusal carrying the setup step that fixes it, or `null` for "no host claimed
-  this process" — which is the only case where launching a local browser is
-  correct. A refusal is deliberately a different value from `null`: answering one
-  with the other is what sends a Worker off to spawn a binary that is not there.
+  `runMigrations` skips schema work in a production serverless request runtime,
+  which is correct only for an app that migrates somewhere else. Exactly one of
+  seventeen templates has a release migration entrypoint. For the other sixteen,
+  an unconditional skip would not defer the work — it would delete it: a newly
+  added migration silently never applies, and a fresh deploy comes up with
+  missing tables. Nothing fails at the moment of the skip, so the first symptom
+  is a missing-table error in production, far from the cause.
 
-  The Cloudflare provider resolves the `BROWSER` binding, and tells an absent
-  binding apart from a malformed one because those send an operator to opposite
-  repairs. `CLOUDFLARE_BROWSER_BINDING_NAME` sits next to the code that reads it
-  and is re-exported from `deploy/build.ts` beside the D1 and R2 names.
+  An app now declares that it owns migrations at release time by setting
+  `AGENT_NATIVE_RELEASE_MIGRATIONS=1`. Analytics sets it in `netlify.toml`
+  alongside its `migrate:production` build step; every other app keeps its
+  existing behavior until it has one.
 
-  The build emits a `browser` binding when `CLOUDFLARE_BROWSER_RENDERING` asks for
-  one, and no `browser` key at all when it does not. Conditional like D1 and R2:
-  Browser Rendering is an entitlement rather than a resource, which makes it more
-  of a deploy prerequisite, not less — `wrangler deploy` rejects a binding the
-  account is not entitled to, so an unconditional emit would fail the deploy of
-  every app that never renders anything. With no resource id to derive from, the
-  variable declares intent; what stops it being a switch nobody flips is that a
-  Worker with no binding refuses by name at the first render, quoting both the
-  variable and the binding. An unrecognised value throws rather than being read as
-  either answer.
+  Note that the Netlify _build_ environment also sets `NETLIFY=true`, so the
+  release step itself looks like a serverless request to this guard — it works
+  only because the entrypoint claims duty through `withMigrationRuntime()`. A
+  migration entrypoint that forgets that wrapper silently no-ops at build time.
 
-  Also adds `dist/hosts/**` to this package's `sideEffects` allow-list. Host
-  registrations are reached through a side-effect-only import of the host barrel,
-  which a bundler honouring that allow-list is entitled to drop — and measurably
-  did: the Cloudflare background transport was absent from every emitted chunk of
-  a built Worker, so the seam resolved as "no host claimed this process" and a
-  durable background run went to the in-process route with nothing reporting it.
+## 0.146.0
 
-- 20a6b93: Give the Host ownership of fallback-storage policy, and add this Host's object
-  storage provider behind that seam.
+### Minor Changes
 
-  `uploadFile()` used to return `null` for three different facts — no provider is
-  configured, the credential store could not be read, and this deployment permits
-  no alternative store at all — and every caller resolved all three the same way,
-  by keeping the file body and writing it into SQL. A call site cannot answer that
-  question: whether a payload may be stored somewhere other than the store it was
-  meant for is a property of the Host.
+- c440e50: Add opt-in audience-specific instruction paths and make `agent-native.config.ts` the canonical typed config filename.
 
-  So it is asked once. Hosts register a policy under `hosts/fallback-storage`
-  declaring their own consultation priority, exactly as background transports do,
-  and a refusal carries the setup step that fixes it rather than only a "no".
-  Cloudflare Workers refuse — the database there is D1 — and a portable baseline
-  refuses for any unrecognised process running against a persistent `DATABASE_URL`
-  or in production, so an unrecognised deployment is never the reason a payload
-  reaches SQL. A local run against a local database still gets the documented
-  capped fallback.
+### Patch Changes
 
-  `uploadFile()` now returns `null` for exactly one condition: no provider is
-  configured AND this host permits the caller to store the payload elsewhere. The
-  other two are typed throws — `FileUploadStorageNotConfiguredError`, carrying
-  `.setup`, and `FileUploadProviderUnreadableError`, which is raised instead of
-  reporting "not configured" when a credential lookup failed. The two `catch {}`
-  blocks that coerced a failed lookup into "unavailable" are gone;
-  `resolveFileUploadProviderForRequest()` reports `provider` / `absent` /
-  `unreadable` as distinct results. Chat attachment pre-upload no longer recovers
-  a refusal by keeping the base64 payload on a message that is about to be
-  persisted, and the resource upload, file-upload and upload-image surfaces report
-  the store's own setup guidance instead of a hardcoded connect-Builder line.
+- c440e50: Stop a refused database connection from immediately producing another attempt.
 
-  Adds `cloudflareR2FileUploadProvider`, registered by the Cloudflare host adapter
-  and reporting itself unconfigured anywhere else. It writes through the `UPLOADS`
-  binding and resolves the bucket's public origin through `resolveSecret`, the
-  single reader for app-provided deploy configuration. It resolves that origin
-  _before_ the put: an object stored under a URL that resolves to nothing is a
-  dangling upload every layer above reads as a success. Object keys are a random
-  UUID plus the extension, never the filename or owner, because the bucket is
-  world-readable by construction and the key is what protects the object.
+  Neon rejects a connection _attempt_, not a connection: "Failed to acquire
+  permit to connect to the database. Too many database connection attempts are
+  currently ongoing." A failed acquire leaves the pool with zero idle clients, so
+  the next `execute()` calls `connect()` again — and `retryOnConnectionError`
+  backs off only 100ms. The process answered each refusal by manufacturing the
+  next attempt, which is what kept the refusal true; production stayed wedged
+  until the compute was restarted by hand.
 
-  The build emits an `r2_buckets` binding when `CLOUDFLARE_R2_BUCKET_NAME` is set,
-  and nothing at all when it is not — modelled on the D1 emitter. An
-  unconditional binding would make a bucket a prerequisite for every Cloudflare
-  deploy, discovered from a `wrangler deploy` failure rather than from anything
-  the app configured. Uploads fail closed at runtime with setup guidance instead.
+  Every Neon pool now passes through `guardNeonPool` (renamed from
+  `attachNeonPoolErrorLogger`), which holds a short jittered per-endpoint
+  cooldown after a failed attempt. Checking out an already-idle client is not an
+  attempt and still succeeds, so a cooldown degrades throughput instead of taking
+  a warm instance offline. `DbConnectCooldownError` is deliberately not
+  classified as a connection error, so the retry loop exits instead of re-entering
+  the storm, and it reads as transient so shed load surfaces as 503 rather than 500. Tune with `DB_CONNECT_COOLDOWN_MS`.
 
-- a12f7f9: Emit one `/assets/**` immutable-cache route rule instead of one per hashed asset, so the generated `_headers` stays inside Cloudflare's 100-rule limit at any asset count. Enumerating each asset produced a file `wrangler deploy` rejects outright, which `wrangler dev` only warns about. Non-hashed files under `/assets/` are now covered by that rule and are reported at build time.
-- bef7405: Add the combined cold-isolate Init Memo: `createInitMemo` wraps a one-time
-  schema-init routine and, on Workers, lets a second caller learn how the first
-  attempt ended by polling an `InitState` flag rather than awaiting a promise that
-  belongs to another request.
+  The added `url` argument makes any pool that skips the gate a compile error
+  rather than a silent bypass.
 
-  This is one mechanism, not two. The seam — a callable returning `Promise<void>`
-  with a `reset()` — is the one the store refactor adopted; the policy inside it is
-  the measured one from `cross-request-init.ts`: the request that starts the work
-  holds it open with its own `waitUntil`, everyone else polls a flag on timers they
-  own, backing off toward a ceiling.
+- c440e50: Offer local source-code handoffs to external coding agents instead of the Builder waitlist.
 
-  A waiter can tell "still running" from "ran and failed": a failed attempt sets
-  `error` on the flag, so the waiter raises that error instead of waiting out the
-  deadline, and the attempt is dropped rather than memoized — one transient DDL
-  failure is no longer replayed to every later caller for the isolate's life. The
-  memo takes an optional h3 event so the caller that starts the work can hand it to
-  its own keep-alive; existing call sites are unaffected.
+## 0.145.8
 
-- 0ebd8af: Stop a background turn from minting an unclaimed recovery successor on every
-  `/runs/active` poll. On a dialect without interactive transactions (D1) the
-  stale-run reaper inserted the successor before, and independently of, the
-  conditional reap UPDATE, so a run that was still heartbeating — or already
-  terminal — accumulated one extra `agent_runs` row and queue message per poll
-  until the 25-run per-turn ledger cap. The reap now decides first on every
-  dialect, and only a run it actually terminalised is recovered; a genuinely
-  lost handoff is still reaped and redispatched exactly as before.
+### Patch Changes
+
+- c497c85: Stop running schema migrations on the serverless request path, and name every
+  database connection.
+
+  `runMigrations` now returns early in a production serverless request runtime.
+  The guard lives in the shared runner rather than at each call site: the
+  analytics template guarded its own runner, but `org`, `context-xray`, and
+  `observational-memory` kept calling `runMigrations` unguarded, so the
+  cold-start probe storm survived the fix meant to end it. Measured in
+  production: the schema snapshot alone costs 5.5-8.6s on a 180-table database,
+  with 4-6 copies running concurrently under load — and when it times out,
+  `ddl-guard` falls back to a per-object probe across ~390 call sites, so
+  starvation multiplies its own query count.
+
+  A scheduled or background runtime claims migration duty through
+  `withMigrationRuntime()`, and `runInServerlessRequest: true` remains the
+  explicit opt-in for a caller that cannot defer. The database client also
+  rejects unguarded schema DDL from production functions, so a new `ensureTable`
+  path fails loudly instead of quietly reintroducing the incident.
+
+  Better Auth table creation now lives in the framework's release migration
+  entrypoint, and Analytics' production deploy runs its framework and template
+  migrations once during the release build. No production request needs an
+  environment variable to skip schema work.
+
+  Postgres pools now set `application_name`. Every backend previously reported
+  `pgbouncer`, which made a 58 MB `SELECT id, config FROM dashboards` running
+  20-wide against production impossible to attribute — it appears nowhere in the
+  repo or any built bundle, and `pg_stat_statements` is not installed.
+
+- c497c85: Use layout-matching skeleton placeholders for shared settings loading states.
+
+## 0.145.7
+
+### Patch Changes
+
+- 25e1bcf: Reset the poll backoff when sync health-gates from the hosted gateway to local. The failure count earned against an unreachable gateway was carried into local mode, delaying the first local poll by up to 8 minutes even though the app's own origin was reachable.
+
+## 0.145.6
+
+### Patch Changes
+
+- 1d5bab1: Keep the chat and prompt composer visible while assistant-ui recovers from a transient render error.
+- 1d5bab1: Stop cold-started processes from replaying the entire durable action-marker
+  history. `seedVersionFromDb` rewound the marker watermark to `0` so a marker
+  written just before boot still reached the first poll, but the replay filter is
+  `updated_at > watermark` and the `__action_change__` table is one never-pruned
+  row per identity that has ever run a mutating action — so every boot re-emitted
+  all of it. On one production app that was 2,188 rows replayed ~32 times a
+  minute: 1,169 sync events/sec against ~1.7/sec of real traffic, and a 47 GB
+  `sync_events` table. The rewind is now bounded to a 60-second replay window,
+  which preserves its purpose, and the marker read is bounded by the same
+  watermark instead of selecting the whole table.
+
+  Also enables `deterministicEventIds` for the default sync state so concurrent
+  processes detecting the same external write collapse via `ON CONFLICT (id) DO
+NOTHING`, and keys the action-marker dedupe on each row's own `updated_at`
+  rather than the table-wide maximum. That mechanism defaulted off and was never
+  set anywhere, so every `dedupeKey` in the poll path had been inert.
+
+  `manage-agent-engine` now classifies `test` and `get-app-default` as reads
+  alongside `list`, so those calls no longer announce a change.
+
+- 1d5bab1: Fix MCP integration logos so every catalog entry uses a real mark and dark marks stay legible.
+- 1d5bab1: Accept OAuth client metadata documents that advertise additional extension grant types, including Claude's JWT bearer grant, while preserving the server's authorization-code flow.
+- 1d5bab1: Stop the chat client from durably aborting background runs that are still
+  working.
+
+  The kill verdict was rendered against a `/runs/active` snapshot fetched
+  _before_ the SSE attach that had just blocked for its whole duration, so any
+  progress that landed during the attach was invisible to the decision. Fleet
+  data: 23 of 24 client-watchdog kills hit runs that had made server-authoritative
+  progress within the previous 90 seconds. The client now takes a second reading
+  after the attach, and only on the path that would otherwise condemn the run —
+  the healthy path pays nothing.
+
+  A failed or unparseable `/runs/active` poll no longer counts as "no active run".
+  Unreadable and absent were the same value, and the absent branch reached the
+  durable abort without consulting progress at all, so one flaky tick could end a
+  live turn.
+
+  A model-stream retry the user waited through is now narrated instead of silently
+  wiping the transcript. Three 90-second retries used to blank the screen at 92s,
+  182s, and 272s with no explanation — the shape people report as "the chat froze".
+  Fast provider blips stay silent.
+
+- 1d5bab1: Add an opt-in database-pressure reading to `/_agent-native/health?pressure=1`.
+  The route reports the three `pg_stat_activity` signals that preceded the
+  2026-08-06 analytics outage — idle-in-transaction pileup, slow trivial queries,
+  and one query stampeding — so a scheduled fleet audit can watch them without
+  holding any production database credential of its own. A dialect or connection
+  that cannot answer reports `measured: false` with a reason rather than a clean
+  zero, and pressure never changes `ready` or the response status.
+- 1d5bab1: Preserve incomplete provider-corpus coverage when a paginated search stops at a page cap.
+- 1d5bab1: Preserve OAuth authentication for legacy MCP endpoint configurations.
+- 1d5bab1: Keep the magic-link onboarding form as the default view when outbound email is ready, while preserving explicit password sign-in fallbacks.
+- 1d5bab1: Keep inline help affordances visually subordinate to the text they explain.
+- 1d5bab1: Paginate long organization member lists in settings.
+- 1d5bab1: Add shared production configuration diagnostics, deploy guidance, and an
+  in-app warning chip with a copyable AI remediation prompt. Agent-Native app
+  configuration now supports deep-merged runtime requirements and typed
+  `agent-native.ts` aliases alongside `agent-native.json`.
+- 1d5bab1: Fix the `sync_events` retention prune, which planned as a sequential scan of
+  the entire table. It now deletes by the already-indexed `version` column
+  (monotonic epoch milliseconds) in bounded batches, oldest first, and reports a
+  failure instead of swallowing it. On one production app the old statement was
+  scanning a 47 GB table roughly 60 times concurrently, and a prune that never
+  succeeded was indistinguishable from one with nothing to do.
+- 1d5bab1: Polish streaming tool-call motion so new calls fade in, retained rows slide with
+  the stack, and older calls visibly settle into the collapsed tool summary.
+- 1d5bab1: Add a keyboard-accessible 75% chat drawer while keeping the app layout stable.
+
+## 0.145.5
+
+### Patch Changes
+
+- da40677: Fix realtime voice tool calls failing with "Invalid or expired realtime voice capability" on serverless deploys. The capability minted by `/_agent-native/realtime-voice/session` lived in a per-process `Map`, so under `NITRO_PRESET=netlify` a tool call that landed on a different instance than the SDP request was rejected — the agent would report that it could not read the current selection and ask the user to reopen the editor. The capability is now an HMAC-signed token carrying the caller's identity, browser tab, and allowed tool names, so any instance can verify it.
+
+  Two behavior changes follow from that. The grant no longer slides on use — it cannot be extended server-side — so its TTL is now an absolute 75 minutes, covering the provider's maximum session length. And when a `tool-search` widens the manifest, the tool response carries a re-issued capability that the client adopts; without it, calls to the newly discovered tools would 404.
+
+  Fix dictation stopping instantly with no error anywhere. `SpeechRecognition` always fires `end` after `error`, and `useVoiceDictation`'s `end` handler returned the composer to idle — erasing the message `onerror` had just set. Every speech failure was therefore invisible in both the UI and the console. `end` no longer overwrites a reported error.
+
+  Dictation also survives browsers that ship `SpeechRecognition` without a speech backend. Brave exposes `webkitSpeechRecognition` but removed the Google service behind it, so `auto` mode selected a recognizer that can only ever fail with `network`. In `auto` mode a recognizer that produced no text — because it failed, or because it ended before the microphone opened — now falls back to the MediaRecorder upload path. Permission and device errors are excluded, since retrying those through another provider fails identically. A mid-session drop that already captured speech keeps the transcript rather than failing over.
+
+  The amplitude meter's own `getUserMedia` also moved to after recognition claims the microphone, since taking the device first can make Chrome abort the session.
+
+- Updated dependencies [da40677]
+  - @agent-native/toolkit@0.13.4
+
+## 0.145.4
+
+### Patch Changes
+
+- db62d66: Fix `frameworkTools` silently ignoring eight of its own switches.
+
+  `sharing`, `review`, `history`, `featureFlags`, `localization`, `contextXray`, `userProfile`, and `audit` are removed by `filterFrameworkToolGroups`, which matched on `ActionEntry.frameworkGroup`. That tag is written in exactly one place — `mergeCoreSharingActions` — and the plugin calls it against `httpActions`, the registry documented as deliberately ungated so the UI keeps working. So the tag never reached the agent registry: any app loading core kits through `loadActionsFromStaticRegistry` or its own actions directory held untagged entries, and setting those eight groups to `false` did nothing. The other groups (`database`, `extensions`, `automation`, `docs`, `resources`, `web`, `workspaceApps`, `chat`, `email`) were unaffected — they are gated at construction, where the registry is built empty.
+
+  Group membership now resolves by name first and tag second (`resolveFrameworkGroup`), so a switch works no matter how the action was registered. `CORE_ACTION_GROUPS` moves to `framework-tools.ts` (still re-exported from `action-discovery.ts`) so the filter can read it without an import cycle; the `frameworkGroup` stamp stays as a pre-resolved copy but nothing depends on it any more.
+
+  The same tag dependency broke `resolveInitialToolNames`, which excludes framework kits from the DEFAULT first-request tool list — untagged apps were promoting ~45 framework schemas into every first request. Fixed by the same change.
+
+  Guard tests cover both consumers using deliberately **untagged** fixtures built from `CORE_ACTION_GROUPS`, since the previous tests hand-stamped `frameworkGroup` and so passed against inputs no real app produced. They also assert an app action that merely resembles a kit name (`share-portfolio` under `sharing: false`) is left alone.
+
+- db62d66: Accept Client ID Metadata documents that advertise grant types beyond `authorization_code`/`refresh_token`. The MCP OAuth client-metadata validator rejected the whole document when it listed any other grant — so Claude.ai, whose CIMD document also lists `urn:ietf:params:oauth:grant-type:jwt-bearer`, could not connect at all. Only the length/shape of `grant_types` is validated now; the token endpoint already honors just `authorization_code` and `refresh_token` regardless of what the document declares.
+- db62d66: Consolidate every MCP setting on `createAgentChatPlugin` under one `mcp: {}` option, and add `mcp.catalog: "app"`.
+
+  `mcp` accepts `enabled`, `catalog`, `connectorCatalog`, `externalAgents`, `builtinCrossAppTools`, `title`, `description`, `websiteUrl`, and `icons`. The top-level `disableMcp`, `mcpServerInfo`, `connectorCatalog`, and `externalAgents` stay accepted for one minor and are deprecated; the nested value wins, and setting both forms to disagreeing values throws at plugin init rather than booting an app with an MCP surface nobody chose (same contract as `resolveFrameworkTools`). `disableMcp: true` and `mcp.enabled: false` are normalized as inverses, so a correctly migrated app is not read as a conflict.
+
+  Two behavior fixes come with it:
+  - `builtinCrossAppTools` had no route through the plugin at all — it was reachable only by calling `mountMCP` directly. That is why `frameworkTools: "minimal"` and `workspaceApps: false` could never remove the cross-app builtins (`list_apps`, `open_app`, `ask_app`, `ask_app_status`, `create_embed_session`, `create_workspace_app`, `list_templates`) from an app using the normal plugin entry point: the MCP layer merges them downstream of the `frameworkTools` filter. `mcp.builtinCrossAppTools: false` is now the switch.
+  - A2A read the connector policy straight off the raw plugin options, so `mcp.connectorCatalog` would have narrowed the MCP surface while A2A kept serving the old one. `filterDirectA2AActions` / `buildAuthenticatedAgentA2ASkills` now take the resolved shape, so the two external surfaces cannot diverge.
+
+  `mcp.catalog: "app"` serves external callers exactly the app's own tool registry, flat — the same actions the in-app agent holds, with no cross-app builtins, no `ask-agent`, no `tool-search`, and no compact/connector trimming. `externalAgents.denyActions` and the OAuth scope filter still apply, since both are explicit removals rather than catalog tiering, and the dev-open surface split is unchanged (an unauthenticated loopback probe still gets `actions`, not `productionActions`). Weigh the token cost before setting it: an app registering ~100 actions puts every schema in the caller's context on `tools/list`, which is what the compact default exists to avoid.
+
+  Also folds the per-tier `tools/call` gate into one rule — the advertised set is the callable surface on every tier except the explicit `--full-catalog` opt-in — so adding a tier can no longer default to "everything callable" by omission.
+
+  `tool-search` is fixed on both ends over MCP. It is dropped entirely from every flat catalog (`mcp.catalog: "app"` and the `--full-catalog` opt-in), where every tool is already listed beside it and it could only describe its own neighbours. On the trimmed catalogs, where it does earn its place, it is now scoped to the advertised set: previously it closed over the app's whole registry while `tools/call` accepted only the advertised subset, so it answered with names that came straight back as "Unknown tool". `attachToolSearch`, `searchToolRegistry`, `createToolSearchEntry`, `TOOL_SEARCH_ACTION_NAME`, `resolveFrameworkTools`, `filterFrameworkToolGroups`, and `frameworkGroupEnabled` are now exported from `@agent-native/core/server`, so a standalone `mountMCP` plugin can compose the same surface the agent-chat plugin does instead of hand-rolling a copy that drifts.
+
+## 0.145.3
+
+### Patch Changes
+
 - c2b7f82: Bound how long a hosted realtime stream can outlive the session that authorized it. Subscribe tokens now carry an optional `absExp` ceiling that `verifyRealtimeSubscribeToken` enforces independently of `exp` (rejecting with `session_expired`), and the mint endpoint sets it to 15 minutes. The gateway re-signs a stream's token every few minutes without consulting the app, so previously one mint could be extended indefinitely and logout, session expiry, user deletion or org removal never reached an open stream. Rotation must copy `absExp` verbatim and refuse to rotate past it.
 
   `AppSyncStateOptions` also gains `accessAllowTtlMs` (default 30s). `invalidateCollabAccessCache` only reaches the in-process default instance, so a gateway holding per-app instances cannot be told a share was revoked and keeps serving its cached ALLOW until the TTL lapses; a shorter value bounds that window at the cost of more `can-see` round-trips.
-
-- a1311d7: Stop the run registry answering for a run whose originating request has gone away.
-
-  `activeRuns` is isolate-global, but a run's execution belongs to the request
-  context that started it. On Workers that context is cancelled independently of
-  the isolate, taking the run's timers, its promise continuations and its terminal
-  persistence with it — and leaving the map entry reading `running` forever. Both
-  readers of that entry treated its presence as proof this isolate was still
-  producing it: an SSE subscriber attached to a buffer that would never be written
-  to again and pinged indefinitely, and `/runs/active` reported
-  `heartbeatAt: Date.now()` — asserted, not read — which is fresher than the
-  durable heartbeat and so overrode the stale-run detection that was about to
-  terminalise the row.
-
-  A run now stamps `lastProducerTickAt` from inside its own heartbeat timer, and
-  `resolveRunProducerState` classifies an entry as `terminal`, `in-flight` or
-  `producer-lost` — three states, because folding the third into `in-flight`
-  reports liveness that is not there and folding it into `terminal` reports an
-  outcome that never happened. A `producer-lost` entry is not answered from
-  memory: subscription falls through to the durable path and `/runs/active`
-  reports SQL's heartbeat. Nothing local is synthesised, because knowing the
-  producer is gone is not knowing how the run ended. `abortRun` likewise reports
-  `false` for such an entry — it still drops it, but nothing there was executing,
-  and the durable marker is what stops the run.
-
-  New export subpath `@agent-native/core/agent/run-producer-state`, carrying the
-  classifier and its two constants.
-
-  Cloudflare-Workers detection in the database client now calls the shared
-  `isCloudflareRuntime()` rather than a second, narrower copy that omitted the
-  `__env__` global — that copy could take the pooled Node path on a Workers
-  deploy and share a connection across requests.
-
-- e517dcc: Keep the `/_agent-native/events` stream from reading as a hung handler. The SSE
-  endpoint opened and emitted nothing until a DB change arrived, so on Workers
-  the runtime cancelled the request as hung — which under `wrangler dev` surfaced
-  to the dev proxy as "Network connection lost" and killed the whole server,
-  taking any in-flight background agent run with it. The stream now emits a named
-  `keep-alive` frame immediately and every 15s; being a named event, it never
-  reaches the client's `onmessage`.
-- 834ac94: Apply the Cloudflare post-build patches to every emitted chunk, at any depth, so
-  a Worker whose framework code lands in a nested chunk can boot.
-
-  The pass walked three hardcoded directories — the server dir, `_chunks/` and
-  `_libs/` — with a one-level `readdirSync`, skipping any entry that did not end
-  `.mjs`/`.js`. Nitro names an externalised package chunk after the package, so a
-  scoped one lands at `_libs/@agent-native/framework.mjs`: the walk saw
-  `@agent-native` as a directory entry, failed the extension test, and patched
-  none of the files beneath it. The `node:` builtin prefixing, the
-  `import.meta.url` replacement and the global-scope timer shim all reached zero
-  of the chunks that needed them, and the pass logged the same success line it
-  logs when there is nothing to do. workerd then refused the Worker with
-  `Disallowed operation called within global scope`, naming a timer the build had
-  already shipped a shim for.
-
-  The walk is now recursive and every rewritten specifier is computed with
-  `path.relative` from the file being rewritten, replacing the two depths the
-  stub pass assumed (`./stub.mjs` from `_libs/`, `../_libs/stub.mjs` from
-  `_chunks/`) — both wrong for a chunk one level deeper. The pass returns what it
-  scanned, patched and stubbed, and fails outright when the output directory it
-  was pointed at holds no chunks at all, because "patched nothing" and "there was
-  nothing to patch" were previously the same log line.
-
-  `postgres` joins the modules a surviving bare specifier is rewritten to a
-  fail-closed stub for. It is an optional peer that core imports lazily, and an
-  app that correctly omits it got `No such module "_libs/postgres"` at startup
-  instead. The rewrite now covers the dynamic `import("x")` form as well as
-  `from"x"`, which is the form a lazily imported peer actually takes. The stub
-  still throws on use: a Worker reaching it has a live caller, and an empty
-  result would be indistinguishable from the capability working and finding
-  nothing.
-
-- f2fe0b3: Validate agent tool input on runtimes that forbid code generation from strings
-
-  Ajv compiles a schema by building JavaScript source and handing it to
-  `new Function`. Cloudflare Workers refuse that, so on a Worker every
-  `ajv.compile` in the agent loop threw and every tool call was rejected before it
-  ran with "tool schema is invalid: Code generation from strings disallowed for
-  this context" — the agent could talk but could not do anything.
-
-  Both Ajv instances in the agent loop now go through one compile seam that
-  selects on the capability rather than on the host: it probes whether the runtime
-  allows code generation, and where it does not, interprets the schema with
-  `@cfworker/json-schema` instead. Where `new Function` works, Ajv is used exactly
-  as before — same options, same `ErrorObject`s, same error text, same union
-  narrowing.
-
-  The interpreted path reproduces Ajv's `coerceTypes` scalar coercion, in place,
-  so a model sending `"3"` for a number is accepted on both. It also checks the
-  schema structurally before use, because the interpreter would otherwise ignore a
-  malformed keyword and then accept everything — turning "this schema is
-  unreadable" into "this input is fine". Error wording differs between the two
-  paths; the accept/reject decision and the coerced value do not, and a parity
-  spec runs the same schemas and inputs through both to keep it that way.
-
-  The seam is exported as `@agent-native/core/agent/json-schema-validator` so a
-  host can ask the core it actually loaded whether it has this capability, rather
-  than inferring it from a version number.
-
-- d583f7d: Keep the `@agent-native/*` packages in one chunk for Worker and Deno output, so
-  an app that installs more than one of them from `node_modules` can boot.
-
-  Nitro declares one Rolldown code-splitting group per installed package and then
-  lets Rolldown merge those groups down to far fewer physical chunks. Two
-  framework packages that share a dependency land on opposite sides of a merge —
-  one chunk holding zod, the other drizzle-orm — and import each other across the
-  chunk boundary. The module linker evaluates one side of that cycle first, so a
-  module-scope read of the other side throws `Cannot access 'X' before
-initialization` and workerd refuses to start the Worker. Nothing earlier in the
-  pipeline notices: install, resolution, bundling and the size check all pass.
-  Workspace sources never match the group's `test`, so this appears only once an
-  app consumes the packages from `node_modules`, and only once it consumes two.
-
-  `codeSplitting` is the option that governs this. Rolldown ignores
-  `advancedChunks` whenever `codeSplitting` is set, and Nitro always sets it, so
-  reaching for `advancedChunks` changes nothing and only logs a warning.
-
-  The group is scoped to `@agent-native/*` rather than to all of `node_modules`.
-  One chunk for every installed package also removes the cycle, but it drags
-  lazily imported third-party packages into the eagerly evaluated chunk, and their
-  module-scope `require("node:...")` then runs during startup — trading this
-  failure for `No such module` at boot.
-
-  A build that would reintroduce a cycle now fails with the names of the chunks
-  involved rather than producing a bundle that only fails at boot. The
-  `noExternals` value passed for these presets is documented as inert where it is
-  inert: Worker and Deno presets run with `node: false`, and Nitro only installs
-  its externals plugin when `node` is true, so nothing in that output is a Nitro
-  external and nothing reads that value.
-
-  Note for apps that post-process the Worker output: the framework packages now
-  land in `_libs/@agent-native/framework.mjs` instead of one file per package.
-
-## 0.134.0-paul.2
-
-### Minor Changes
-
-- fe48d97: Add `agent-native connect <url> --bearer`, which mints a connect token through the existing device-code flow and writes it as an explicit bearer for every selected client, including the OAuth-capable ones that plain `connect` hands a URL-only entry. One browser approval — which may happen on a different machine — authenticates a headless VPS, CI runner, or container with no in-agent OAuth step and no pasted long-lived token. Plain `connect` is unchanged: OAuth-capable clients still get URL-only entries, which remains the better path wherever a browser exists. `--bearer` prints one stderr line saying a long-lived bearer was written and that OAuth is preferred where a browser exists; there is no confirmation prompt and no justification field. An approval that returns no token — a deployment running in open local-dev mode answers with an owner identity instead of a bearer — is refused rather than stored as an empty credential. Connect requests now send an explicit User-Agent, because the edge proxy in front of at least one deployment rejects a default scripting-library agent string in a way that reads exactly like the connect route being disabled; a proxy refusal of the unauthenticated connect route now says so instead of suggesting the feature is off.
-- 440e2ab: Add `agent-native vault add KEY "description" [--app NAME]`, which stores one
-  secret in a workspace vault with its value read from a prompt that does not
-  echo. The value is never an argument: there is no value flag and a third
-  positional is refused, so the secret cannot reach this process's argv where
-  another local user reading the process table would see it, and it never lands
-  in shell history. The prompt ends on Enter rather than on an end-of-file
-  keystroke, so terminals that cannot send one still work, and standard input
-  ending before a value is entered is a loud refusal rather than an empty secret
-  — exit `74`, kept distinct from the `64` that means the command itself was
-  malformed.
-
-  Like `list`, it calls the workspace action — `create-vault-secret` — over HTTP
-  with the connect bearer the machine already holds, and takes the deployment as
-  an argument on the subcommand. No value reaches stdout or stderr on any path:
-  the confirmation names only the key, and the type carrying the deployment's
-  reply has no field for a value even though the action answers with the stored
-  row.
-
-- bb7058f: Add `agent-native vault env --key KEY [--key KEY...] [--app NAME]`, which leases
-  workspace vault secrets and prints them as shell assignments, so a long-lived
-  process an operator did not launch — and cannot relaunch — can still receive
-  them. It leases through the same call as `vault exec`, so it produces the same
-  audit record: it is not a second way to reach a secret, only the same lease with
-  a different output shape. The lease id is exported alongside the values as
-  `AGENT_NATIVE_VAULT_LEASE`, and only the assignments reach stdout, so every
-  notice stays out of the sourced output.
-
-  The command states plainly, in `--help` and on stderr at the moment it runs,
-  that it is weaker than running a child process: the values last as long as the
-  shell that sourced them and are inherited by everything it starts. A credential
-  key that is not a valid shell variable name is refused before a lease is spent
-  rather than emitted as a line that would break whatever sources it. `vault exec`
-  is unchanged.
-
-- 00fdc7f: Add `agent-native vault list [--app NAME]`, which prints the credential keys and
-  display names of the secrets in a workspace vault and never a value — not even a
-  masked preview — so seeing what is available cannot put a credential in a
-  transcript. It calls `list-vault-secrets` over HTTP with the connect bearer the
-  machine already holds, discovered through the CLI's existing multi-client,
-  multi-scope scan, and takes the deployment as an argument so one installation
-  serves every connected app. This opens the vault subcommand dispatch point:
-  `exec` behaves exactly as before, and an unknown subcommand still exits `64`.
-
-  Every vault call now goes out through one request path, so the explicit
-  `User-Agent` — load-bearing, because the edge proxy in front of at least one
-  deployment rejects a default runtime agent string with an error that reads like
-  a disabled route — is sent by `vault exec`'s lease call as well.
-
-### Patch Changes
-
-- df8bafe: Let a deployment name its MCP server with `MCP_SERVER_NAME`.
-
-  The connect page, the copyable client config and device-flow grants all report a
-  server id that defaulted to `agent-native-<first label of the hostname>`. The
-  only way to change it was `createCoreRoutesPlugin({ mcpConnectServerName })`,
-  which a deployment consuming a pre-composed core-routes plugin cannot reach —
-  recomposing it would need that package's own private options — so such
-  deployments could not rename their MCP server at all.
-
-  `MCP_SERVER_NAME` now fills in when no explicit option was passed. Precedence is
-  explicit option, then env, then the derived default: an app that named its server
-  in code keeps that name, so a deployment-wide variable cannot silently take it
-  over.
-
-  `mcpConnectAppName` already had an equivalent escape hatch — core-routes falls
-  back to `getAppName()`, which reads `APP_NAME` — so the human-readable app name
-  needed no change.
-
-- 0e4ee8b: Fix cold-isolate 404s and 503s on Cloudflare Workers deploys.
-
-  Framework bootstrap and plugin inits started at isolate scope and were memoized
-  as isolate-global promises that every concurrent request awaited. On Workers a
-  promise belongs to the request context that created it, so once the request that
-  warmed the isolate answered, workerd canceled the continuations the other
-  in-flight requests were parked on. A concurrent burst against a cold isolate came
-  back as a mix of 200s, no-match 404s (routes the canceled init never registered)
-  and 503s at the readiness deadline; `/_agent-native/*` and `/mcp` were affected
-  alike.
-
-  On Workers, bootstrap and tracked plugin inits now start inside a real request
-  context under that request's `waitUntil`, and waiting requests observe completion
-  flags they poll in their own context instead of awaiting a foreign promise. Node
-  keeps the existing shared-promise path.
-
-  `trackPluginInit(nitroApp, init, …)` now accepts a thunk (`() => Promise<void>`)
-  as well as a promise, and plugin authors should pass a thunk — that is what lets
-  the framework choose where the init runs and re-run it after a failure. Passing a
-  promise still works.
-
-  Two further cold-isolate 404 sources are closed. Request-time readiness no
-  longer waits only for the plugin inits whose declared `paths` match the request:
-  `paths` says where a plugin registers its own routes, which is a different
-  question from which plugin owns the route being requested — `/mcp` is mounted by
-  the agent-chat init while `/mcp/oauth` is mounted by core-routes, so a `/mcp`
-  request was released as soon as core-routes finished and 404'd a handler that was
-  still being mounted. On Workers every gated request now waits for every tracked
-  init (they all run concurrently on a cold isolate, so the wall-clock cost is
-  unchanged); Node keeps its existing scoped behaviour.
-
-  And a gated prefix no longer answers a bare 404 while the isolate cannot prove
-  its init finished: `/_agent-native/*`, `/mcp/*` and `/.well-known/*` fall through
-  to a guard that reports a retryable 503 naming the unfinished inits. A route that
-  genuinely does not exist still 404s.
-
-  Readiness is derived from init state — a clean bootstrap plus every tracked init
-  having settled, counted cumulatively — rather than from a flag some request sets
-  when it is released. Both alternatives failed in production: the live entry list
-  is pruned as entries settle, so "nothing pending" also reads true before anything
-  was ever recorded, and a release-time flag stopped being set at all once requests
-  gained an earlier way out, which stranded gated paths that no mount claims (the
-  auth guard, a global middleware, is what answers `/_agent-native/config`) until
-  the readiness deadline expired.
-
-  Two things make the init guard reliable. It no longer steps aside when a route
-  matched — on an SSR app h3 resolves the catch-all for `/mcp` and the app's own
-  404 page answers, which is not a framework answer at all. And readiness is now a
-  positive record rather than an inference: tracked entries are pruned once they
-  settle, so "nothing pending" could equally mean "nothing was ever recorded", and
-  a request arriving before the bookkeeping existed read the second as the first.
-  An isolate that has never completed a readiness pass must also find the requested
-  route actually registered before the gate releases it.
-  This matters most for MCP clients, which make a handful of discovery and
-  handshake calls without retrying, so one 404 on `/mcp` or
-  `/.well-known/oauth-authorization-server` drops the connection outright.
-
-  Waiting is also narrowed and cheapened. A gated request is released as soon as a
-  route matching its own path is registered, even while other inits are still
-  running — no other plugin can un-register it, and holding on serialised every
-  gated request on a cold isolate behind the slowest plugin in the app. That is
-  evidence (the route exists) rather than the declared-`paths` guess that
-  under-waited before. And waiters now back off from 10ms toward 100ms instead of
-  polling flat: a waiter polls inside the isolate it is waiting on, so nine parked
-  requests at 10ms spent ~22,500 wakeups over a 25s deadline competing for the CPU
-  the init needed — which is why raising the deadline made cold starts measurably
-  worse rather than better.
-
-  Also: a bootstrap or Better Auth init that fails once no longer poisons the
-  instance for its whole lifetime (the memo is cleared and the attempt retried,
-  bounded), and a Better Auth init failure now surfaces as a retryable 503 on
-  `/_agent-native/auth` instead of a bare 404 — `autoMountAuth` still returns true
-  for the locked-app fallback, and the new `getAuthMountFailure(app)` reports that
-  the mount is incomplete.
-
-- 0276138: Serve gated routes whose mount lands after the request was dispatched.
-
-  The readiness gate releases a request on completion flags, and h3 snapshots the
-  middleware list immediately afterwards. On a cold Cloudflare isolate the flags
-  went to `bootstrap=ready pending=[] failed=[]` while mounting was still running:
-  a `/mcp` request measured a 0ms readiness wait and was then dispatched against a
-  list missing 298 of the isolate's mounts, `/mcp` among them. Concurrent bursts
-  put 5 of 8 `/mcp` calls into a bare 404 this way, which drops an MCP client
-  outright.
-
-  The framework init guard now waits — bounded by mount progress, not just the
-  readiness deadline — for a mount that covers the requested path, then runs the
-  mounts that were registered after the snapshot. It also recovers a gated path
-  that Nitro's asset/SSR catch-all already answered with a bare 404, which is how
-  `/.well-known/agent-card.json` failed without ever reaching the "no route
-  matched" path. A framework mount's own 404 is left alone, so an action that
-  legitimately finds nothing is never re-run.
-
-  `registerMiddleware` also invalidates h3's memoized dispatcher and composed
-  chain, which until now only h3's own `use()` did.
-
-## 0.134.0-paul.1
-
-### Patch Changes
-
-- 014813e: Fix `agent-native connect` reading a Codex config back as having no auth headers when `http_headers` is expressed as a `[mcp_servers.<name>.http_headers]` sub-table rather than an inline table. The block reader stopped at the sub-table header, so the headers were never even collected, and `connect dev`/`connect prod` silently dropped the bearer when saving and restoring the production entry. `connect.ts` now uses the shared MCP config readers in `mcp-config-writers.ts` instead of its own private near-duplicates, which read both header forms and preserve a server's whole TOML footprint (its table plus every sub-table) so a saved entry round-trips intact. As a result `connect` now reports a config file it cannot read or parse instead of treating it as a client with nothing connected.
-
-## 0.134.0-paul.0
-
-### Minor Changes
-
-- f3a868b: Read the Vault Audit tab from the framework action audit log, so reads,
-  mutations, and refused attempts arrive in one timeline with their status and
-  error code. The tab now filters by action, outcome, actor, and time, and pages
-  through results; the list surface still omits each event's recorded input.
-  `vault_audit_log` keeps its existing writers and rows — nothing reads it for
-  the tab. Audit queries gain a `targetTypes` filter for features whose events
-  span more than one target type.
-- 0c17835: Add `agent-native vault exec --key KEY [--key KEY...] [--app NAME] -- <command>`, which leases the named workspace vault secrets into a child process environment so a local agent session never has to paste a credential into a prompt. Leased values win over the existing environment and collisions are reported by key name only; the lease id goes to stderr and reaches the child as `AGENT_NATIVE_VAULT_LEASE`. Wrapper failures use private exit codes 64–68 so `vault exec` never impersonates the command it wrapped, and the child's own exit code propagates unchanged. `--help` states plainly that this is hygiene rather than containment.
-- 17b5fe8: Split the vault read surface: `list-vault-secrets` no longer returns secret
-  values at all, carrying a server-computed masked `last4` preview instead, and a
-  new `reveal-vault-secret` returns one value for one id. Reveal is mounted
-  `POST`-only, kept off the agent and tool-iframe surfaces, and audited on every
-  call — the audit row records the id and never the value. The vault UI's eye
-  toggle now fetches on demand and the edit dialog no longer prefills the stored
-  value, so a reveal in the timeline means a real reveal.
-
-  Core: vault action names join the auto-authenticated-read exclusion patterns, so
-  a value-returning vault action is never auto-advertised to external agents;
-  `filterAgentTools` is exported from `@agent-native/core/server` so apps can
-  assert an `agentTool: false` action really is absent from the agent tool list.
 
 ## 0.145.2
 

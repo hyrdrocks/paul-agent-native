@@ -10,10 +10,10 @@
  * every reader that assumed it was is answering for a run nothing is producing.
  *
  * Kept in its own module, with no VALUE imports, for two reasons: the
- * classifier is pure and the registry it serves is not, and the release's
- * capability probe has to be able to ask a bare Node process this question
- * without pulling in the database client behind `run-manager.js`. The one
- * import below is a type and is erased, so it costs the probe nothing.
+ * classifier is pure and the registry it serves is not, and a bare Node
+ * process has to be able to ask this question without pulling in the database
+ * client behind `run-manager.js`. The one import below is a type and is
+ * erased, so it costs that caller nothing.
  */
 import type { RunStatus } from "./types.js";
 
