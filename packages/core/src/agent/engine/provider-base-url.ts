@@ -11,6 +11,8 @@ import { OPENAI_BASE_URL_ENV_VAR } from "./openai-compatible-endpoint.js";
 
 export const ANTHROPIC_BASE_URL_ENV_VAR = "ANTHROPIC_BASE_URL";
 
+export const AZURE_BASE_URL_ENV_VAR = "AZURE_BASE_URL";
+
 /**
  * The two Anthropic clients disagree about what a base URL is. The official
  * `@anthropic-ai/sdk` appends `/v1/messages`, so it wants a bare origin — which
@@ -33,6 +35,11 @@ const ENGINE_BASE_URLS: Readonly<Record<string, EngineBaseUrlConfig>> = {
     envVar: OPENAI_BASE_URL_ENV_VAR,
     shape: "as-configured",
   },
+  // Azure takes the endpoint as configured: it is the resource's own URL, not
+  // a gateway standing in for one, and the SDK appends its own path segments.
+  // Optional — with no base URL the SDK derives the endpoint from
+  // AZURE_RESOURCE_NAME itself, which is why that variable needs no plumbing.
+  "ai-sdk:azure": { envVar: AZURE_BASE_URL_ENV_VAR, shape: "as-configured" },
   anthropic: { envVar: ANTHROPIC_BASE_URL_ENV_VAR, shape: "without-v1" },
   "ai-sdk:anthropic": { envVar: ANTHROPIC_BASE_URL_ENV_VAR, shape: "with-v1" },
 };
@@ -45,6 +52,7 @@ const ENGINE_BASE_URLS: Readonly<Record<string, EngineBaseUrlConfig>> = {
 const API_KEY_TO_BASE_URL_ENV_VAR: Readonly<Record<string, string>> = {
   OPENAI_API_KEY: OPENAI_BASE_URL_ENV_VAR,
   ANTHROPIC_API_KEY: ANTHROPIC_BASE_URL_ENV_VAR,
+  AZURE_API_KEY: AZURE_BASE_URL_ENV_VAR,
 };
 
 /**

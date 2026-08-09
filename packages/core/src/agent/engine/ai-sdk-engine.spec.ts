@@ -27,6 +27,22 @@ function mockOpenAIProvider() {
   return { createOpenAI, provider, responsesModel, chatModel };
 }
 
+/**
+ * Same shape as {@link mockOpenAIProvider}: both constructors are exposed so a
+ * test can assert WHICH one was used. Azure must always take the default
+ * (Responses) one — the inverse of the OpenAI-with-base-URL case.
+ */
+function mockAzureProvider() {
+  const responsesModel = { id: "azure-responses-model" };
+  const chatModel = { id: "azure-chat-model" };
+  const provider = Object.assign(vi.fn().mockReturnValue(responsesModel), {
+    chat: vi.fn().mockReturnValue(chatModel),
+  });
+  const createAzure = vi.fn().mockReturnValue(provider);
+  vi.doMock("@ai-sdk/azure", () => ({ createAzure }));
+  return { createAzure, provider, responsesModel, chatModel };
+}
+
 const BASE_STREAM_OPTIONS = {
   model: "gpt-5.5",
   systemPrompt: "",
@@ -885,4 +901,114 @@ describe("AISDKEngine missing-credential fail-closed", () => {
       expect(streamText).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("AISDKEngine Azure OpenAI", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.unstubAllEnvs();
+  });
+
+  it("builds the model with the SDK's default Responses constructor, never chat", async () => {
+    const { streamText } = mockAiSdk();
+    const { createAzure, provider, responsesModel } = mockAzureProvider();
+
+    const { createAISDKEngine } = await import("./ai-sdk-engine.js");
+    const engine = createAISDKEngine("azure", { apiKey: "az-test" });
+
+    await drain(engine.stream(BASE_STREAM_OPTIONS));
+
+    expect(createAzure).toHaveBeenCalledWith({ apiKey: "az-test" });
+    expect(provider).toHaveBeenCalledWith("gpt-5.5");
+    expect(provider.chat).not.toHaveBeenCalled();
+    expect(streamText).toHaveBeenCalledWith(
+      expect.objectContaining({ model: responsesModel }),
+    );
+  });
+
+  it("keeps the Responses constructor even with a base URL configured", async () => {
+    // For a gateway a base URL means "forced onto Chat Completions"; for Azure
+    // it is just the resource's own endpoint. Sharing OpenAI's branch would
+    // silently move Azure onto a surface its reasoning models reject.
+    const { streamText } = mockAiSdk();
+    const { provider, responsesModel } = mockAzureProvider();
+
+    const { createAISDKEngine } = await import("./ai-sdk-engine.js");
+    const engine = createAISDKEngine("azure", {
+      apiKey: "az-test",
+      baseUrl: "https://example.openai.azure.com/openai/v1",
+    });
+
+    await drain(engine.stream(BASE_STREAM_OPTIONS));
+
+    expect(provider).toHaveBeenCalledWith("gpt-5.5");
+    expect(provider.chat).not.toHaveBeenCalled();
+    expect(streamText).toHaveBeenCalledWith(
+      expect.objectContaining({ model: responsesModel }),
+    );
+  });
+
+  it("sends reasoning effort at full value under the openai provider-options key", async () => {
+    const { streamText } = mockAiSdk();
+    mockAzureProvider();
+
+    const { createAISDKEngine } = await import("./ai-sdk-engine.js");
+    const engine = createAISDKEngine("azure", {
+      apiKey: "az-test",
+      baseUrl: "https://example.openai.azure.com/openai/v1",
+    });
+
+    await drain(
+      engine.stream({
+        ...BASE_STREAM_OPTIONS,
+        tools: [
+          {
+            name: "test-tool",
+            description: "A test tool",
+            inputSchema: { type: "object", properties: {} },
+          },
+        ],
+        reasoningEffort: "medium",
+      } as any),
+    );
+
+    // A base URL AND tools together is exactly the combination that downgrades
+    // OpenAI to "none". Azure must not inherit that.
+    const call = streamText.mock.calls[0]?.[0] as any;
+    expect(call.providerOptions.openai.reasoningEffort).toBe("medium");
+  });
+
+  it("preserves a deployment name that collides with the catalog", async () => {
+    const { createAISDKEngine } = await import("./ai-sdk-engine.js");
+    const engine = createAISDKEngine("azure", { apiKey: "az-test" });
+
+    expect(engine.preserveCustomModels).toBe(true);
+
+    const { normalizeModelForEngine } = await import("./registry.js");
+    // `gpt-5.4` shares family `gpt` and an empty suffix with the catalog's
+    // `gpt-5.5`, so without preservation it normalizes to the higher version
+    // and — because both are really deployed — succeeds against the wrong
+    // model with no error at all.
+    expect(normalizeModelForEngine(engine, "gpt-5.4")).toBe("gpt-5.4");
+    expect(normalizeModelForEngine(engine, "my-custom-deployment")).toBe(
+      "my-custom-deployment",
+    );
+  });
+
+  it("fails closed with missing_credentials when no key is configured", async () => {
+    const { streamText } = mockAiSdk();
+    const { createAzure } = mockAzureProvider();
+
+    const { createAISDKEngine } = await import("./ai-sdk-engine.js");
+    const engine = createAISDKEngine("azure", { allowEnvFallback: false });
+
+    const events: any[] = [];
+    for await (const e of engine.stream(BASE_STREAM_OPTIONS)) events.push(e);
+
+    expect(createAzure).not.toHaveBeenCalled();
+    expect(streamText).not.toHaveBeenCalled();
+    expect(events.find((e) => e.type === "stop")?.errorCode).toBe(
+      "missing_credentials",
+    );
+  });
 });

@@ -2391,3 +2391,40 @@ describe("AgentEngine registry", () => {
     });
   });
 });
+
+describe("resolveEnginePreservesCustomModels", () => {
+  it("answers true for the Azure engine with no base URL to consult", async () => {
+    // The SAVE path. It receives a static registry ENTRY, which cannot carry
+    // the instance's runtime `preserveCustomModels` flag, so it resolves the
+    // same question here. Fixing only the instance leaves this path rewriting
+    // a real deployment name and reporting success.
+    const { resolveEnginePreservesCustomModels, normalizeModelForEngine } =
+      await import("./registry.js");
+
+    expect(
+      await resolveEnginePreservesCustomModels({ name: "ai-sdk:azure" }),
+    ).toBe(true);
+
+    const entry = {
+      name: "ai-sdk:azure",
+      defaultModel: "gpt-5.5",
+      supportedModels: ["gpt-5.5", "gpt-5.6-luna"],
+    };
+    // Without the flag this returns "gpt-5.5": `gpt-5.4` matches the catalog on
+    // family and empty suffix, and the normalizer takes the highest version.
+    expect(
+      normalizeModelForEngine(entry, "gpt-5.4", {
+        preserveCustomModels: true,
+      }),
+    ).toBe("gpt-5.4");
+    expect(normalizeModelForEngine(entry, "gpt-5.4")).toBe("gpt-5.5");
+  });
+
+  it("still answers false for first-party OpenAI with no gateway", async () => {
+    const { resolveEnginePreservesCustomModels } =
+      await import("./registry.js");
+    expect(
+      await resolveEnginePreservesCustomModels({ name: "ai-sdk:anthropic" }),
+    ).toBe(false);
+  });
+});
