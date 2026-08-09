@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 
 function providerFailureFingerprint(key: string, value: string): string {
   return createHash("sha256")
@@ -2346,6 +2346,48 @@ describe("AgentEngine registry", () => {
       expect(openAiCreate).not.toHaveBeenCalled();
       expect(builderCreate).toHaveBeenCalled();
       expect(resolved).toBe(builderEngine);
+    });
+  });
+
+  describe("isAgentEnginePackageInstalled", () => {
+    // Package availability is memoised in module scope, so the runtime globals
+    // must be stubbed before ./registry.js is imported or the memo — not the
+    // predicate — decides the result.
+    const bundledOnlyEntry = {
+      name: "ai-sdk:bundled-only",
+      label: "Bundled Only",
+      description: "",
+      installPackage: "@agent-native/not-a-real-provider-package",
+      capabilities: {} as any,
+      defaultModel: "m",
+      supportedModels: [],
+      requiredEnvVars: [],
+      create: vi.fn() as any,
+    };
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("reports a bundled package as available on the Cloudflare runtime", async () => {
+      vi.resetModules();
+      vi.stubGlobal("__cf_env", {});
+
+      const { isAgentEnginePackageInstalled } = await import("./registry.js");
+
+      expect(isAgentEnginePackageInstalled(bundledOnlyEntry)).toBe(true);
+    });
+
+    it("still reports a genuinely missing package as unavailable off Cloudflare", async () => {
+      vi.resetModules();
+      // Pin the other bundled-serverless legs: a CI runner that happens to set
+      // these would otherwise make the assertion pass for the wrong reason.
+      vi.stubEnv("VERCEL", "");
+      vi.stubEnv("NETLIFY", "");
+
+      const { isAgentEnginePackageInstalled } = await import("./registry.js");
+
+      expect(isAgentEnginePackageInstalled(bundledOnlyEntry)).toBe(false);
     });
   });
 });

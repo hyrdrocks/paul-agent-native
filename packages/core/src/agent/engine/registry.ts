@@ -20,6 +20,7 @@ import {
   resolveSecret,
 } from "../../server/credential-provider.js";
 import { getSetting } from "../../settings/store.js";
+import { isCloudflareRuntime } from "../../shared/runtime.js";
 import { getAgentAppModelDefaultForCurrentRequest } from "../app-model-defaults.js";
 import {
   normalizeOpenAiBaseUrl,
@@ -117,8 +118,16 @@ function packageNameFromInstallSpecifier(specifier: string): string | null {
  * means the package is genuinely absent and must NOT be masked. Those runtimes
  * are still covered *when the code is actually bundled*, via the module-path
  * check below, which stays false for a normal `node_modules` layout.
+ *
+ * Cloudflare Workers is the one runtime where this holds unconditionally: it
+ * has no CommonJS resolver at all, so `require.resolve` throws for every
+ * specifier there, bundled or not.
  */
 function isBundledServerlessRuntime(): boolean {
+  // Keyed on the canonical predicate from ADR-0003 — the Workers environment
+  // globals the Nitro preset installs — rather than a user-agent string, which
+  // is not a reliable signal under the `nodejs_compat` flag this deploys with.
+  if (isCloudflareRuntime()) return true;
   const env = process.env;
   // Nitro's Vercel/Netlify presets inline optional peers into the function
   // bundle; these platforms always set these markers.
