@@ -294,6 +294,14 @@ export const AGENT_MODEL_CONFIG = {
       defaultModel: FRAMEWORK_DEFAULT_OPENAI_MODEL,
       supportedModels: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
     },
+    azure: {
+      // A picker seed, NOT a catalog. Azure model ids are per-resource
+      // deployment names the framework cannot enumerate, so anything the user
+      // types must survive verbatim — see `preserveCustomModels` on the Azure
+      // engine and `resolveEnginePreservesCustomModels` for the save path.
+      defaultModel: "gpt-5.5",
+      supportedModels: ["gpt-5.5", "gpt-5.6-luna"],
+    },
     openrouter: {
       defaultModel: FRAMEWORK_DEFAULT_OPENROUTER_MODEL,
       supportedModels: [

@@ -354,10 +354,16 @@ export function resolveDelegatedRunModel(
  * helper reproduces the same decision — `ai-sdk:openai` AND a resolved base URL
  * — from the request's stored/deploy config. First-party OpenAI (no gateway)
  * returns false so an unknown/invalid model still normalizes to a supported one.
+ *
+ * Azure answers true unconditionally, with no base URL to consult: its model
+ * ids are always per-resource deployment names. This path is distinct from the
+ * engine instance's own `preserveCustomModels`, and fixing only that one leaves
+ * the SAVE path rewriting a deployment name and reporting success.
  */
 export async function resolveEnginePreservesCustomModels(
   entry: Pick<AgentEngineEntry, "name">,
 ): Promise<boolean> {
+  if (entry.name === "ai-sdk:azure") return true;
   if (entry.name !== "ai-sdk:openai") return false;
   try {
     return Boolean(await resolveConfiguredBaseUrl(OPENAI_BASE_URL_ENV_VAR));

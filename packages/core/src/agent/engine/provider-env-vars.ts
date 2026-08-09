@@ -29,6 +29,11 @@ export const PROVIDER_ENV_META: Record<string, ProviderEnvMeta> = {
     label: "OpenAI API Key",
     placeholder: "sk-...",
   },
+  azure: {
+    envVar: "AZURE_API_KEY",
+    label: "Azure OpenAI API Key",
+    placeholder: "...",
+  },
   google: {
     envVar: "GOOGLE_GENERATIVE_AI_API_KEY",
     label: "Google Gemini API Key",

@@ -79,6 +79,13 @@ const PROVIDER_CAPABILITIES: Record<AISDKProvider, EngineCapabilities> = {
     computerUse: false,
     parallelToolCalls: true,
   },
+  azure: {
+    thinking: true,
+    promptCaching: false,
+    vision: true,
+    computerUse: false,
+    parallelToolCalls: true,
+  },
   openrouter: {
     thinking: true,
     promptCaching: true,
@@ -144,6 +151,7 @@ const PROVIDER_SUPPORTED_MODELS = Object.fromEntries(
 const PROVIDER_ENV_VARS: Record<AISDKProvider, string[]> = {
   anthropic: ["ANTHROPIC_API_KEY"],
   openai: ["OPENAI_API_KEY"],
+  azure: ["AZURE_API_KEY"],
   openrouter: ["OPENROUTER_API_KEY"],
   google: ["GOOGLE_GENERATIVE_AI_API_KEY"],
   groq: ["GROQ_API_KEY"],
@@ -155,6 +163,7 @@ const PROVIDER_ENV_VARS: Record<AISDKProvider, string[]> = {
 const PROVIDER_PACKAGES: Record<AISDKProvider, string> = {
   anthropic: "@ai-sdk/anthropic",
   openai: "@ai-sdk/openai",
+  azure: "@ai-sdk/azure",
   openrouter: "@openrouter/ai-sdk-provider",
   google: "@ai-sdk/google",
   groq: "@ai-sdk/groq",
@@ -167,6 +176,7 @@ const PROVIDER_PACKAGES: Record<AISDKProvider, string> = {
 const PROVIDER_FACTORIES: Record<AISDKProvider, string> = {
   anthropic: "createAnthropic",
   openai: "createOpenAI",
+  azure: "createAzure",
   openrouter: "createOpenRouter",
   google: "createGoogleGenerativeAI",
   groq: "createGroq",
@@ -243,8 +253,13 @@ class AISDKEngine implements AgentEngine {
     this.label = `${capitalize(provider)} (AI SDK)`;
     this.defaultModel = config.model ?? PROVIDER_DEFAULT_MODELS[provider];
     this.supportedModels = PROVIDER_SUPPORTED_MODELS[provider];
+    // Azure preserves unconditionally, NOT gated on a base URL the way OpenAI
+    // is: every Azure model id is a per-resource deployment name. Normalizing
+    // one is a silent wrong-model failure, because a deployment named `gpt-5.4`
+    // matches the catalog's `gpt-5.5` on family and suffix and both can exist.
     this.preserveCustomModels =
-      provider === "openai" && Boolean(config.baseUrl);
+      provider === "azure" ||
+      (provider === "openai" && Boolean(config.baseUrl));
     this.capabilities = PROVIDER_CAPABILITIES[provider];
     this.apiKey =
       config.apiKey ??
@@ -413,6 +428,18 @@ class AISDKEngine implements AgentEngine {
           reasoningEffort: forcedChatCompletionsWithTools
             ? "none"
             : reasoningEffort,
+        };
+      } else if (this.provider === "azure") {
+        // Its own branch, deliberately not folded into the OpenAI one above.
+        // That branch downgrades effort to "none" whenever a base URL is set,
+        // because there a base URL means an OpenAI-compatible gateway forced
+        // onto Chat Completions. For Azure a base URL is the NORMAL endpoint
+        // and the transport is Responses, so inheriting that downgrade would
+        // silently disable effort. Written under the `openai` key: the Azure
+        // SDK's Responses model reads its own key first and falls back to it.
+        providerOpts.openai = {
+          ...((providerOpts.openai as object) ?? {}),
+          reasoningEffort,
         };
       } else if (this.provider === "openrouter") {
         providerOpts.openrouter = {
@@ -644,6 +671,8 @@ async function importProviderPackage(provider: AISDKProvider): Promise<any> {
       return import("@openrouter/ai-sdk-provider");
     case "google":
       return import("@ai-sdk/google");
+    case "azure":
+      return import("@ai-sdk/azure");
     case "groq":
       return import("@ai-sdk/groq");
     case "mistral":

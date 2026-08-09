@@ -72,6 +72,7 @@ export function registerBuiltinEngines(): void {
   const aiSdkProviders: AISDKProvider[] = [
     "anthropic",
     "openai",
+    "azure",
     "openrouter",
     "google",
     "groq",
@@ -83,6 +84,7 @@ export function registerBuiltinEngines(): void {
   const providerLabels: Record<AISDKProvider, string> = {
     anthropic: "Claude",
     openai: "OpenAI",
+    azure: "Azure OpenAI",
     openrouter: "OpenRouter",
     google: "Gemini",
     groq: "Groq",
@@ -95,6 +97,8 @@ export function registerBuiltinEngines(): void {
     anthropic:
       "Claude models through the Vercel AI SDK. Supports thinking and caching via AI SDK providerOptions.",
     openai: "OpenAI GPT models via the Vercel AI SDK. Requires OPENAI_API_KEY.",
+    azure:
+      "OpenAI models on your own Azure resource, via the Vercel AI SDK. Requires AZURE_API_KEY plus either AZURE_RESOURCE_NAME or AZURE_BASE_URL. Model ids are your resource's own deployment names and are sent verbatim — the listed models are a starting point, not the full set.",
     openrouter:
       "300+ models from Anthropic, OpenAI, Google, Z.ai, and more routed through a single endpoint. Use model IDs like 'anthropic/claude-sonnet-5', 'openai/gpt-5.6-sol', or 'z-ai/glm-5.2'. Requires OPENROUTER_API_KEY.",
     google:

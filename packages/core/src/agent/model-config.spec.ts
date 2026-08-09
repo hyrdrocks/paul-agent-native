@@ -72,6 +72,7 @@ describe("agent model config catalog", () => {
     expect(Object.keys(AI_SDK_MODEL_CONFIG).sort()).toEqual(
       [
         "anthropic",
+        "azure",
         "cohere",
         "google",
         "groq",
