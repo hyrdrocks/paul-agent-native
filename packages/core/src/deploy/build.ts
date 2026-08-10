@@ -5237,8 +5237,9 @@ export const WORKER_FRAMEWORK_CHUNK_NAME = "_libs/@agent-native/framework";
 const WORKER_FRAMEWORK_CHUNK_TEST = /node_modules[/\\]@agent-native[/\\]/;
 
 /**
- * Keeps every installed `@agent-native/*` package in one chunk for Worker and
- * Deno output.
+ * Keeps every installed `@agent-native/*` package in one chunk, for every
+ * preset. The `WORKER_` names are historical: the failure below is ESM's, not
+ * workerd's, and a Node build cycles exactly the same way.
  *
  * Nitro declares one code-splitting group per installed package and then lets
  * Rolldown merge those groups down to far fewer physical chunks, so two
@@ -5246,8 +5247,9 @@ const WORKER_FRAMEWORK_CHUNK_TEST = /node_modules[/\\]@agent-native[/\\]/;
  * merge and import each other across the chunk boundary — one chunk holding
  * zod, the other drizzle-orm. ESM evaluates one side of such a cycle first, and
  * a module-scope read of the other side's `const` throws "Cannot access 'X'
- * before initialization" while workerd is still linking, so the Worker never
- * boots although install, resolution, bundling and the size check all passed.
+ * before initialization" while the runtime is still linking, so the server
+ * never boots although install, resolution, bundling and the size check all
+ * passed.
  * Workspace sources never match the group `test`, which is why this appears
  * only once an app consumes the packages from node_modules, and only once it
  * consumes two of them.
@@ -5730,9 +5732,13 @@ export default bundle;
       ...(preset === "netlify" || preset === "vercel" || preset === "aws-lambda"
         ? { external: ["yjs"] }
         : {}),
-      ...(preset.startsWith("cloudflare") || preset.startsWith("deno")
-        ? { output: { codeSplitting: workerFrameworkCodeSplitting() } }
-        : {}),
+      // Every preset, not only the edge ones. A chunk cycle's TDZ is a property
+      // of ESM linking rather than of workerd, so the Node preset boots into the
+      // same `Cannot access 'X' before initialization` from `nitro build` +
+      // `node .output/server/index.mjs` — with the added cost that it looks like
+      // an app bug, because the deploy target everyone associates with the
+      // failure is not involved.
+      output: { codeSplitting: workerFrameworkCodeSplitting() },
       plugins: [
         ...(preset.startsWith("cloudflare")
           ? [createCloudflareModuleStubPlugin()]
@@ -6050,13 +6056,14 @@ export default bundle;
   }
 
   // Last gate before the artifact ships: the cycle this catches passes install,
-  // resolution, bundling and the size check, and only workerd's module linker
-  // objects — by then the evidence is a minified symbol name.
-  if (preset.startsWith("cloudflare") || preset.startsWith("deno")) {
-    assertNoWorkerChunkImportCycles(
-      nitro.options.output.serverDir || path.join(cwd, "dist", "_worker.js"),
-    );
-  }
+  // resolution, bundling and the size check, and only the module linker
+  // objects — by then the evidence is a minified symbol name. Node's linker
+  // raises the same TDZ as workerd's, so gate every preset, not just the edge
+  // ones: a Node build that boots is the cheapest place to catch a cycle that
+  // would otherwise be found on a deploy.
+  assertNoWorkerChunkImportCycles(
+    nitro.options.output.serverDir || path.join(cwd, "dist", "_worker.js"),
+  );
 
   await nitro.close();
   console.log(`[deploy] Nitro build complete for preset "${preset}".`);
