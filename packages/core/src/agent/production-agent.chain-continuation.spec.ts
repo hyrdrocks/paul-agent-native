@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { runWithRequestContext } from "../server/request-context.js";
 import {
   AGENT_CHAT_BACKGROUND_RUN_FIELD,
   AGENT_CHAT_PROCESS_RUN_PATH,
@@ -103,6 +104,7 @@ interface Harness {
       | "emitRunText"
       | "isTurnAborted"
       | "markRunAborted"
+      | "getRunOwner"
     >
   >;
   /** Ordered log of the calls that matter for handoff-ordering assertions. */
@@ -125,6 +127,7 @@ function makeHarness(overrides?: {
     insertRun: vi.fn(async () => {
       callOrder.push("insertRun");
     }),
+    getRunOwner: vi.fn(async () => null),
     fireBackgroundDispatch:
       overrides?.fireBackgroundDispatch ?? (vi.fn(async () => {}) as any),
     readBackgroundRunClaim:
@@ -187,6 +190,40 @@ async function runChain(
 }
 
 describe("chainServerDrivenContinuation — transactional handoff (foreground self-chain)", () => {
+  // The successor is dispatched cookieless too, and its thread row is not
+  // guaranteed to exist. The owner must travel ON the row it inserts.
+  it("stamps the successor row with the predecessor's recorded owner", async () => {
+    const h = makeHarness();
+    h.deps.getRunOwner = vi.fn(async () => ({
+      email: "recorded@example.com",
+      anonymous: true,
+    }));
+
+    // Ambient identity deliberately DISAGREES: this runs from the run's
+    // terminal completion chain, so the row is the authority, not the ALS.
+    await runWithRequestContext({ userEmail: "ambient@example.com" }, () =>
+      runChain(h, { run: timeoutBoundaryRun() }),
+    );
+
+    const insertOptions = (h.deps.insertRun as any).mock.calls[0][3];
+    expect(insertOptions.ownerEmail).toBe("recorded@example.com");
+    expect(insertOptions.ownerAnonymous).toBe(true);
+  });
+
+  it("falls back to the ambient owner when the predecessor row is unreadable", async () => {
+    const h = makeHarness();
+    h.deps.getRunOwner = vi.fn(async () => {
+      throw new Error("db down");
+    });
+
+    await runWithRequestContext({ userEmail: "ambient@example.com" }, () =>
+      runChain(h, { run: timeoutBoundaryRun() }),
+    );
+
+    const insertOptions = (h.deps.insertRun as any).mock.calls[0][3];
+    expect(insertOptions.ownerEmail).toBe("ambient@example.com");
+  });
+
   it("does not mint a successor after the logical turn has been durably aborted", async () => {
     const h = makeHarness();
     h.deps.isTurnAborted = vi.fn(async () => true);
