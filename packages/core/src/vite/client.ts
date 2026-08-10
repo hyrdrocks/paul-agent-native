@@ -3014,7 +3014,7 @@ function devServerNoExternal(args: {
 }
 
 /**
- * Decide whether a Vite environment needs core's dev inlining policy restated.
+ * Whether a Vite environment needs core's dev inlining policy restated.
  *
  * Vite's `ssr` config shorthand lands on `environments.ssr` alone. Nitro
  * renders the app in an environment it names `nitro`, whose own dev
@@ -3029,25 +3029,24 @@ function devServerNoExternal(args: {
  * Restating the policy per environment rather than only through the shorthand
  * is what keeps one module registry per environment self-consistent.
  */
-function serverEnvironmentInliningPolicy(args: {
+function needsDevServerNoExternal(args: {
   name: string;
   consumer?: string;
   command?: AgentNativeViteCommand;
   currentNoExternal?: unknown;
-  noExternal: Array<string | RegExp>;
-}): { resolve: { noExternal: Array<string | RegExp> } } | undefined {
+}): boolean {
   // The build config already inlines everything but `node:` builtins, and a
   // built server has one Rolldown graph rather than one registry per loader.
-  if (isBuildCommand(args.command)) return undefined;
-  if (args.consumer !== "server") return undefined;
+  if (isBuildCommand(args.command)) return false;
+  if (args.consumer !== "server") return false;
   // `ssr` gets the same list from the shorthand above; restating it here would
   // only duplicate every entry in the resolved config.
-  if (args.name === "ssr") return undefined;
+  if (args.name === "ssr") return false;
   // An environment that already inlines everything — Nitro's workerd runner
   // sets `noExternal: true` — has nothing to gain and would lose the blanket
   // policy if a list were merged over it.
-  if (args.currentNoExternal === true) return undefined;
-  return { resolve: { noExternal: args.noExternal } };
+  if (args.currentNoExternal === true) return false;
+  return true;
 }
 
 function hasReactRouterPlugin(plugins: any[] | undefined): boolean {
@@ -3787,25 +3786,34 @@ function createAgentNativeConfigPlugin(
       );
     },
     configEnvironment(name: string, envConfig: any, env: ConfigEnv) {
+      if (
+        !needsDevServerNoExternal({
+          name,
+          consumer: envConfig?.consumer,
+          command: env?.command,
+          currentNoExternal: envConfig?.resolve?.noExternal,
+        })
+      ) {
+        return;
+      }
       const cwd = process.cwd();
       const workspaceCore = findWorkspaceCoreSync(cwd);
-      const packageWorkspaceRoot = findPnpmWorkspaceRoot(cwd);
-      return serverEnvironmentInliningPolicy({
-        name,
-        consumer: envConfig?.consumer,
-        command: env?.command,
-        currentNoExternal: envConfig?.resolve?.noExternal,
-        noExternal: devServerNoExternal({
-          cwd,
-          workspaceCoreNoExternal: workspaceCore
-            ? [new RegExp(`^${escapeRegex(workspaceCore.packageName)}(/.*)?$`)]
-            : [],
-          localWorkspacePackageNoExternal: findLocalWorkspacePackageDeps(
+      return {
+        resolve: {
+          noExternal: devServerNoExternal({
             cwd,
-            packageWorkspaceRoot,
-          ).map((pkg) => new RegExp(`^${escapeRegex(pkg.packageName)}(/.*)?$`)),
-        }),
-      });
+            workspaceCoreNoExternal: workspaceCore
+              ? [new RegExp(`^${escapeRegex(workspaceCore.packageName)}(/.*)?$`)]
+              : [],
+            localWorkspacePackageNoExternal: findLocalWorkspacePackageDeps(
+              cwd,
+              findPnpmWorkspaceRoot(cwd),
+            ).map(
+              (pkg) => new RegExp(`^${escapeRegex(pkg.packageName)}(/.*)?$`),
+            ),
+          }),
+        },
+      };
     },
   };
 }
@@ -3865,7 +3873,7 @@ export {
   findCorePackageRoot as _findCorePackageRoot,
   getReactRouterAliases as _getReactRouterAliases,
   devServerNoExternal as _devServerNoExternal,
-  serverEnvironmentInliningPolicy as _serverEnvironmentInliningPolicy,
+  needsDevServerNoExternal as _needsDevServerNoExternal,
   nitroStartupGate as _nitroStartupGate,
   nitroStartupRecovery as _nitroStartupRecovery,
   nitroModuleGraphSignature as _nitroModuleGraphSignature,

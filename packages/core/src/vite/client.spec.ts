@@ -17,9 +17,9 @@ import {
   _installReactRouterVirtualInvalidationMirror,
   _mirrorReactRouterVirtualInvalidation,
   _nitroModuleGraphSignature,
+  _needsDevServerNoExternal,
   _nitroStartupGate,
   _nitroStartupRecovery,
-  _serverEnvironmentInliningPolicy,
   agentNative,
   defineConfig,
   isFrameworkDevPath,
@@ -2619,19 +2619,21 @@ describe("local-core dev aliases and router dedupe", () => {
 });
 
 describe("dev server module inlining policy", () => {
-  const noExternal = [/^@agent-native\/core(\/.*)?$/];
-
-  it("covers every core subpath, not only the package root", () => {
+  it("covers every framework subpath, not only core's package root", () => {
     const patterns = _devServerNoExternal({
       cwd: process.cwd(),
       workspaceCoreNoExternal: [],
       localWorkspacePackageNoExternal: [],
     }) as RegExp[];
-    const core = patterns[0]!;
+    const framework = patterns[0]!;
 
-    expect(core.test("@agent-native/core")).toBe(true);
-    expect(core.test("@agent-native/core/client/hooks")).toBe(true);
-    expect(core.test("@agent-native/core/client/navigation")).toBe(true);
+    expect(framework.test("@agent-native/core")).toBe(true);
+    expect(framework.test("@agent-native/core/client/hooks")).toBe(true);
+    expect(framework.test("@agent-native/core/client/navigation")).toBe(true);
+    // An externalized toolkit brings its own @radix-ui copy and breaks provider
+    // identity exactly as an externalized core breaks the router context.
+    expect(framework.test("@agent-native/toolkit/ui/tooltip")).toBe(true);
+    expect(framework.test("react-router")).toBe(false);
   });
 
   it("carries a caller's own entries through", () => {
@@ -2649,59 +2651,54 @@ describe("dev server module inlining policy", () => {
   // config shorthand never reaches. Without the policy restated there, core is
   // handed to Node's ESM loader while the app around it is inlined, and the two
   // React Router copies that produces break `useLocation` during SSR.
-  it("restates the policy for a server environment the shorthand cannot reach", () => {
+  it("claims a server environment the shorthand cannot reach", () => {
     expect(
-      _serverEnvironmentInliningPolicy({
+      _needsDevServerNoExternal({
         name: "nitro",
         consumer: "server",
         command: "serve",
-        noExternal,
       }),
-    ).toEqual({ resolve: { noExternal } });
+    ).toBe(true);
   });
 
   it("leaves the ssr environment to the shorthand", () => {
     expect(
-      _serverEnvironmentInliningPolicy({
+      _needsDevServerNoExternal({
         name: "ssr",
         consumer: "server",
         command: "serve",
-        noExternal,
       }),
-    ).toBeUndefined();
+    ).toBe(false);
   });
 
   it("leaves client environments alone", () => {
     expect(
-      _serverEnvironmentInliningPolicy({
+      _needsDevServerNoExternal({
         name: "client",
         consumer: "client",
         command: "serve",
-        noExternal,
       }),
-    ).toBeUndefined();
+    ).toBe(false);
   });
 
   it("does not narrow an environment that already inlines everything", () => {
     expect(
-      _serverEnvironmentInliningPolicy({
+      _needsDevServerNoExternal({
         name: "nitro",
         consumer: "server",
         command: "serve",
         currentNoExternal: true,
-        noExternal,
       }),
-    ).toBeUndefined();
+    ).toBe(false);
   });
 
   it("stays out of the build config, which inlines everything already", () => {
     expect(
-      _serverEnvironmentInliningPolicy({
+      _needsDevServerNoExternal({
         name: "nitro",
         consumer: "server",
         command: "build",
-        noExternal,
       }),
-    ).toBeUndefined();
+    ).toBe(false);
   });
 });
