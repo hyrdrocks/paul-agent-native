@@ -98,4 +98,41 @@ describe("docs-search: skill reference sub-files are reachable end-to-end", () =
     expect(slugs).toContain("skill-recap-tools");
     expect(slugs).toContain("skill-recap-tools--references-canvas");
   });
+
+  // A model that fills every optional parameter sends `list` next to the page
+  // it asked for. Answering with the index made it re-ask and trip the agent
+  // loop's duplicate-read-only guard, aborting the turn.
+  it("reads the page when --list is supplied alongside --slug", async () => {
+    const slug = skillSubfileDocsSlug("recap-tools", "references/canvas.md");
+
+    const output = await runDocsSearch(["--list", "true", "--slug", slug]);
+
+    expect(output).toContain("CANVAS_REFERENCE_TOKEN");
+    expect(output).not.toContain('skill-recap-tools--references-canvas"');
+  });
+
+  it("searches when --list is supplied alongside --query", async () => {
+    const output = await runDocsSearch([
+      "--list",
+      "true",
+      "--query",
+      "CANVAS_REFERENCE_TOKEN",
+    ]);
+
+    expect(output).toContain("doc(s) matching");
+    expect(output).toContain("skill-recap-tools--references-canvas");
+  });
+
+  it("still lists when --list is the only thing asked for", async () => {
+    const output = await runDocsSearch(["--list", "true"]);
+
+    const listing = JSON.parse(output) as { slug: string }[];
+    expect(listing.map((d) => d.slug)).toContain("skill-recap-tools");
+  });
+
+  it("does not list when --list is false", async () => {
+    const output = await runDocsSearch(["--list", "false"]);
+
+    expect(output).toContain("Provide --query, --slug, or --list");
+  });
 });

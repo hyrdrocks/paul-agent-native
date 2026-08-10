@@ -13,6 +13,7 @@ import {
   type TextSearchMode,
 } from "../../search-utils/index.js";
 import { parseArgs } from "../utils.js";
+import { wantsIndexListing } from "./list-flag.js";
 import { loadAllDocs, type DocFull } from "./search.js";
 import { listSourceFiles, type SourceFile } from "./source-search.js";
 
@@ -194,7 +195,7 @@ Options:
   --mode <mode>      substring, glob, sql-like, or regex (default: substring)
   --path <glob>      Optional glob to limit matching paths
   --limit <number>   Maximum files to return (default: ${DEFAULT_LIMIT}, max: ${MAX_LIMIT})
-  --list             List the searchable docs and source roots
+  --list             List the searchable docs and source roots (ignored with --pattern/--query)
   --help             Show this help message`);
 }
 
@@ -226,7 +227,7 @@ export default async function frameworkSearchScript(
   }
   const limit = limitResult.value!;
 
-  if (parsed.list === "true") {
+  if (wantsIndexListing(parsed, ["pattern", "query"])) {
     const [docs, sourceFiles] = await Promise.all([
       scope === "source" ? Promise.resolve([]) : loadAllDocs(),
       scope === "docs"

@@ -16,6 +16,7 @@ import { runAgentLoopDirectWithSoftTimeout } from "../agent/run-loop-with-resume
 import type { AgentChatEvent } from "../agent/types.js";
 import { createGitHubRepoToolEntries } from "../provider-api/github-repo.js";
 import { resolveDevUserEmail } from "../scripts/dev-session.js";
+import { listToolParameter } from "../scripts/docs/list-flag.js";
 import { loadEnv } from "../scripts/utils.js";
 import { autoDiscoverActions } from "../server/action-discovery.js";
 import { captureCliOutput } from "../server/cli-capture.js";
@@ -340,12 +341,7 @@ export async function createHeadlessBuiltinActions(): Promise<
               type: "string",
               description: "Maximum matching files to return, from 1 to 50.",
             },
-            list: {
-              type: "string",
-              description:
-                'Set to "true" to list searchable docs and source roots.',
-              enum: ["true"],
-            },
+            list: listToolParameter("searchable docs and source roots"),
           },
         },
       },
@@ -373,11 +369,7 @@ export async function createHeadlessBuiltinActions(): Promise<
               description:
                 "Read a specific doc page by slug, for example actions, agent-native-docs, automations, a2a-protocol, or external-agents.",
             },
-            list: {
-              type: "string",
-              description: 'Set to "true" to list all available doc pages.',
-              enum: ["true"],
-            },
+            list: listToolParameter("all available doc pages"),
           },
         },
       },
@@ -405,11 +397,7 @@ export async function createHeadlessBuiltinActions(): Promise<
               description:
                 "Read a specific corpus file or list a directory, for example templates/plan/AGENTS.md or templates/chat/actions/hello.ts.",
             },
-            list: {
-              type: "string",
-              description: 'Set to "true" to list corpus sections.',
-              enum: ["true"],
-            },
+            list: listToolParameter("corpus sections"),
           },
         },
       },

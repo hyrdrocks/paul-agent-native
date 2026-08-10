@@ -69,4 +69,24 @@ describe("framework-search", { timeout: 60000 }, () => {
       runFrameworkSearch(["--pattern", "[", "--mode", "regex"]),
     ).resolves.toContain("Invalid regex search pattern");
   });
+
+  it("searches when --list is supplied alongside a pattern", async () => {
+    const output = await runFrameworkSearch([
+      "--list",
+      "true",
+      "--pattern",
+      "framework-search",
+      "--scope",
+      "docs",
+    ]);
+
+    expect(output).toContain("[doc]");
+    expect(output).not.toContain('"roots"');
+  });
+
+  it("still lists when --list is the only thing asked for", async () => {
+    const output = await runFrameworkSearch(["--list", "true"]);
+
+    expect(output).toContain('"roots"');
+  });
 });

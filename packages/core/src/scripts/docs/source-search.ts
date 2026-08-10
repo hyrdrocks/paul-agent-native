@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseSkillFrontmatter } from "../../server/agents-bundle.js";
 import { isValidPath, parseArgs } from "../utils.js";
+import { wantsIndexListing } from "./list-flag.js";
 
 export interface SourceFile {
   relativePath: string;
@@ -422,7 +423,7 @@ export default async function sourceSearchScript(
 Options:
   --query <text>    Search readable framework source by keyword
   --path <path>     Read a source file or list a source directory
-  --list            List source roots
+  --list            List source roots (ignored with --path/--query)
   --help            Show this help message`);
     return;
   }
@@ -434,7 +435,7 @@ Options:
     return;
   }
 
-  if (parsed.list === "true") {
+  if (wantsIndexListing(parsed, ["path", "query"])) {
     console.log(JSON.stringify(listSourceRoots(), null, 2));
     return;
   }

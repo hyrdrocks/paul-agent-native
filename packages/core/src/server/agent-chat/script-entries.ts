@@ -8,6 +8,7 @@ import {
 } from "../../chat-threads/store.js";
 import type { DatabaseToolsMode } from "../../scripts/db/tool-mode.js";
 import { dbExecToolParameters } from "../../scripts/db/tool-schemas.js";
+import { listToolParameter } from "../../scripts/docs/list-flag.js";
 import { captureCliOutput } from "../cli-capture.js";
 import {
   getAmbientUserEmail,
@@ -269,12 +270,7 @@ export async function createDocsScriptEntries(): Promise<
               type: "string",
               description: "Maximum matching files to return, from 1 to 50.",
             },
-            list: {
-              type: "string",
-              description:
-                'Set to "true" to list searchable docs and source roots.',
-              enum: ["true"],
-            },
+            list: listToolParameter("searchable docs and source roots"),
           },
         },
       },
@@ -307,11 +303,7 @@ export async function createDocsScriptEntries(): Promise<
               description:
                 "Read a specific doc page by slug (e.g. 'actions', 'authentication', 'database')",
             },
-            list: {
-              type: "string",
-              description: 'Set to "true" to list all available doc pages',
-              enum: ["true"],
-            },
+            list: listToolParameter("all available doc pages"),
           },
         },
       },
@@ -344,11 +336,7 @@ export async function createDocsScriptEntries(): Promise<
               description:
                 "Read a specific corpus file or list a directory (e.g. 'templates/plan/AGENTS.md' or 'templates/chat/actions/hello.ts').",
             },
-            list: {
-              type: "string",
-              description: 'Set to "true" to list corpus sections',
-              enum: ["true"],
-            },
+            list: listToolParameter("corpus sections"),
           },
         },
       },

@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { parseArgs } from "../utils.js";
+import { wantsIndexListing } from "./list-flag.js";
 
 interface DocMeta {
   slug: string;
@@ -250,12 +251,12 @@ export default async function docsSearchScript(args: string[]): Promise<void> {
 Options:
   --query <text>    Search docs by keyword (returns matching pages)
   --slug <slug>     Read a specific doc page by slug
-  --list            List all available doc pages
+  --list            List all available doc pages (ignored with --slug/--query)
   --help            Show this help message`);
     return;
   }
 
-  if (parsed.list === "true") {
+  if (wantsIndexListing(parsed, ["slug", "query"])) {
     const docs = await loadAllDocs();
     const listing = docs.map((d) => ({
       slug: d.slug,
