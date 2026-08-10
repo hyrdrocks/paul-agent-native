@@ -527,6 +527,25 @@ export async function resolveFetchToolKeyAllowlist(
   return deps.getKeyAllowlist(keyName, "user", owner);
 }
 
+/**
+ * Whether a file under `actions/` or `scripts/` exports anything at all.
+ *
+ * Action discovery imports these files to read the real `tool` + `run` pair off
+ * the module. A file with no exports cannot supply either, so importing it can
+ * only run its side effects — and a CLI-style script's top-level
+ * `process.exit()` takes the whole server process with it, past any `catch`.
+ *
+ * Deliberately a source sniff rather than a parse: discovery already reads the
+ * source for its `http:`/`agentTool:` fallback sniff, and the question here is
+ * only "could an import possibly find an export", where a false positive costs
+ * nothing beyond the import that was happening anyway.
+ */
+export function exportsAnything(source: string): boolean {
+  return /(^|[\s;}])export\s*[{*]|(^|[\s;}])export\s+(default|const|let|var|function|async|class|type|interface|enum|abstract)\b/.test(
+    source,
+  );
+}
+
 export function createAgentChatPlugin(
   options?: AgentChatPluginOptions,
 ): NitroPluginDef {
@@ -848,8 +867,18 @@ export function createAgentChatPlugin(
               // run function (not a shell wrapper). This makes HTTP endpoints
               // work correctly. Only fall back to shell wrapper if the import
               // fails (e.g., CLI-style scripts that throw at top level).
+              //
+              // A file that exports nothing can never satisfy the `def.tool` +
+              // `def.run` shape below, so importing it buys nothing and risks
+              // everything: a CLI script's top-level `process.exit` is not a
+              // throw, so the `catch` cannot contain it and the server process
+              // dies during discovery. Skip straight to the shell wrapper,
+              // which is how such a script is meant to be run anyway.
               const filePath = pathMod.join(actionsDir, file);
               try {
+                if (!exportsAnything(_fs.readFileSync(filePath, "utf-8"))) {
+                  throw new Error(`${file} exports nothing to discover`);
+                }
                 const mod = await import(/* @vite-ignore */ filePath);
                 const def =
                   mod.default && typeof mod.default === "object"

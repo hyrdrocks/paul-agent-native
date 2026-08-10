@@ -2969,6 +2969,87 @@ function isBuildCommand(command?: AgentNativeViteCommand): boolean {
   return command === "build" || (!command && process.argv.includes("build"));
 }
 
+/**
+ * Which packages Vite must keep in a dev server module graph rather than hand
+ * to Node's ESM loader.
+ *
+ * Kept as its own function because the list has to be applied to more than one
+ * Vite environment. `ssr.noExternal` reaches only the environment literally
+ * named `ssr`; see `serverEnvironmentInliningPolicy`.
+ */
+function devServerNoExternal(args: {
+  cwd: string;
+  userNoExternal?: unknown;
+  workspaceCoreNoExternal: RegExp[];
+  localWorkspacePackageNoExternal: RegExp[];
+}): Array<string | RegExp> {
+  const { cwd } = args;
+  return [
+    // Every Agent Native package, not just core. A package left external is
+    // loaded by Node while the graph around it is inlined by Vite, and any
+    // React context the two share then exists twice: an externalized
+    // `@agent-native/toolkit` pulls its own `@radix-ui/react-tooltip` and
+    // server-renders `Tooltip must be used within TooltipProvider` against the
+    // inlined provider. These packages also ship dist files carrying literal
+    // `@/` path-alias imports, which only resolve inside Vite's pipeline where
+    // the consuming app's `@` → `./app` alias is registered. The build config
+    // already inlines everything but `node:` builtins, so this is dev matching
+    // what ships.
+    /^@agent-native\//,
+    // Keep React Router in Vite's SSR module graph so resolve.dedupe
+    // can force root.tsx and core's shared entry-server through the
+    // same FrameworkContext instance.
+    ...(hasDep("react-router", cwd) ? [/^react-router(\/.*)?$/] : []),
+    // Radix UI primitives are transitive deps of @agent-native/core
+    // (used by FeedbackButton, AgentSidebar, ShareDialog, etc.). When
+    // a consumer app SSRs a component that imports Radix, Node's
+    // externalized resolver can't find @radix-ui/* from the app cwd
+    // because pnpm doesn't hoist transitive deps. Bundling them
+    // through Vite resolves them via the workspace store.
+    /^@radix-ui\//,
+    ...args.workspaceCoreNoExternal,
+    ...args.localWorkspacePackageNoExternal,
+    ...arrayFrom(args.userNoExternal as string | RegExp | undefined),
+  ];
+}
+
+/**
+ * Decide whether a Vite environment needs core's dev inlining policy restated.
+ *
+ * Vite's `ssr` config shorthand lands on `environments.ssr` alone. Nitro
+ * renders the app in an environment it names `nitro`, whose own dev
+ * `resolve.noExternal` lists Nitro's runtime packages and nothing of ours. So
+ * in that environment the app's own files are inlined by Vite while every
+ * `@agent-native/core` subpath is handed to Node's ESM loader. Core then loads
+ * its own React Router through Node while the app's `<Router>` provider comes
+ * from the inlined copy, and the two contexts are different objects — the
+ * `useLocation() may be used only in the context of a <Router>` 500 on any
+ * server-rendered public route.
+ *
+ * Restating the policy per environment rather than only through the shorthand
+ * is what keeps one module registry per environment self-consistent.
+ */
+function serverEnvironmentInliningPolicy(args: {
+  name: string;
+  consumer?: string;
+  command?: AgentNativeViteCommand;
+  currentNoExternal?: unknown;
+  noExternal: Array<string | RegExp>;
+}): { resolve: { noExternal: Array<string | RegExp> } } | undefined {
+  // The build config already inlines everything but `node:` builtins, and a
+  // built server has one Rolldown graph rather than one registry per loader.
+  if (isBuildCommand(args.command)) return undefined;
+  if (args.consumer !== "server") return undefined;
+  // `ssr` gets the same list from the shorthand above; restating it here would
+  // only duplicate every entry in the resolved config.
+  if (args.name === "ssr") return undefined;
+  // An environment that already inlines everything — Nitro's workerd runner
+  // sets `noExternal: true` — has nothing to gain and would lose the blanket
+  // policy if a list were merged over it.
+  if (args.currentNoExternal === true) return undefined;
+  return { resolve: { noExternal: args.noExternal } };
+}
+
 function hasReactRouterPlugin(plugins: any[] | undefined): boolean {
   return Boolean(
     plugins?.some(
@@ -3607,33 +3688,12 @@ function createAgentNativeConfig(
           // so the workspace-core template's exports.development → src/
           // entry is picked automatically — Vite handles TS compilation
           // and triggers a server restart when those files change.
-          noExternal: [
-            /^@agent-native\/core(\/.*)?$/,
-            // Keep React Router in Vite's SSR module graph so resolve.dedupe
-            // can force root.tsx and core's shared entry-server through the
-            // same FrameworkContext instance.
-            ...(hasDep("react-router", cwd) ? [/^react-router(\/.*)?$/] : []),
-            // Radix UI primitives are transitive deps of @agent-native/core
-            // (used by FeedbackButton, AgentSidebar, ShareDialog, etc.). When
-            // a consumer app SSRs a component that imports Radix, Node's
-            // externalized resolver can't find @radix-ui/* from the app cwd
-            // because pnpm doesn't hoist transitive deps. Bundling them
-            // through Vite resolves them via the workspace store.
-            /^@radix-ui\//,
-            // scheduling ships TypeScript-compiled dist files that contain literal
-            // `@/` path-alias imports (e.g. `import { Input } from
-            // "@/components/ui/input"`). In standalone (published) mode Node
-            // treats the package as an external CJS dep and can't resolve
-            // `@/components`. Adding it to noExternal makes Vite process it
-            // through the module pipeline, where the consumer app's `@` →
-            // `./app` alias is already registered.
-            ...(hasDep("@agent-native/scheduling", cwd)
-              ? [/^@agent-native\/scheduling(\/.*)?$/]
-              : []),
-            ...workspaceCoreNoExternal,
-            ...localWorkspacePackageNoExternal,
-            ...arrayFrom((userConfig.ssr as { noExternal?: any })?.noExternal),
-          ],
+          noExternal: devServerNoExternal({
+            cwd,
+            userNoExternal: (userConfig.ssr as { noExternal?: any })?.noExternal,
+            workspaceCoreNoExternal,
+            localWorkspacePackageNoExternal,
+          }),
           external: [
             "react",
             "react-dom",
@@ -3726,6 +3786,27 @@ function createAgentNativeConfigPlugin(
         projectConfig,
       );
     },
+    configEnvironment(name: string, envConfig: any, env: ConfigEnv) {
+      const cwd = process.cwd();
+      const workspaceCore = findWorkspaceCoreSync(cwd);
+      const packageWorkspaceRoot = findPnpmWorkspaceRoot(cwd);
+      return serverEnvironmentInliningPolicy({
+        name,
+        consumer: envConfig?.consumer,
+        command: env?.command,
+        currentNoExternal: envConfig?.resolve?.noExternal,
+        noExternal: devServerNoExternal({
+          cwd,
+          workspaceCoreNoExternal: workspaceCore
+            ? [new RegExp(`^${escapeRegex(workspaceCore.packageName)}(/.*)?$`)]
+            : [],
+          localWorkspacePackageNoExternal: findLocalWorkspacePackageDeps(
+            cwd,
+            packageWorkspaceRoot,
+          ).map((pkg) => new RegExp(`^${escapeRegex(pkg.packageName)}(/.*)?$`)),
+        }),
+      });
+    },
   };
 }
 
@@ -3783,6 +3864,8 @@ export {
   getDefaultOptimizeDeps as _getDefaultOptimizeDeps,
   findCorePackageRoot as _findCorePackageRoot,
   getReactRouterAliases as _getReactRouterAliases,
+  devServerNoExternal as _devServerNoExternal,
+  serverEnvironmentInliningPolicy as _serverEnvironmentInliningPolicy,
   nitroStartupGate as _nitroStartupGate,
   nitroStartupRecovery as _nitroStartupRecovery,
   nitroModuleGraphSignature as _nitroModuleGraphSignature,

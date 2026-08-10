@@ -9,6 +9,7 @@ import { parseChangelog } from "../changelog/parse.js";
 import { signEmbedSessionToken } from "../server/embed-session.js";
 import {
   _debounceNitroFullReloadHotUpdate,
+  _devServerNoExternal,
   _findCorePackageRoot,
   _getClientDedupe,
   _getDefaultOptimizeDeps,
@@ -18,6 +19,7 @@ import {
   _nitroModuleGraphSignature,
   _nitroStartupGate,
   _nitroStartupRecovery,
+  _serverEnvironmentInliningPolicy,
   agentNative,
   defineConfig,
   isFrameworkDevPath,
@@ -2613,5 +2615,93 @@ describe("local-core dev aliases and router dedupe", () => {
     expect(fs.existsSync(aliases[0]!.replacement)).toBe(true);
     expect(aliases[1]?.find.test("react-router")).toBe(true);
     expect(fs.existsSync(aliases[1]!.replacement)).toBe(true);
+  });
+});
+
+describe("dev server module inlining policy", () => {
+  const noExternal = [/^@agent-native\/core(\/.*)?$/];
+
+  it("covers every core subpath, not only the package root", () => {
+    const patterns = _devServerNoExternal({
+      cwd: process.cwd(),
+      workspaceCoreNoExternal: [],
+      localWorkspacePackageNoExternal: [],
+    }) as RegExp[];
+    const core = patterns[0]!;
+
+    expect(core.test("@agent-native/core")).toBe(true);
+    expect(core.test("@agent-native/core/client/hooks")).toBe(true);
+    expect(core.test("@agent-native/core/client/navigation")).toBe(true);
+  });
+
+  it("carries a caller's own entries through", () => {
+    const patterns = _devServerNoExternal({
+      cwd: process.cwd(),
+      userNoExternal: [/^my-package$/],
+      workspaceCoreNoExternal: [],
+      localWorkspacePackageNoExternal: [],
+    });
+
+    expect(patterns).toContainEqual(/^my-package$/);
+  });
+
+  // Nitro renders the app in an environment named `nitro`, which the `ssr`
+  // config shorthand never reaches. Without the policy restated there, core is
+  // handed to Node's ESM loader while the app around it is inlined, and the two
+  // React Router copies that produces break `useLocation` during SSR.
+  it("restates the policy for a server environment the shorthand cannot reach", () => {
+    expect(
+      _serverEnvironmentInliningPolicy({
+        name: "nitro",
+        consumer: "server",
+        command: "serve",
+        noExternal,
+      }),
+    ).toEqual({ resolve: { noExternal } });
+  });
+
+  it("leaves the ssr environment to the shorthand", () => {
+    expect(
+      _serverEnvironmentInliningPolicy({
+        name: "ssr",
+        consumer: "server",
+        command: "serve",
+        noExternal,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("leaves client environments alone", () => {
+    expect(
+      _serverEnvironmentInliningPolicy({
+        name: "client",
+        consumer: "client",
+        command: "serve",
+        noExternal,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("does not narrow an environment that already inlines everything", () => {
+    expect(
+      _serverEnvironmentInliningPolicy({
+        name: "nitro",
+        consumer: "server",
+        command: "serve",
+        currentNoExternal: true,
+        noExternal,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("stays out of the build config, which inlines everything already", () => {
+    expect(
+      _serverEnvironmentInliningPolicy({
+        name: "nitro",
+        consumer: "server",
+        command: "build",
+        noExternal,
+      }),
+    ).toBeUndefined();
   });
 });
