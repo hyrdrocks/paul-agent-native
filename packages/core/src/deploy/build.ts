@@ -37,6 +37,7 @@ import {
   AGENT_CHAT_DURABLE_BACKGROUND_ENV,
   AGENT_CHAT_PROCESS_RUN_PATH,
   BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY,
+  INTERNAL_TOKEN_BRIDGE_KEY,
   isDurableBackgroundFlagExplicitlyDisabled,
 } from "../agent/durable-background.js";
 import {
@@ -164,8 +165,9 @@ function processorPathFromParsedBody(parsed) {
  *
  * The consumer is the Cloudflare half of the durable background path. Per
  * message it enters the per-invocation background scope, synthesises a POST to
- * the processor route the message selects — carrying the signed internal token
- * the producer minted — and delegates to the SAME handler that serves fetch.
+ * the processor route the message selects — signing the internal token HERE,
+ * at delivery, because a queue holds a message for longer than a token lives —
+ * and delegates to the SAME handler that serves fetch.
  * Structurally the move the Netlify wrapper makes when it rewrites an incoming
  * pathname; the difference is only that there is no inbound request to rewrite,
  * so the envelope carries the origin.
@@ -195,9 +197,24 @@ ${backgroundProcessorRoutingSource()}
 
 const BACKGROUND_QUEUE_MESSAGE_KIND = ${JSON.stringify(BACKGROUND_QUEUE_MESSAGE_KIND)};
 const ENTER_BACKGROUND_SCOPE_KEY = ${JSON.stringify(BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY)};
+const SIGN_PROCESSOR_TOKEN_KEY = ${JSON.stringify(INTERNAL_TOKEN_BRIDGE_KEY)};
 
 function isBackgroundRunMessage(body) {
   return Boolean(body) && body.kind === BACKGROUND_QUEUE_MESSAGE_KIND;
+}
+
+// True when the credential the processor checks is the one THIS entry minted a
+// moment ago. An app route under /api/_agent-native-background/ authenticates
+// with its own token carried in the body and minted by whoever enqueued the
+// job, so a 401 from one of those is that route's decision about a credential
+// this entry never issued — not evidence about A2A_SECRET, and not ours to
+// retry: the body token is already expired and every redelivery re-presents the
+// same one.
+function usesTokenMintedHere(envelope) {
+  const body = envelope && envelope.body;
+  return !(
+    body && body[BACKGROUND_PROCESSOR_FIELD] === BACKGROUND_PROCESSOR_ROUTE
+  );
 }
 
 // A body carrying NO processor field is an agent-chat turn — that is the
@@ -235,10 +252,22 @@ async function runBackgroundQueueMessage(message, env, ctx) {
   }
   const url = new URL(processorPathForEnvelope(envelope.body), envelope.origin);
   const headers = { "Content-Type": "application/json" };
-  // The signed internal token the producer minted, carried verbatim: the queue
-  // handoff authenticates exactly like the HTTP handoff the processor routes
-  // already verify.
-  if (envelope.authorization) headers["Authorization"] = envelope.authorization;
+  // Mint the processor token HERE, at delivery. The token lives five minutes and
+  // a queue holds a message for as long as it needs to — behind a long run, or
+  // across a redelivery — so a token minted by the producer is routinely expired
+  // by the time this runs, and the 401 it earns is indistinguishable from a real
+  // auth failure. A missing bridge is refused rather than delivered unsigned,
+  // because unsigned would earn that same unexplainable 401.
+  const signProcessorToken = globalThis[SIGN_PROCESSOR_TOKEN_KEY];
+  if (typeof signProcessorToken !== "function") {
+    throw new Error(
+      "[agent-background] the framework bundle did not publish " +
+        SIGN_PROCESSOR_TOKEN_KEY +
+        " — refusing to deliver this message unauthenticated.",
+    );
+  }
+  const authorization = signProcessorToken(envelope.taskId);
+  if (authorization) headers["Authorization"] = authorization;
   const request = new Request(url.toString(), {
     method: "POST",
     headers,
@@ -278,9 +307,9 @@ export default {
       try {
         const response = await runBackgroundQueueMessage(message, env, ctx);
         // A 5xx is the processor failing, not the message being bad: retry it
-        // and let the queue's own retry/dead-letter policy bound that. Any
-        // other status means the route made a decision (ran it, or refused the
-        // token) and redelivering would only repeat it. NO response at all is
+        // and let the queue's own retry/dead-letter policy bound that. A 2xx/4xx
+        // means the route made a decision and redelivering would only repeat it
+        // — EXCEPT for the credential refusals below. NO response at all is
         // neither — it means the handler did not answer, and acknowledging that
         // would drop the run while reporting it delivered.
         if (!response || typeof response.status !== "number") {
@@ -288,6 +317,25 @@ export default {
             "[agent-background] the request handler returned no response for queued run " +
               message.body.taskId +
               " — retrying the message rather than acknowledging an unrun turn.",
+          );
+          message.retry();
+        } else if (
+          (response.status === 401 || response.status === 403) &&
+          usesTokenMintedHere(message.body)
+        ) {
+          // This entry minted that token immediately before the request, so a
+          // refusal is a deployment fault (a mismatched or absent A2A_SECRET),
+          // never an expired credential. Acking would delete a turn that never
+          // ran while its run row still said "running" — the run would hang
+          // until a sweeper reaped it, and nothing would record why. Retry to
+          // the dead-letter queue instead, where it is visible.
+          console.error(
+            "[agent-background] processor refused this deployment's own credentials (HTTP " +
+              response.status +
+              ") for queued run " +
+              message.body.taskId +
+              " — check A2A_SECRET on this Worker. Retrying rather than " +
+              "acknowledging a turn that never ran.",
           );
           message.retry();
         } else if (response.status >= 500) {

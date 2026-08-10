@@ -46,6 +46,7 @@ import {
 } from "../a2a/auth-policy.js";
 import {
   extractBearerToken,
+  signInternalToken,
   verifyInternalToken,
 } from "../integrations/internal-token.js";
 import { isCloudflareRuntime } from "../shared/runtime.js";
@@ -205,6 +206,46 @@ export const BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY =
 (globalThis as Record<string, unknown>)[
   BACKGROUND_INVOCATION_SCOPE_BRIDGE_KEY
 ] = runInBackgroundInvocationScope;
+
+/**
+ * Entry point the generated Cloudflare Worker consumer uses to mint the
+ * processor token for a message it is about to deliver.
+ *
+ * The token has a five-minute life, and a queue's delivery latency is unbounded
+ * by construction — a backlog behind a long run, or a redelivery after a failed
+ * invocation, both routinely exceed it. So the credential CANNOT be minted by
+ * the producer and carried on the envelope: it would be dead on arrival for
+ * exactly the long runs the queue exists to serve, and the processor's 401 is
+ * indistinguishable from a real auth failure. Mint at DELIVERY instead, from
+ * the same secret and the same signer the HTTP handoff uses. The consumer lives
+ * outside this module graph, so the bridge is what shares one implementation
+ * rather than growing a second copy of the token format in the emitted entry.
+ */
+export const INTERNAL_TOKEN_BRIDGE_KEY =
+  "__AGENT_NATIVE_SIGN_BACKGROUND_PROCESSOR_TOKEN__";
+
+/**
+ * `Authorization` header value for a run id, or null when this deployment has
+ * no `A2A_SECRET` to sign with. Null is "this deployment signs nothing", never
+ * "signing failed" — a signing failure throws, so the consumer retries the
+ * message instead of delivering it unauthenticated and reading back a 401 it
+ * cannot explain.
+ *
+ * On a Worker, null is a dead end rather than a fallback: the generated entry
+ * publishes the platform env, so the processor's trusted-local check can never
+ * pass there and an unsigned message is refused. Nothing reaches this transport
+ * that way — the agent-chat gate already requires a configured secret — but do
+ * not read the null as "it will run unsigned instead".
+ */
+export function signBackgroundProcessorAuthorization(
+  runId: string,
+): string | null {
+  if (!hasConfiguredA2ASecret()) return null;
+  return `Bearer ${signInternalToken(runId)}`;
+}
+
+(globalThis as Record<string, unknown>)[INTERNAL_TOKEN_BRIDGE_KEY] =
+  signBackgroundProcessorAuthorization;
 
 /**
  * Path of a target for the callers still typed on a plain string. A transport

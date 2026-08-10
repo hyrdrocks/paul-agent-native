@@ -456,10 +456,14 @@ describe("Cloudflare module Worker entry", () => {
       "new URL(processorPathForEnvelope(envelope.body), envelope.origin)",
     );
     expect(entry).toContain("loaded.fetch(request, env, ctx)");
-    // The signed internal token travels with the message, unchanged.
+    // The token is minted at DELIVERY, never carried on the envelope: a
+    // five-minute credential cannot survive an unbounded queue latency.
+    expect(entry).not.toContain("envelope.authorization");
     expect(entry).toContain(
-      'headers["Authorization"] = envelope.authorization;',
+      'const SIGN_PROCESSOR_TOKEN_KEY = "__AGENT_NATIVE_SIGN_BACKGROUND_PROCESSOR_TOKEN__";',
     );
+    expect(entry).toContain("signProcessorToken(envelope.taskId)");
+    expect(entry).toContain('typeof signProcessorToken !== "function"');
     // Every processor the Netlify wrapper reaches is reachable here too.
     expect(entry).toContain(
       'const A2A_PROCESS_TASK_PATH = "/_agent-native/a2a/_process-task";',
@@ -485,6 +489,20 @@ describe("Cloudflare module Worker entry", () => {
     // A handler that answers with nothing is neither a 5xx nor a decision;
     // acking it would drop the run while reporting it delivered.
     expect(entry).toContain('!response || typeof response.status !== "number"');
+    // A credential refusal is this deployment's own fault, not a decision about
+    // the message. Acking one deletes a turn that never ran while its run row
+    // still reads "running" — the hang this consumer is built to prevent.
+    expect(entry).toContain(
+      "response.status === 401 || response.status === 403",
+    );
+    expect(entry).toContain("check A2A_SECRET on this Worker");
+    // ...but only for the processors whose credential this entry actually
+    // minted. An app route under /api/_agent-native-background/ checks its own
+    // body token, minted by whoever enqueued the job, so retrying its 401 just
+    // re-presents the same expired credential three more times and blames
+    // A2A_SECRET for it.
+    expect(entry).toContain("function usesTokenMintedHere(envelope)");
+    expect(entry).toContain("usesTokenMintedHere(message.body)");
   });
 
   it("refuses a message that declares a processor it cannot route", () => {
