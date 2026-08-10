@@ -91,6 +91,27 @@ describe("source-search", { timeout: 60000 }, () => {
     ).resolves.toContain("@agent-native/core/action");
   });
 
+  // A model that fills every optional parameter sends `list` next to the file
+  // it asked for. Answering with the index made it re-ask and trip the agent
+  // loop's duplicate-read-only guard, aborting the turn.
+  it("reads the file when --list is supplied alongside --path", async () => {
+    const output = await runSourceSearch([
+      "--list",
+      "true",
+      "--path",
+      "templates/chat/package.json",
+    ]);
+
+    expect(output).toContain('"name": "chat"');
+  });
+
+  it("still lists when --list is the only thing asked for", async () => {
+    const output = await runSourceSearch(["--list", "true"]);
+
+    expect(output).toContain("templates");
+    expect(output).not.toContain('"name": "chat"');
+  });
+
   it("hides dev-scoped skill files from runtime query, path, and directory results", async () => {
     writeCorpusFixture(
       ".agents/skills/dev-only/SKILL.md",

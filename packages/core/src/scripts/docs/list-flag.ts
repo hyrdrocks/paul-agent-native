@@ -7,8 +7,8 @@
  * alongside the page they actually asked for. If `list` wins, the tool answers
  * with the index, the model re-asks for the same page, and the agent loop's
  * duplicate-read-only guard aborts the turn (`duplicate_read_only_tool`).
- * Selectors therefore take precedence, and a single-value enum is never
- * advertised — a model that fills the enum must have a way to say "no".
+ * Selectors therefore take precedence, and these tools advertise no
+ * single-value enum — a model that fills the enum must have a way to say "no".
  */
 
 import type { AgentNativeJsonSchema } from "../../agent/types.js";

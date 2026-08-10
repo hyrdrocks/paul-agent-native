@@ -227,6 +227,9 @@ export default async function frameworkSearchScript(
   }
   const limit = limitResult.value!;
 
+  // `path` is a filter here rather than a selector — unlike source-search's,
+  // it names no single file to read — so a call carrying only `list` and
+  // `path` has still asked for nothing but the index.
   if (wantsIndexListing(parsed, ["pattern", "query"])) {
     const [docs, sourceFiles] = await Promise.all([
       scope === "source" ? Promise.resolve([]) : loadAllDocs(),
