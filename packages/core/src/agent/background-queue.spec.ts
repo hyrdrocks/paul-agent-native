@@ -12,6 +12,7 @@ import {
   resolveBackgroundQueueProducer,
   sendBackgroundQueueMessage,
 } from "./background-queue.js";
+import { signBackgroundProcessorAuthorization } from "./durable-background.js";
 
 /**
  * The producer half of the Cloudflare queue transport. The decisive cases are
@@ -86,7 +87,7 @@ describe("background queue binding resolution", () => {
 });
 
 describe("background queue envelope", () => {
-  it("carries the signed internal token, not a raw secret", () => {
+  it("carries no credential — the consumer signs at delivery", () => {
     process.env.A2A_SECRET = "test-secret-not-a-real-key";
     const message = buildBackgroundQueueMessage({
       taskId: "run_1",
@@ -95,23 +96,27 @@ describe("background queue envelope", () => {
     });
 
     expect(message.kind).toBe(BACKGROUND_QUEUE_MESSAGE_KIND);
-    expect(message.authorization).toMatch(/^Bearer /);
-    expect(message.authorization).not.toContain("test-secret-not-a-real-key");
-    expect(
-      verifyInternalToken("run_1", String(message.authorization).slice(7)),
-    ).toBe(true);
+    // A token minted here would carry a five-minute life through a transport
+    // whose delivery latency is unbounded, so the envelope holds none at all —
+    // and no secret leaks into a queued message either way.
+    expect(JSON.stringify(message)).not.toContain("test-secret-not-a-real-key");
+    expect(message).not.toHaveProperty("authorization");
     expect(message.body).toEqual({
       taskId: "run_1",
       __agentNativeProcessor: "a2a",
     });
   });
 
-  it("sends unsigned only where the HTTP handoff also would (no A2A_SECRET)", () => {
-    const message = buildBackgroundQueueMessage({
-      taskId: "run_1",
-      origin: ORIGIN,
-    });
-    expect(message.authorization).toBeNull();
+  it("signs at delivery with a token the processor accepts", () => {
+    process.env.A2A_SECRET = "test-secret-not-a-real-key";
+    const header = signBackgroundProcessorAuthorization("run_1");
+
+    expect(header).toMatch(/^Bearer /);
+    expect(verifyInternalToken("run_1", String(header).slice(7))).toBe(true);
+  });
+
+  it("signs nothing where the HTTP handoff also would not (no A2A_SECRET)", () => {
+    expect(signBackgroundProcessorAuthorization("run_1")).toBeNull();
   });
 
   it("carries the caller's origin for the synthesised request", () => {

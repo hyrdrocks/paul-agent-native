@@ -18,7 +18,6 @@
  * three different conditions with three different repairs, and the caller
  * degrades to an inline run on any of them.
  */
-import { signInternalToken } from "../integrations/internal-token.js";
 import { isCloudflareRuntime } from "../shared/runtime.js";
 
 /**
@@ -57,15 +56,8 @@ export const BACKGROUND_QUEUE_MESSAGE_KIND = "agent-native-background-run";
 /** Envelope the producer writes and the generated consumer reads. */
 export interface BackgroundQueueMessage {
   kind: typeof BACKGROUND_QUEUE_MESSAGE_KIND;
-  /** Run/task id the processor claims. Signed over by `authorization`. */
+  /** Run/task id the processor claims. The consumer signs over it at delivery. */
   taskId: string;
-  /**
-   * The `Authorization: Bearer <internal token>` header value, signed here and
-   * carried verbatim so the queue handoff authenticates exactly like the HTTP
-   * handoff does. Null only where `fireInternalDispatch` also sends unsigned:
-   * no `A2A_SECRET`, which the durable gate already refuses to open without.
-   */
-  authorization: string | null;
   /** Origin the consumer builds the synthesised request URL against. */
   origin: string;
   /** JSON body the processor route receives, processor-selection field and all. */
@@ -139,8 +131,16 @@ export function hasBoundBackgroundQueue(): boolean {
 }
 
 /**
- * Build the envelope for one run. Exported so the size refusal and the token
- * handling are testable without a queue binding.
+ * Build the envelope for one run. Exported so the size refusal is testable
+ * without a queue binding.
+ *
+ * The envelope deliberately carries NO credential. A processor token lives five
+ * minutes and a queue's delivery latency is unbounded — a backlog behind a long
+ * run, or a redelivery after a failed invocation, both routinely outlive it — so
+ * a token minted here would be expired on arrival for exactly the long runs this
+ * transport exists to serve, and the consumer would read back a 401 it could not
+ * tell from a real auth failure. The consumer mints at delivery instead; see
+ * `signBackgroundProcessorAuthorization`.
  *
  * `origin` is supplied by the caller rather than resolved here: the consumer
  * has no inbound request to copy one from, and `resolveSelfDispatchBaseUrl` is
@@ -152,24 +152,9 @@ export function buildBackgroundQueueMessage(input: {
   origin: string;
   body?: Record<string, unknown>;
 }): BackgroundQueueMessage {
-  let authorization: string | null = null;
-  try {
-    authorization = `Bearer ${signInternalToken(input.taskId)}`;
-  } catch (err) {
-    // Mirrors `fireInternalDispatch`: a missing A2A_SECRET is the documented
-    // unsigned-dev path, anything else is a real signing failure and must not
-    // pass as one.
-    if (err instanceof Error && !/A2A_SECRET/i.test(err.message)) {
-      console.error(
-        `[agent-chat] signInternalToken failed unexpectedly for ${input.taskId}:`,
-        err,
-      );
-    }
-  }
   return {
     kind: BACKGROUND_QUEUE_MESSAGE_KIND,
     taskId: input.taskId,
-    authorization,
     origin: input.origin,
     body: { taskId: input.taskId, ...(input.body ?? {}) },
   };
