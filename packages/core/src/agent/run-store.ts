@@ -337,6 +337,8 @@ async function ensureRunTables(): Promise<void> {
           dispatch_mode TEXT,
           diag_stage TEXT,
           dispatch_payload TEXT,
+          owner_email TEXT,
+          owner_anonymous ${intType()},
           peak_rss_mb ${intType()}
         )
       `;
@@ -445,6 +447,16 @@ async function ensureRunTables(): Promise<void> {
           // rehydrates the body from this column via the marker's payloadRef.
           // Cleared on terminal status writes.
           ["dispatch_payload", "TEXT"],
+          // owner_email is who the run belongs to, recorded on the row by the
+          // entrypoint that already resolved the caller. A background worker
+          // re-enters cookieless and has ONLY the runId, so this column — not
+          // the thread row — is what attributes the run. See getRunOwner.
+          ["owner_email", "TEXT"],
+          // owner_anonymous records whether that owner is a template's
+          // anonymous pseudo-owner. Without it the worker cannot tell an
+          // anonymous public-surface run from a signed-in one and would hand
+          // the read-only visitor the full read/write handler.
+          ["owner_anonymous", intType()],
           // in_flight_since = ms epoch when run-manager's in-memory
           // `inFlightWorkCount` last transitioned 0->1 (a tool call or nested
           // `agent_call`/A2A delegation started), NULL once it drops back to 0.
@@ -493,75 +505,38 @@ async function ensureRunTables(): Promise<void> {
       // original create-then-additive-alter behaviour. SQLite has no
       // `ADD COLUMN IF NOT EXISTS`, so the ALTERs stay wrapped in try/catch.
       await client.execute(agentRunsCreateSql);
-      // Backfill heartbeat_at on older deployments.
-      try {
-        await client.execute(
-          `ALTER TABLE agent_runs ADD COLUMN heartbeat_at ${intType()}`,
-        );
-      } catch {
-        // Column already exists — ignore
-      }
-      try {
-        await client.execute(
-          `ALTER TABLE agent_runs ADD COLUMN abort_reason TEXT`,
-        );
-      } catch {
-        // Column already exists — ignore
-      }
-      // Backfill last_progress_at — this is distinct from heartbeat_at.
-      // heartbeat_at = "the producer process is alive" (bumped on a timer).
-      // last_progress_at = "the agent is actually emitting events" (bumped on
-      // each emit). The gap between them is the stuck-detector signal.
-      try {
-        await client.execute(
-          `ALTER TABLE agent_runs ADD COLUMN last_progress_at ${intType()}`,
-        );
-      } catch {
-        // Column already exists — ignore
-      }
-      // Backfill in_flight_since — ms epoch when run-manager's in-memory
-      // `inFlightWorkCount` last transitioned 0->1, NULL once back to 0. Lets
-      // the cross-isolate stale reapers grant a bounded grace to a
-      // demonstrably-alive run even when the heartbeat write itself has
-      // failed. See `IN_FLIGHT_RUN_STALE_GRACE_MS` and `setRunInFlightMarker`.
-      try {
-        await client.execute(
-          `ALTER TABLE agent_runs ADD COLUMN in_flight_since ${intType()}`,
-        );
-      } catch {
-        // Column already exists — ignore
-      }
-      // Backfill turn_id / error_code / error_detail.
-      //   turn_id    = stable identity for one logical assistant turn that may
-      //                span several continuation runs, so the durable record
-      //                can be folded across runs instead of dropped per-run.
-      //   error_code / error_detail = terminal failure classification captured
-      //                at completion so errored/cut-off runs are queryable for
-      //                pattern analysis (see listErroredRuns).
-      // dispatch_mode marks how a run was started: NULL/"foreground" for the
-      // normal client-continued synchronous path, "foreground-self-chain" for
-      // a foreground run whose continuation boundary is server-driven, and
-      // "background" for a run dispatched into a Netlify background function.
-      // The reaper/claim widen the stale window for background rows so a slow
-      // cold-start isn't falsely reaped.
-      // diag_stage records the last reached pipeline stage (+ any error) for a
-      // background-dispatched run so a silent worker death is DIAGNOSABLE from
-      // the client (/runs/active surfaces it) without reading the unreadable
-      // Netlify background-function logs. See recordRunDiagnostic.
-      for (const col of [
-        "turn_id",
-        "error_code",
-        "error_detail",
-        "terminal_reason",
-        "dispatch_mode",
-        "diag_stage",
-        "worker_stage",
-        "dispatch_payload",
+      // Additive columns, as (name, type) pairs — the same list shape the
+      // Postgres branch above uses. One loop, not one try/catch per column:
+      // a per-column block is where the next column gets forgotten, and it is
+      // how `owner_anonymous` nearly shipped as a fifth copy of this pattern.
+      // Each column's WHY lives with its declaration in the CREATE above and
+      // in the Postgres list; only the DDL differs here.
+      for (const [col, colType] of [
+        ["heartbeat_at", intType()],
+        ["abort_reason", "TEXT"],
+        ["last_progress_at", intType()],
+        ["in_flight_since", intType()],
+        ["turn_id", "TEXT"],
+        ["error_code", "TEXT"],
+        ["error_detail", "TEXT"],
+        ["terminal_reason", "TEXT"],
+        ["dispatch_mode", "TEXT"],
+        ["diag_stage", "TEXT"],
+        ["worker_stage", "TEXT"],
+        ["dispatch_payload", "TEXT"],
+        ["owner_email", "TEXT"],
+        ["owner_anonymous", intType()],
       ] as const) {
         try {
-          await client.execute(`ALTER TABLE agent_runs ADD COLUMN ${col} TEXT`);
+          await client.execute(
+            `ALTER TABLE agent_runs ADD COLUMN ${col} ${colType}`,
+          );
         } catch {
-          // Column already exists — ignore
+          // coercion-ok: SQLite has no ADD COLUMN IF NOT EXISTS, so "already
+          // exists" is indistinguishable from any other DDL error here. A
+          // genuinely absent column is not swallowed — every one of these is
+          // in DEFAULT_REQUIRED_SCHEMA, which reports it as a schema-health
+          // failure instead of leaving the caller to guess.
         }
       }
       await client.execute(agentRunEventsCreateSql);
@@ -698,13 +673,21 @@ export async function insertRun(
      * bodies at 256KB); the worker rehydrates the body from this column.
      */
     dispatchPayload?: string;
+    /**
+     * Who this run belongs to, as already resolved by the entrypoint. Recorded
+     * on the row because a background worker re-enters cookieless with nothing
+     * but the runId — see `getRunOwner`.
+     */
+    ownerEmail?: string | null;
+    /** True when `ownerEmail` is a template's anonymous pseudo-owner. */
+    ownerAnonymous?: boolean;
   },
 ): Promise<void> {
   await ensureRunTables();
   const client = getDbExec();
   const now = Date.now();
   await client.execute({
-    sql: `INSERT INTO agent_runs (id, thread_id, status, started_at, heartbeat_at, last_progress_at, turn_id, dispatch_mode, dispatch_payload) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING`,
+    sql: `INSERT INTO agent_runs (id, thread_id, status, started_at, heartbeat_at, last_progress_at, turn_id, dispatch_mode, dispatch_payload, owner_email, owner_anonymous) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING`,
     args: [
       id,
       threadId,
@@ -714,6 +697,8 @@ export async function insertRun(
       turnId ?? id,
       options?.dispatchMode ?? null,
       options?.dispatchPayload ?? null,
+      options?.ownerEmail ?? null,
+      options?.ownerAnonymous ? 1 : 0,
     ],
   });
 }
@@ -1049,25 +1034,56 @@ export async function countRunsForTurn(
   return Number.isFinite(count) ? count : 0;
 }
 
+export interface RunOwner {
+  email: string;
+  /** True when the owner is a template's anonymous pseudo-owner. */
+  anonymous: boolean;
+}
+
 /**
- * Resolve the authenticated owner email for a run by joining it to its chat
- * thread. The durable background worker's self-dispatch is cookieless
- * (HMAC-only — see `AGENT_CHAT_PROCESS_RUN_PATH`), so it has no session for the
- * normal owner resolution and would otherwise be treated as unauthenticated.
- * The thread's `owner_email` was written by the authenticated foreground when it
- * created the thread, so it is a trusted, non-forgeable owner source: only the
- * HMAC-signed `runId` selects the row, and the caller cannot influence which
- * owner that row maps to. Returns null when the run (or its thread) is missing.
+ * Who a run belongs to, for a caller that holds only the runId — the durable
+ * background worker, which re-enters cookieless over an HMAC-signed dispatch.
+ * Only the signed `runId` selects the row, so the caller cannot influence which
+ * owner it maps to.
+ *
+ * The run row answers on its own, in one query against a table
+ * `ensureRunTables` created. `chat_threads` is a SEPARATE module's table and is
+ * only consulted for rows written before `owner_email` existed: a turn that
+ * opens a new conversation carries no `threadId`, so `agent_runs.thread_id` is
+ * the runId and there is no thread row to join against at dispatch time.
+ * Joining first made every such turn look unowned, and the worker then rejected
+ * its own dispatch as unauthenticated.
  */
-export async function getRunOwnerEmail(runId: string): Promise<string | null> {
+export async function getRunOwner(runId: string): Promise<RunOwner | null> {
   await ensureRunTables();
   const client = getDbExec();
   const { rows } = await client.execute({
+    sql: `SELECT owner_email, owner_anonymous FROM agent_runs WHERE id = ? LIMIT 1`,
+    args: [runId],
+  });
+  const row = rows?.[0] as
+    | { owner_email?: string | null; owner_anonymous?: unknown }
+    | undefined;
+  if (!row) return null;
+  if (row.owner_email) {
+    return {
+      email: row.owner_email,
+      anonymous: Boolean(Number(row.owner_anonymous ?? 0)),
+    };
+  }
+
+  // Legacy row: written before `owner_email` existed. The thread's owner is the
+  // same trusted, non-forgeable fact, and pre-column rows always had a thread.
+  const { rows: threadRows } = await client.execute({
     sql: `SELECT t.owner_email AS owner_email FROM agent_runs r JOIN chat_threads t ON r.thread_id = t.id WHERE r.id = ? LIMIT 1`,
     args: [runId],
   });
-  const row = rows?.[0] as { owner_email?: string | null } | undefined;
-  return row?.owner_email ?? null;
+  const threadRow = threadRows?.[0] as
+    | { owner_email?: string | null }
+    | undefined;
+  return threadRow?.owner_email
+    ? { email: threadRow.owner_email, anonymous: false }
+    : null;
 }
 
 /**
@@ -1653,7 +1669,7 @@ async function attemptStaleRunRecovery(
   runId: string,
 ): Promise<StaleRunRecoveryOutcome> {
   const { rows } = await db.execute({
-    sql: `SELECT thread_id, turn_id, dispatch_mode, dispatch_payload, started_at FROM agent_runs WHERE id = ? LIMIT 1`,
+    sql: `SELECT thread_id, turn_id, dispatch_mode, dispatch_payload, started_at, owner_email, owner_anonymous FROM agent_runs WHERE id = ? LIMIT 1`,
     args: [runId],
   });
   const row = rows?.[0] as
@@ -1663,6 +1679,8 @@ async function attemptStaleRunRecovery(
         dispatch_mode?: string | null;
         dispatch_payload?: string | null;
         started_at?: number | string | null;
+        owner_email?: string | null;
+        owner_anonymous?: unknown;
       }
     | undefined;
   const dispatchMode = row?.dispatch_mode ?? "";
@@ -1744,7 +1762,7 @@ async function attemptStaleRunRecovery(
   const successorRunId = generateRecoveryRunId();
   const now = Date.now();
   await db.execute({
-    sql: `INSERT INTO agent_runs (id, thread_id, status, started_at, heartbeat_at, last_progress_at, turn_id, dispatch_mode, dispatch_payload) VALUES (?, ?, 'running', ?, ?, ?, ?, 'background', ?) ON CONFLICT (id) DO NOTHING`,
+    sql: `INSERT INTO agent_runs (id, thread_id, status, started_at, heartbeat_at, last_progress_at, turn_id, dispatch_mode, dispatch_payload, owner_email, owner_anonymous) VALUES (?, ?, 'running', ?, ?, ?, ?, 'background', ?, ?, ?) ON CONFLICT (id) DO NOTHING`,
     args: [
       successorRunId,
       threadId,
@@ -1753,6 +1771,11 @@ async function attemptStaleRunRecovery(
       now,
       turnId,
       staleRecoveryDispatchPayload(payload),
+      // Inherited, not re-derived: this runs on the reaper's schedule with no
+      // request context to resolve an owner from, and a successor the worker
+      // cannot attribute is a rescue that drops the turn it was rescuing.
+      row.owner_email ?? null,
+      Number(row.owner_anonymous ?? 0) ? 1 : 0,
     ],
   });
   return { outcome: "recovered", successorRunId, threadId, turnId };
