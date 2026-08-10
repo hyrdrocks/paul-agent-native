@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  signInternalToken,
+  verifyInternalToken,
+} from "../integrations/internal-token.js";
 import { buildBackgroundQueueMessage } from "./background-queue.js";
 import {
   prepareProcessRunRequest,
@@ -8,14 +12,15 @@ import {
 
 /**
  * REPRO for the production hang on design.paulsjob.ai (2026-08-10): a durable
- * background run that sits in the queue backlog longer than the internal
- * token's five-minute life is rejected 401 by the processor it was queued for,
- * and the generated consumer acks that 401 — so the run is deleted from the
- * queue having never executed a single turn.
+ * background run whose processor token was minted at ENQUEUE was rejected 401
+ * by the processor it was queued for, because the queue had held the message
+ * longer than the token lives. The consumer acked that 401, so the turn was
+ * deleted having never executed while its run row still read `running`.
  *
- * The fix moves minting to DELIVERY time. Queue delivery latency is unbounded
- * by design (that is what the queue is for), so it can never be the same clock
- * as enqueue. Every case below asserts on that gap, not on the crypto.
+ * The token's life is fixed and short; a queue's delivery latency is unbounded
+ * by construction. The first case below pins that mismatch as the reason the
+ * credential cannot travel on the envelope — it is the assertion that fails if
+ * anyone reasons "five minutes is surely enough". The rest pin the fix.
  */
 
 const ORIGIN = "https://design.example.com";
@@ -23,6 +28,13 @@ const TASK = "run-1786333164277-qtdj11";
 
 /** internal-token.ts: MAX_AGE_MS. */
 const TOKEN_MAX_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * The observed production gap: enqueued 03:39:24, delivered 03:48:02, while a
+ * preceding run held the consumer. Cloudflare's own backlog metric shows the
+ * queue draining across those seconds.
+ */
+const OBSERVED_QUEUE_LATENCY_MS = 518_000;
 
 let saved: NodeJS.ProcessEnv;
 
@@ -38,50 +50,54 @@ afterEach(() => {
   process.env = saved;
 });
 
-/**
- * Deliver an envelope exactly as the generated Worker consumer does: mint the
- * token now, at delivery, then hand it to the processor's own auth.
- */
-function deliver(message: { taskId: string }) {
-  const authorization = signBackgroundProcessorAuthorization(message.taskId);
-  return prepareProcessRunRequest(
-    { taskId: message.taskId },
-    authorization ?? undefined,
-  );
-}
-
 describe("durable background queue token vs. queue delivery latency", () => {
-  it("authenticates a message the consumer picks up immediately", () => {
-    const message = buildBackgroundQueueMessage({
-      taskId: TASK,
-      origin: ORIGIN,
-    });
+  it("proves an enqueue-time token is dead before a backlogged queue delivers it", () => {
+    // Not a tautology and not about the crypto: this is the fact that makes
+    // carrying a credential on the envelope unworkable at all.
+    expect(OBSERVED_QUEUE_LATENCY_MS).toBeGreaterThan(TOKEN_MAX_AGE_MS);
 
-    vi.advanceTimersByTime(2_000);
+    const mintedAtEnqueue = signInternalToken(TASK);
+    vi.advanceTimersByTime(OBSERVED_QUEUE_LATENCY_MS);
 
-    expect(deliver(message)).toMatchObject({ ok: true, runId: TASK });
+    expect(verifyInternalToken(TASK, mintedAtEnqueue)).toBe(false);
   });
 
-  it("REGRESSION: still authenticates after the run sat in the backlog", () => {
+  it("REGRESSION: the envelope carries no credential to go stale", () => {
     const message = buildBackgroundQueueMessage({
       taskId: TASK,
       origin: ORIGIN,
     });
 
-    // The observed production gap: this run was enqueued at 03:39:24 and the
-    // consumer reached it at 03:48:02, 518s later, while a preceding run held
-    // the consumer. Cloudflare's own backlog metric shows the queue draining
-    // across those same seconds.
-    vi.advanceTimersByTime(518_000);
+    // The producer must hand the consumer nothing it would be tempted to
+    // present later. Re-adding an `authorization` (or any other Bearer-shaped
+    // field) puts the expiry back on the wire, so assert on the whole envelope
+    // rather than on one field name.
+    expect(JSON.stringify(message)).not.toContain("Bearer");
+    expect(message).not.toHaveProperty("authorization");
+  });
 
-    expect(518_000).toBeGreaterThan(TOKEN_MAX_AGE_MS);
-    expect(deliver(message)).toMatchObject({ ok: true, runId: TASK });
+  it("REGRESSION: signing at delivery authenticates after the same latency", () => {
+    const message = buildBackgroundQueueMessage({
+      taskId: TASK,
+      origin: ORIGIN,
+    });
+
+    vi.advanceTimersByTime(OBSERVED_QUEUE_LATENCY_MS);
+
+    // What the generated consumer does: mint now, then hand it to the
+    // processor's own auth.
+    const authorization = signBackgroundProcessorAuthorization(message.taskId);
+    expect(
+      prepareProcessRunRequest(
+        { taskId: message.taskId },
+        authorization ?? undefined,
+      ),
+    ).toMatchObject({ ok: true, runId: TASK });
   });
 
   it("REGRESSION: a run may outlive the token life without being unrunnable", () => {
-    // A durable background run owns a 15-minute consumer invocation. A token
-    // that dies at 5 minutes cannot be the thing that authorises it — the
-    // second and third runs behind a long first run are structurally doomed.
+    // A durable background run owns a 15-minute consumer invocation, so the
+    // second and third runs behind a long first one were structurally doomed.
     const message = buildBackgroundQueueMessage({
       taskId: TASK,
       origin: ORIGIN,
@@ -89,6 +105,12 @@ describe("durable background queue token vs. queue delivery latency", () => {
 
     vi.advanceTimersByTime(15 * 60 * 1000);
 
-    expect(deliver(message)).toMatchObject({ ok: true, runId: TASK });
+    const authorization = signBackgroundProcessorAuthorization(message.taskId);
+    expect(
+      prepareProcessRunRequest(
+        { taskId: message.taskId },
+        authorization ?? undefined,
+      ),
+    ).toMatchObject({ ok: true, runId: TASK });
   });
 });

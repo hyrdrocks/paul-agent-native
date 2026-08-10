@@ -496,6 +496,13 @@ describe("Cloudflare module Worker entry", () => {
       "response.status === 401 || response.status === 403",
     );
     expect(entry).toContain("check A2A_SECRET on this Worker");
+    // ...but only for the processors whose credential this entry actually
+    // minted. An app route under /api/_agent-native-background/ checks its own
+    // body token, minted by whoever enqueued the job, so retrying its 401 just
+    // re-presents the same expired credential three more times and blames
+    // A2A_SECRET for it.
+    expect(entry).toContain("function usesTokenMintedHere(envelope)");
+    expect(entry).toContain("usesTokenMintedHere(message.body)");
   });
 
   it("refuses a message that declares a processor it cannot route", () => {

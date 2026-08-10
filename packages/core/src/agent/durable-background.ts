@@ -225,11 +225,17 @@ export const INTERNAL_TOKEN_BRIDGE_KEY =
   "__AGENT_NATIVE_SIGN_BACKGROUND_PROCESSOR_TOKEN__";
 
 /**
- * `Authorization` header value for a run id, or null on the documented unsigned
- * path (no `A2A_SECRET`), where the processor falls back to its trusted-local
- * check. Null is "this deployment signs nothing", never "signing failed" — a
- * signing failure throws, so the consumer retries the message instead of
- * delivering it unauthenticated and reading back a 401 it cannot explain.
+ * `Authorization` header value for a run id, or null when this deployment has
+ * no `A2A_SECRET` to sign with. Null is "this deployment signs nothing", never
+ * "signing failed" — a signing failure throws, so the consumer retries the
+ * message instead of delivering it unauthenticated and reading back a 401 it
+ * cannot explain.
+ *
+ * On a Worker, null is a dead end rather than a fallback: the generated entry
+ * publishes the platform env, so the processor's trusted-local check can never
+ * pass there and an unsigned message is refused. Nothing reaches this transport
+ * that way — the agent-chat gate already requires a configured secret — but do
+ * not read the null as "it will run unsigned instead".
  */
 export function signBackgroundProcessorAuthorization(
   runId: string,

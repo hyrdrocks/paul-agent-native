@@ -165,8 +165,9 @@ function processorPathFromParsedBody(parsed) {
  *
  * The consumer is the Cloudflare half of the durable background path. Per
  * message it enters the per-invocation background scope, synthesises a POST to
- * the processor route the message selects — carrying the signed internal token
- * the producer minted — and delegates to the SAME handler that serves fetch.
+ * the processor route the message selects — signing the internal token HERE,
+ * at delivery, because a queue holds a message for longer than a token lives —
+ * and delegates to the SAME handler that serves fetch.
  * Structurally the move the Netlify wrapper makes when it rewrites an incoming
  * pathname; the difference is only that there is no inbound request to rewrite,
  * so the envelope carries the origin.
@@ -200,6 +201,20 @@ const SIGN_PROCESSOR_TOKEN_KEY = ${JSON.stringify(INTERNAL_TOKEN_BRIDGE_KEY)};
 
 function isBackgroundRunMessage(body) {
   return Boolean(body) && body.kind === BACKGROUND_QUEUE_MESSAGE_KIND;
+}
+
+// True when the credential the processor checks is the one THIS entry minted a
+// moment ago. An app route under /api/_agent-native-background/ authenticates
+// with its own token carried in the body and minted by whoever enqueued the
+// job, so a 401 from one of those is that route's decision about a credential
+// this entry never issued — not evidence about A2A_SECRET, and not ours to
+// retry: the body token is already expired and every redelivery re-presents the
+// same one.
+function usesTokenMintedHere(envelope) {
+  const body = envelope && envelope.body;
+  return !(
+    body && body[BACKGROUND_PROCESSOR_FIELD] === BACKGROUND_PROCESSOR_ROUTE
+  );
 }
 
 // A body carrying NO processor field is an agent-chat turn — that is the
@@ -304,13 +319,16 @@ export default {
               " — retrying the message rather than acknowledging an unrun turn.",
           );
           message.retry();
-        } else if (response.status === 401 || response.status === 403) {
-          // This entry mints the token itself, immediately before the request,
-          // so a refusal is a deployment fault (a mismatched or absent
-          // A2A_SECRET), never an expired credential. Acking would delete a turn
-          // that never ran while its run row still said "running" — the run
-          // would hang until a sweeper reaped it, and nothing would record why.
-          // Retry to the dead-letter queue instead, where it is visible.
+        } else if (
+          (response.status === 401 || response.status === 403) &&
+          usesTokenMintedHere(message.body)
+        ) {
+          // This entry minted that token immediately before the request, so a
+          // refusal is a deployment fault (a mismatched or absent A2A_SECRET),
+          // never an expired credential. Acking would delete a turn that never
+          // ran while its run row still said "running" — the run would hang
+          // until a sweeper reaped it, and nothing would record why. Retry to
+          // the dead-letter queue instead, where it is visible.
           console.error(
             "[agent-background] processor refused this deployment's own credentials (HTTP " +
               response.status +
