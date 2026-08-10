@@ -98,14 +98,6 @@ export interface RequestRunContext {
   } | null;
   /** Resolved owner email (set by prepareRun). */
   owner?: string;
-  /**
-   * True when `owner` is a template's anonymous pseudo-owner rather than a
-   * signed-in account. Carried alongside the email because the two together
-   * are the identity: the email alone cannot tell a public read-only visitor
-   * from an authenticated user, and code that assumes the latter hands the
-   * former the full write surface.
-   */
-  ownerAnonymous?: boolean;
   /** Owner's API key for this run's engine (set by prepareRun). */
   userApiKey?: string;
   /**

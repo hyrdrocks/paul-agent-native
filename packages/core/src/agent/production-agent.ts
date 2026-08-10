@@ -166,7 +166,6 @@ import {
   clearLedgerForThread,
   insertRun,
   insertRunEvent,
-  getRunOwner,
   isTurnAborted,
   markRunAborted,
   updateRunHeartbeat,
@@ -7012,7 +7011,6 @@ export interface ChainServerDrivenContinuationDeps {
   isTurnAborted?: typeof isTurnAborted;
   emitRunText?: typeof emitRunText;
   insertRun?: typeof insertRun;
-  getRunOwner?: typeof getRunOwner;
   fireInternalDispatch?: typeof fireInternalDispatch;
   fireBackgroundDispatch?: typeof fireBackgroundDispatch;
   readBackgroundRunClaim?: typeof readBackgroundRunClaim;
@@ -7243,7 +7241,6 @@ export async function chainServerDrivenContinuation(opts: {
     isTurnAborted: opts.deps?.isTurnAborted ?? isTurnAborted,
     emitRunText: opts.deps?.emitRunText ?? emitRunText,
     insertRun: opts.deps?.insertRun ?? insertRun,
-    getRunOwner: opts.deps?.getRunOwner ?? getRunOwner,
     fireInternalDispatch:
       opts.deps?.fireInternalDispatch ?? fireInternalDispatch,
     fireBackgroundDispatch:
@@ -7401,40 +7398,11 @@ export async function chainServerDrivenContinuation(opts: {
     //    a regular-function target instead responds only after the successor
     //    chunk finishes, so its timeout falls back to the claim check below.
     //    Retried with backoff for transient network blips.
-    // The successor is dispatched cookieless like its predecessor, so it needs
-    // its own recorded owner. Inherited from the predecessor ROW rather than
-    // read from ambient request context: this runs on the run's terminal
-    // completion chain, which is not guaranteed to still be inside the
-    // request's AsyncLocalStorage scope, and an owner-less successor cannot be
-    // attributed by the worker that picks it up.
-    let successorOwner: { email: string; anonymous: boolean } | null = null;
-    try {
-      successorOwner = await d.getRunOwner(runId);
-    } catch (ownerErr) {
-      console.error(
-        `[agent-chat] could not read the owner of ${runId} for its continuation successor; ` +
-          "falling back to the request context:",
-        ownerErr,
-      );
-    }
-    if (!successorOwner) {
-      const ambientOwner = getRequestUserEmail();
-      successorOwner = ambientOwner
-        ? { email: ambientOwner, anonymous: false }
-        : null;
-    }
-
     let nextRowInserted = false;
     try {
       await d.insertRun(nextRunId, effectiveThreadId, effectiveTurnId, {
         dispatchMode: "background",
         dispatchPayload: JSON.stringify(continuationBody),
-        ...(successorOwner
-          ? {
-              ownerEmail: successorOwner.email,
-              ownerAnonymous: successorOwner.anonymous,
-            }
-          : {}),
       });
       nextRowInserted = true;
     } catch (insertErr) {
@@ -8725,16 +8693,9 @@ export function createProductionAgentHandler(
         // the self-POST below can carry only the tiny marker — Netlify caps
         // background-function request bodies at 256KB, and a large chat
         // history (inline attachments especially) silently exceeded that.
-        // `ownerEmail` is what makes the handoff attributable. The worker
-        // re-enters over a cookieless HMAC dispatch, and a first turn in a new
-        // conversation has no `chat_threads` row to recover the owner from.
-        // The anonymous flag travels with it: it selects the read-only handler
-        // on the far side, and losing it upgrades a public visitor's turn.
         await insertRun(runId, effectiveThreadId, effectiveTurnId, {
           dispatchMode: "background",
           dispatchPayload: JSON.stringify(body),
-          ownerEmail: ownerEmail ?? getRequestUserEmail() ?? null,
-          ownerAnonymous: getRequestRunContext()?.ownerAnonymous === true,
         });
         backgroundRowInserted = true;
       } catch (err) {
@@ -9173,20 +9134,7 @@ export function createProductionAgentHandler(
         if (isChainedBackgroundContinuation) {
           await insertRun(runId, effectiveThreadId, effectiveTurnId, {
             dispatchMode: "background",
-            ownerEmail: getRequestUserEmail() ?? null,
-          }).catch(async (insertErr) => {
-            // Not best-effort: without this row the claim below loses and the
-            // chunk reports `already-claimed`, which names the wrong cause.
-            await recordRunDiagnostic(
-              runId,
-              RUN_DIAG_STAGE.workerSetupStep,
-              `continuation_row_insert_failed ${
-                insertErr instanceof Error
-                  ? insertErr.message
-                  : String(insertErr)
-              }`,
-            ).catch(() => {});
-          });
+          }).catch(() => {});
         }
         const won = await claimBackgroundRun(runId);
         if (!won) {

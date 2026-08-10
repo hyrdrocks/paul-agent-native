@@ -69,14 +69,6 @@ export const DEFAULT_REQUIRED_SCHEMA: RequiredSchemaTable[] = [
       "dispatch_mode",
       "diag_stage",
       "worker_stage",
-      "dispatch_payload",
-      // Load-bearing for background-run auth: the worker attributes its own
-      // cookieless dispatch from these. The SQLite ALTER that adds them
-      // swallows every error, so an absent column has to surface here or the
-      // operator sees `ok: true` while every background turn fails to resolve
-      // an owner.
-      "owner_email",
-      "owner_anonymous",
     ],
   },
   {

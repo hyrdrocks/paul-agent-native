@@ -5944,29 +5944,7 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
             // helper expands that owner into the same user/org AsyncLocalStorage
             // context the foreground request uses, so credential and data scoping
             // stay aligned.
-            try {
-              await seedBackgroundAgentRunOwnerContext(event, prepared.runId);
-            } catch (seedErr) {
-              // Claim the row on the way out. This throw lands BEFORE the
-              // handler's own early claim, and the shared failure finalizer
-              // only terminalizes a claimed run — so an unclaimed row would be
-              // left `running` with its payload intact and the unclaimed sweep
-              // would redispatch it into the same failure every ~20s until the
-              // bound expired and reported `background_worker_never_started`,
-              // a cause that has nothing to do with why it failed.
-              const { claimBackgroundRun } =
-                await import("../agent/run-store.js");
-              try {
-                await claimBackgroundRun(prepared.runId);
-              } catch (claimErr) {
-                console.error(
-                  `[agent-chat] could not claim ${prepared.runId} to terminalize a failed ` +
-                    "owner seed — the unclaimed sweep will redispatch it until its bound:",
-                  claimErr,
-                );
-              }
-              throw seedErr;
-            }
+            await seedBackgroundAgentRunOwnerContext(event, prepared.runId);
             return await invokeAgentChatHandler(event);
           } catch (err: any) {
             console.error("[agent-chat] _process-run failed:", err);

@@ -24,11 +24,7 @@ let claimStateRows: Array<{
 let runListRows: Array<Record<string, unknown>> = [];
 let refreshedRunListRows: Array<Record<string, unknown>> | null = null;
 let runListSelectCount = 0;
-let runOwnerRows: Array<{
-  owner_email: string | null;
-  owner_anonymous?: number | null;
-}> = [];
-let threadOwnerRows: Array<{ owner_email: string | null }> = [];
+let runOwnerRows: Array<{ owner_email: string | null }> = [];
 let insertEventBehavior: () => void = () => {};
 let abortRowsAffected = 1;
 let dispatchPayloadRows: Array<{ dispatch_payload: string | null }> = [];
@@ -135,13 +131,9 @@ const mockDb = {
     ) {
       return { rows: claimStateRows, rowsAffected: 0 };
     }
-    // getRunOwner primary read: SELECT owner_email, owner_anonymous FROM agent_runs
-    if (/SELECT owner_email, owner_anonymous FROM agent_runs/i.test(rawSql)) {
-      return { rows: runOwnerRows, rowsAffected: 0 };
-    }
-    // getRunOwner legacy fallback: SELECT t.owner_email ... JOIN chat_threads
+    // getRunOwnerEmail: SELECT t.owner_email FROM agent_runs r JOIN chat_threads t ...
     if (/JOIN chat_threads/i.test(rawSql)) {
-      return { rows: threadOwnerRows, rowsAffected: 0 };
+      return { rows: runOwnerRows, rowsAffected: 0 };
     }
     if (/INSERT INTO agent_run_events/i.test(rawSql)) {
       insertEventBehavior();
@@ -211,7 +203,7 @@ const {
   getRunStatus,
   listRunsForThread,
   readBackgroundRunClaim,
-  getRunOwner,
+  getRunOwnerEmail,
   writeLedgerEntry,
   readLedgerEntry,
   clearLedgerForThread,
@@ -302,31 +294,9 @@ describe("run store", () => {
     expect(await readBackgroundRunClaim("run-missing")).toBeNull();
   });
 
-  // A first turn in a NEW conversation carries no threadId, so agent_runs.
-  // thread_id is the runId and no chat_threads row exists yet. Recovering the
-  // owner by joining that row is what made every such background dispatch look
-  // unowned, and the worker then rejected itself with 401 Unauthenticated.
-  it("getRunOwner answers from the run row without touching chat_threads", async () => {
-    runOwnerRows = [{ owner_email: "owner@example.com", owner_anonymous: 0 }];
-    threadOwnerRows = [];
-    expect(await getRunOwner("run-new-thread")).toEqual({
-      email: "owner@example.com",
-      anonymous: false,
-    });
-
-    // `chat_threads` belongs to another module and `ensureRunTables` never
-    // creates it — reading it here would make the answer depend on a table
-    // that may not exist in this isolate.
-    expect(execCalls.some((c) => /chat_threads/i.test(c.sql))).toBe(false);
-  });
-
-  it("getRunOwner falls back to the thread owner for legacy rows, or null when missing", async () => {
-    runOwnerRows = [{ owner_email: null }];
-    threadOwnerRows = [{ owner_email: "owner@example.com" }];
-    expect(await getRunOwner("run-1")).toEqual({
-      email: "owner@example.com",
-      anonymous: false,
-    });
+  it("getRunOwnerEmail resolves the thread owner for a run, or null when missing", async () => {
+    runOwnerRows = [{ owner_email: "owner@example.com" }];
+    expect(await getRunOwnerEmail("run-1")).toBe("owner@example.com");
     // resolves by joining agent_runs to chat_threads, keyed by the runId only —
     // the caller cannot supply the owner, only select the HMAC-signed run row.
     const joinCall = execCalls.find((c) => /JOIN chat_threads/i.test(c.sql));
@@ -334,8 +304,7 @@ describe("run store", () => {
     expect(joinCall?.args).toEqual(["run-1"]);
 
     runOwnerRows = [];
-    threadOwnerRows = [];
-    expect(await getRunOwner("run-missing")).toBeNull();
+    expect(await getRunOwnerEmail("run-missing")).toBeNull();
   });
 
   it("persists a terminal event when marking a run aborted", async () => {
@@ -1126,46 +1095,7 @@ describe("run store", () => {
       "turn-1",
       "background",
       '{"messages":[]}',
-      null,
-      0,
     ]);
-  });
-
-  it("insertRun persists ownerEmail into the owner_email column", async () => {
-    await insertRun("run-owned", "thread-1", "turn-1", {
-      dispatchMode: "background",
-      ownerEmail: "owner@example.com",
-    });
-
-    const insert = execCalls.find((call) =>
-      /INSERT INTO agent_runs/i.test(call.sql),
-    );
-    expect(insert?.sql).toContain("owner_email");
-    expect(insert?.args[8]).toBe("owner@example.com");
-  });
-
-  // The anonymous flag selects the read-only handler on the far side of the
-  // dispatch, so it has to survive the handoff with the email.
-  it("insertRun records whether the owner is anonymous", async () => {
-    await insertRun("run-anon", "thread-1", "turn-1", {
-      dispatchMode: "background",
-      ownerEmail: "public@example.com",
-      ownerAnonymous: true,
-    });
-
-    const insert = execCalls.find((call) =>
-      /INSERT INTO agent_runs/i.test(call.sql),
-    );
-    expect(insert?.sql).toContain("owner_anonymous");
-    expect(insert?.args[9]).toBe(1);
-  });
-
-  it("getRunOwner reports the recorded anonymous owner as anonymous", async () => {
-    runOwnerRows = [{ owner_email: "public@example.com", owner_anonymous: 1 }];
-    await expect(getRunOwner("run-anon")).resolves.toEqual({
-      email: "public@example.com",
-      anonymous: true,
-    });
   });
 
   it("insertRun binds null dispatch_payload when no payload is given", async () => {
